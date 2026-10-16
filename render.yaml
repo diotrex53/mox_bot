@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: mox-bot
+    env: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
