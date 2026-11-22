@@ -55,7 +55,7 @@ TAVILY_API_KEY = os.environ.get("TAVIL_API", "")
 
 # Если запускаешь локально и нужен SOCKS-прокси — впиши сюда,
 # например "socks5://127.0.0.1:10808". На Render оставь пустым.
-PROXY_URL = ""
+PROXY_URL = os.environ.get("PROXY_URL", "")
 
 OWNER_ID = 6101597477
 ALLOWED_GROUPS = {-1002495961136}
@@ -693,13 +693,62 @@ async def describe_image(image_bytes: bytes, mime: str | None = None) -> str:
 # WHISPER
 # ============================================================
 
+# Groq принимает только эти расширения. Важно: .oga (как у голосовых
+# Telegram) в списке нет — его нужно отправлять как .ogg.
+GROQ_AUDIO_EXTENSIONS = {
+    ".flac", ".mp3", ".mp4", ".mpeg", ".m4a",
+    ".ogg", ".opus", ".wav", ".webm",
+}
+AUDIO_MIME_BY_EXT = {
+    ".flac": "audio/flac",
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".mpeg": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
+AUDIO_EXT_BY_MIME = {
+    "audio/flac": ".flac",
+    "audio/x-flac": ".flac",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".ogg",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
+}
+
+
+def audio_extension(media, file_path: str | None) -> str:
+    """Подбирает расширение, которое примет Groq."""
+    suffix = os.path.splitext(file_path or "")[1].lower()
+    if suffix == ".oga":  # Telegram voice
+        suffix = ".ogg"
+    if suffix in GROQ_AUDIO_EXTENSIONS:
+        return suffix
+    mime = (getattr(media, "mime_type", "") or "").lower()
+    return AUDIO_EXT_BY_MIME.get(mime, ".ogg")
+
 
 async def transcribe_voice(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in GROQ_AUDIO_EXTENSIONS:
+        ext = ".ogg"
+    content_type = AUDIO_MIME_BY_EXT[ext]
+
     async def _do():
         with open(file_path, "rb") as f:
             result = await asyncio.wait_for(
                 ai_client.audio.transcriptions.create(
-                    file=f,
+                    # Явное имя обязательно: иначе SDK возьмёт имя временного
+                    # файла (например, .oga), и Groq ответит 400.
+                    file=(f"voice{ext}", f, content_type),
                     model=WHISPER_MODEL,
                     language="ru",
                 ),
@@ -1057,9 +1106,7 @@ async def download_media_to_temp(message: Message) -> str:
     if media is None:
         raise ValueError("В сообщении нет голосового")
     file = await bot.get_file(media.file_id)
-    suffix = os.path.splitext(file.file_path or "")[1] or ".ogg"
-    if suffix.lower() not in (".ogg", ".oga", ".mp3", ".m4a", ".wav", ".flac", ".opus", ".webm"):
-        suffix = ".ogg"
+    suffix = audio_extension(media, file.file_path)
     fd, path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     await bot.download_file(file.file_path, path)
