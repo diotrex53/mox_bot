@@ -9,25 +9,32 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
 import httpx
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatAction, ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeChat,
     BotCommandScopeDefault,
     BufferedInputFile,
+    CallbackQuery,
     ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultArticle,
     InputTextMessageContent,
     Message,
 )
 from openai import AsyncOpenAI
+
+from deepseek_client import ChatResult, DeepSeekClient
+from storage import DB_LIMIT_BYTES, MSK, storage
 
 # ============================================================
 # НАСТРОЙКИ
@@ -53,22 +60,35 @@ GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
 
 TAVILY_API_KEY = os.environ.get("TAVIL_API", "")
 
+# DeepSeek — только для владельца и явно выданных пользователей.
+AIKEYS_API_KEY = os.environ.get("AIKEYS_API", "")
+DEEPSEEK_BASE_URL = "https://api.aikeysforyou.com/v1"
+DEEPSEEK_MODEL = "deepseek-v4.1-flash"
+DEEPSEEK_HISTORY_CHARS_LIMIT = 60000
+DEEPSEEK_MAX_TOKENS = 4000
+DEEPSEEK_DAILY_LIMIT = 50
+DEEPSEEK_PHOTO_LIMIT = 10
+
 # Если запускаешь локально и нужен SOCKS-прокси — впиши сюда,
 # например "socks5://127.0.0.1:10808". На Render оставь пустым.
 PROXY_URL = os.environ.get("PROXY_URL", "")
 
 OWNER_ID = 6101597477
-ALLOWED_GROUPS = {-1002495961136}
+ALLOWED_GROUPS: set[int] = {-1002495961136}
 
 HISTORY_LIMIT = 50
-HISTORY_CHARS_LIMIT = 60000
+HISTORY_STORE_CHARS_LIMIT = 60000
+HISTORY_CHARS_LIMIT = 14000
 MAX_REPLY_LENGTH = 4000
+CHAT_MAX_TOKENS = 1200
 COOLDOWN_SECONDS = 2
 AI_TIMEOUT = 120.0
 TYPING_INTERVAL = 4.0
 FALLBACK_COOLDOWN = 600
-ALBUM_DELAY = 1.3
-MAX_ALBUM_PHOTOS = 8
+PHOTO_SESSION_DELAY = 2.0
+MAX_ALBUM_PHOTOS = DEEPSEEK_PHOTO_LIMIT
+ADMIN_PAGE_SIZE = 6
+BLOCK_REPLY_COOLDOWN = 5.0
 
 TRIGGER_ROOTS = ("мох", "mox", "moh")
 FALLBACK_TEXT = "Чтобы добавить меня в чат, напишите владельцу @Diotrex."
@@ -105,6 +125,14 @@ ai_client = AsyncOpenAI(
     timeout=AI_TIMEOUT,
 )
 
+deepseek_client = DeepSeekClient(
+    api_key=AIKEYS_API_KEY,
+    base_url=DEEPSEEK_BASE_URL,
+    model=DEEPSEEK_MODEL,
+    http_client=http_client,
+    timeout=AI_TIMEOUT,
+)
+
 BOT_ID: int | None = None
 BOT_USERNAME = ""
 
@@ -115,16 +143,77 @@ _typing_last: dict[int, float] = {}
 _fallback_last: dict[int, float] = {}
 _media_cache: dict[tuple[int, int], str] = {}
 _locks: dict[int, asyncio.Lock] = {}
-_album_buffers: dict[tuple[int, str], list[Message]] = {}
-_album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 _search_cache: dict[str, tuple[float, list[dict]]] = {}
 _image_lock = asyncio.Lock()
+
+# Фото-сессии: все подряд идущие фото одного пользователя склеиваются в одну пачку.
+_photo_sessions: dict[tuple[int, int], list[Message]] = {}
+_photo_tasks: dict[tuple[int, int], asyncio.Task] = {}
+_photo_generation: dict[tuple[int, int], int] = {}
+
+# Выбранная модель живёт только в памяти: после рестарта снова Groq.
+_selected_model: dict[int, str] = {}
+_deepseek_grants: dict[int, dict] = {}
+_dm_blacklist: dict[int, dict] = {}
+_groups_cache: dict[int, dict] = {}
+_ds_usage: dict[tuple[int, str], int] = {}
+_ds_limit_notified: set[tuple[int, str]] = set()
+_block_reply_last: dict[int, float] = {}
+
+# Состояние админ-панели
+_admin_input: dict[int, dict] = {}
+_admin_filter: dict[int, dict] = {}
+_db_size_cache = 0
 
 GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
 
 # ============================================================
 # РЕТРАЙ
 # ============================================================
+
+
+def _parse_duration(value: str) -> float | None:
+    """Парсит '9.7875s', '665ms', '1m30s' в секунды."""
+    if not value:
+        return None
+    value = str(value).strip().lower()
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h)?", value)
+    if not matches:
+        return None
+    total = 0.0
+    for number, unit in matches:
+        amount = float(number)
+        if unit == "ms":
+            total += amount / 1000.0
+        elif unit == "m":
+            total += amount * 60.0
+        elif unit == "h":
+            total += amount * 3600.0
+        else:
+            total += amount
+    return total or None
+
+
+def retry_after_seconds(error: Exception) -> float | None:
+    """Достаёт паузу из Retry-After или текста ошибки Groq."""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        for key in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+            raw = headers.get(key)
+            if raw:
+                wait = _parse_duration(raw)
+                if wait:
+                    return wait
+
+    match = re.search(
+        r"try again in\s+([\d.]+\s*(?:ms|s|m|h)?)",
+        str(error),
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return _parse_duration(match.group(1))
+    return None
 
 
 def is_retryable_error(error: Exception) -> bool:
@@ -166,11 +255,29 @@ async def with_retry(coro_fn, *args, retries=3, base_wait=2.0, **kwargs):
             last_err = e
             if is_retryable_error(e):
                 wait = base_wait * (attempt + 1)
-                logging.warning(f"Retry {attempt + 1}/{retries} in {wait}s: {e}")
+                # Groq в 429 обычно сам говорит, сколько ждать. Игнорировать
+                # это нельзя: 2-4 секунды недостаточно, и все ретраи сгорят.
+                retry_after = retry_after_seconds(e)
+                if retry_after:
+                    wait = max(wait, retry_after + 0.5)
+                wait = min(wait, 60.0)
+                logging.warning(f"Retry {attempt + 1}/{retries} in {wait:.1f}s: {e}")
                 await asyncio.sleep(wait)
                 continue
             raise
     raise last_err
+
+
+def friendly_ai_error(error: Exception) -> str:
+    status = getattr(error, "status_code", None)
+    if status is None:
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+    if status == 429:
+        wait = retry_after_seconds(error)
+        seconds = int(wait) + 1 if wait else 10
+        return f"Слишком много запросов к AI. Подожди примерно {seconds} с и повтори."
+    return str(error)
 
 
 # ============================================================
@@ -225,26 +332,41 @@ def esc(text) -> str:
 # ============================================================
 
 
-def add_to_history(chat_id: int, role: str, content: str) -> None:
+def _trim_history(history: list[dict], chars_limit: int = HISTORY_STORE_CHARS_LIMIT) -> None:
+    while len(history) > HISTORY_LIMIT:
+        history.pop(0)
+    total = sum(len(str(m.get("content") or "")) for m in history)
+    while len(history) > 1 and total > chars_limit:
+        total -= len(str(history[0].get("content") or ""))
+        history.pop(0)
+
+
+async def add_to_history(chat_id: int, role: str, content: str) -> None:
     if not content:
         return
     history = _history.setdefault(chat_id, [])
     history.append({"role": role, "content": content})
-    while len(history) > HISTORY_LIMIT:
-        history.pop(0)
-    # Страховка от переполнения контекста очень длинными сообщениями.
-    total = sum(len(m.get("content") or "") for m in history)
-    while len(history) > 1 and total > HISTORY_CHARS_LIMIT:
-        total -= len(history[0].get("content") or "")
-        history.pop(0)
+    _trim_history(history)
+    await storage.save_context(chat_id, history)
 
 
 def get_history(chat_id: int) -> list[dict]:
     return _history.get(chat_id, [])
 
 
-def reset_history(chat_id: int) -> None:
+def history_for_model(chat_id: int, model: str) -> list[dict]:
+    limit = DEEPSEEK_HISTORY_CHARS_LIMIT if model == "deepseek" else HISTORY_CHARS_LIMIT
+    source = list(_history.get(chat_id, []))
+    total = sum(len(str(m.get("content") or "")) for m in source)
+    while len(source) > 1 and total > limit:
+        total -= len(str(source[0].get("content") or ""))
+        source.pop(0)
+    return source
+
+
+async def reset_history(chat_id: int) -> None:
     _history.pop(chat_id, None)
+    await storage.delete_context(chat_id)
 
 
 def get_history_size(chat_id: int) -> int:
@@ -253,6 +375,28 @@ def get_history_size(chat_id: int) -> int:
 
 def chat_lock(chat_id: int) -> asyncio.Lock:
     return _locks.setdefault(chat_id, asyncio.Lock())
+
+
+def clear_media_cache(chat_id: int) -> None:
+    for key in list(_media_cache.keys()):
+        if key[0] == chat_id:
+            _media_cache.pop(key, None)
+
+
+def cancel_photo_sessions(chat_id: int) -> None:
+    for key in list(_photo_sessions.keys()):
+        if key[0] == chat_id:
+            _photo_sessions.pop(key, None)
+            _photo_generation[key] = _photo_generation.get(key, 0) + 1
+            task = _photo_tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+
+
+async def clear_chat_context(chat_id: int) -> None:
+    await reset_history(chat_id)
+    clear_media_cache(chat_id)
+    cancel_photo_sessions(chat_id)
 
 
 # ============================================================
@@ -299,6 +443,117 @@ def can_send_fallback(chat_id: int) -> bool:
     return True
 
 
+# ============================================================
+# МОДЕЛИ И ДОСТУП К DEEPSEEK
+# ============================================================
+
+
+def deepseek_eligible(user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    return int(user_id) == OWNER_ID or int(user_id) in _deepseek_grants
+
+
+def selected_model(user_id: int) -> str:
+    if not deepseek_eligible(user_id):
+        return "groq"
+    return _selected_model.get(int(user_id), "groq")
+
+
+def model_label(model: str) -> str:
+    return "🧠 DeepSeek" if model == "deepseek" else "🌿 Groq"
+
+
+def is_blacklisted(user_id: int | None) -> bool:
+    return user_id is not None and int(user_id) in _dm_blacklist
+
+
+def msk_now() -> datetime:
+    return datetime.now(MSK)
+
+
+def msk_today() -> date:
+    return msk_now().date()
+
+
+def msk_day_start(day: date) -> datetime:
+    return datetime(day.year, day.month, day.day, tzinfo=MSK).astimezone(timezone.utc)
+
+
+def is_complex_task(text: str) -> bool:
+    text = text or ""
+    lowered = text.lower()
+    if len(text) > 220:
+        return True
+    markers = (
+        "реши", "задач", "уравнен", "докажи", "вычисли", "найди", "объясни",
+        "почему", "как работает", "код", "напиши программу", "проанализируй",
+        "сравни", "план", "эссе", "сочинени", "переведи", "формул",
+    )
+    if any(m in lowered for m in markers):
+        return True
+    if re.search(r"[=<>√∑∫]|\d+\s*[+\-*/^]\s*\d+", text):
+        return True
+    return False
+
+
+async def notify_ds_limit(user_id: int) -> None:
+    key = (int(user_id), msk_today().isoformat())
+    if key in _ds_limit_notified:
+        return
+    _ds_limit_notified.add(key)
+    try:
+        await bot.send_message(
+            user_id,
+            "⚠️ Лимит DeepSeek на сегодня исчерпан "
+            f"({DEEPSEEK_DAILY_LIMIT} сообщений). Отвечаю через Groq. "
+            "Лимит сбросится в 00:00 МСК.",
+        )
+    except Exception:
+        pass
+
+
+async def resolve_model(user_id: int | None, private: bool) -> str:
+    """Возвращает фактическую модель и списывает дневной лимит DeepSeek."""
+    if not private or user_id is None:
+        return "groq"
+    if selected_model(user_id) != "deepseek":
+        return "groq"
+    if int(user_id) == OWNER_ID:
+        return "deepseek"
+    today = msk_today()
+    used = await storage.get_usage(int(user_id), today)
+    if used >= DEEPSEEK_DAILY_LIMIT:
+        await notify_ds_limit(int(user_id))
+        return "groq"
+    await storage.inc_usage(int(user_id), today)
+    return "deepseek"
+
+
+async def set_model_for_user(user_id: int, model: str) -> tuple[bool, str]:
+    """Переключает модель и очищает всё выбранное. Возвращает (ok, текст)."""
+    if model not in ("groq", "deepseek"):
+        return False, "Неизвестная модель."
+    if int(user_id) != OWNER_ID and int(user_id) not in _deepseek_grants:
+        return False, "DeepSeek тебе не выдан."
+    if model == "deepseek" and not deepseek_client.configured:
+        return False, "DeepSeek не настроен: на сервере нет AIKEYS_API."
+    old = selected_model(user_id)
+    if old == model:
+        return True, f"Уже выбрана модель {model_label(model)}. Контекст не тронут."
+    await clear_chat_context(int(user_id))
+    _selected_model[int(user_id)] = model
+    limit_note = ""
+    if model == "deepseek" and int(user_id) != OWNER_ID:
+        used = await storage.get_usage(int(user_id), msk_today())
+        limit_note = f"\nОсталось сегодня: <b>{max(0, DEEPSEEK_DAILY_LIMIT - used)}</b>."
+    return (
+        True,
+        f"Модель переключена на {model_label(model)}. "
+        f"Контекст, кэш фото и незавершённые фотосессии очищены.{limit_note}",
+    )
+
+
 async def safe_typing(chat_id: int) -> None:
     now = time.time()
     if now - _typing_last.get(chat_id, 0) < TYPING_INTERVAL:
@@ -320,6 +575,85 @@ def display_user(user) -> str:
         return "Аноним"
     name = (user.first_name or user.username or f"id{user.id}").strip()
     return f"{name} ({user.id})"
+
+
+def username_of(user) -> str:
+    if user is None:
+        return ""
+    return user.username or user.full_name or str(user.id)
+
+
+@dataclass
+class Track:
+    request_id: int | None
+    user_id: int | None
+    chat_id: int | None
+
+
+async def begin_request(
+    message: Message,
+    *,
+    kind: str,
+    prompt: str,
+    model: str | None,
+    is_request: bool = True,
+) -> Track:
+    user = message.from_user
+    request_id = await storage.create_request(
+        user_id=user.id if user else None,
+        username=username_of(user),
+        chat_id=message.chat.id,
+        chat_type=str(message.chat.type),
+        kind=kind,
+        is_request=is_request,
+        model=model,
+        prompt_preview=prompt or "",
+    )
+    return Track(
+        request_id=request_id,
+        user_id=user.id if user else None,
+        chat_id=message.chat.id,
+    )
+
+
+async def finish_track(
+    track: Track | None,
+    *,
+    status: str = "ok",
+    error: str = "",
+    latency_ms: int | None = None,
+    model: str | None = None,
+    tools: str = "",
+) -> None:
+    if track is None:
+        return
+    await storage.finish_request(
+        track.request_id,
+        status=status,
+        error=error,
+        latency_ms=latency_ms,
+        model=model,
+        tools=tools,
+    )
+
+
+async def log_group_event(message: Message, text: str, kind: str = "group_message") -> None:
+    user = message.from_user
+    await storage.create_request(
+        user_id=user.id if user else None,
+        username=username_of(user),
+        chat_id=message.chat.id,
+        chat_type=str(message.chat.type),
+        kind=kind,
+        is_request=False,
+        model=None,
+        prompt_preview=text or media_placeholder(message),
+        status="logged",
+    )
+
+
+async def record_blocked(message: Message) -> None:
+    await log_group_event(message, message.text or message.caption or "", kind="blocked_dm")
 
 
 def first_word(text: str) -> str:
@@ -570,13 +904,13 @@ SEARCH_TOOLS = [TOOLS[0]]
 # ============================================================
 
 
-async def groq_chat(messages, tools=None, tool_choice="auto"):
+async def groq_chat(messages, tools=None, tool_choice="auto", max_tokens: int | None = None):
     async def _do():
         kwargs = {
             "model": CHAT_MODEL,
             "messages": messages,
             "temperature": 0.7,
-            "max_tokens": 4096,
+            "max_tokens": int(max_tokens or CHAT_MAX_TOKENS),
         }
         if tools:
             kwargs["tools"] = tools
@@ -586,7 +920,109 @@ async def groq_chat(messages, tools=None, tool_choice="auto"):
             timeout=AI_TIMEOUT,
         )
 
-    return await with_retry(_do, retries=2)
+    return await with_retry(_do, retries=3)
+
+
+def openai_to_chat_result(response, provider: str, model: str) -> ChatResult:
+    message = response.choices[0].message
+    usage = getattr(response, "usage", None)
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+    total_tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
+    reasoning_tokens = 0
+    cached_tokens = 0
+    details = getattr(usage, "completion_tokens_details", None) if usage else None
+    if details is not None:
+        reasoning_tokens = int(getattr(details, "reasoning_tokens", 0) or 0)
+    prompt_details = getattr(usage, "prompt_tokens_details", None) if usage else None
+    if prompt_details is not None:
+        cached_tokens = int(getattr(prompt_details, "cached_tokens", 0) or 0)
+
+    calls = []
+    for tc in (getattr(message, "tool_calls", None) or []):
+        calls.append(
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+        )
+
+    return ChatResult(
+        content=(message.content or "").strip(),
+        reasoning_content=(getattr(message, "reasoning_content", "") or "").strip(),
+        tool_calls=calls,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_tokens=cached_tokens,
+        total_tokens=total_tokens or prompt_tokens + completion_tokens,
+        model=model,
+        finish_reason=response.choices[0].finish_reason or "",
+    )
+
+
+async def call_model(
+    provider: str,
+    messages: list[dict],
+    *,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = "auto",
+    track: Track | None = None,
+    effort: str = "low",
+    max_tokens: int | None = None,
+) -> ChatResult:
+    started = time.perf_counter()
+    status = "ok"
+    error_text = ""
+    result: ChatResult | None = None
+    try:
+        if provider == "deepseek":
+            result = await with_retry(
+                lambda: deepseek_client.chat(
+                    messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    max_tokens=max_tokens or DEEPSEEK_MAX_TOKENS,
+                    effort=effort,
+                ),
+                retries=2,
+            )
+        else:
+            response = await groq_chat(
+                messages,
+                tools,
+                tool_choice or "auto",
+                max_tokens=max_tokens or CHAT_MAX_TOKENS,
+            )
+            result = openai_to_chat_result(response, "groq", CHAT_MODEL)
+        return result
+    except Exception as e:
+        status = "error"
+        error_text = str(e)
+        raise
+    finally:
+        latency = int((time.perf_counter() - started) * 1000)
+        if track is not None:
+            await storage.add_call(
+                request_id=track.request_id,
+                user_id=track.user_id,
+                chat_id=track.chat_id,
+                provider=provider,
+                model=(result.model if result else (DEEPSEEK_MODEL if provider == "deepseek" else CHAT_MODEL)),
+                prompt_tokens=result.prompt_tokens if result else 0,
+                completion_tokens=result.completion_tokens if result else 0,
+                reasoning_tokens=result.reasoning_tokens if result else 0,
+                cached_tokens=result.cached_tokens if result else 0,
+                total_tokens=result.total_tokens if result else 0,
+                credit=result.credit if result else 0,
+                latency_ms=latency,
+                status=status,
+                error=error_text,
+            )
 
 
 def assistant_tool_message(msg) -> dict:
@@ -618,20 +1054,28 @@ VISION_PROMPT = (
 )
 
 
-async def describe_image(image_bytes: bytes, mime: str | None = None) -> str:
-    if not mime:
-        if image_bytes.startswith(b"\x89PNG"):
-            mime = "image/png"
-        elif image_bytes.startswith(b"GIF8"):
-            mime = "image/gif"
-        elif image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
-            mime = "image/webp"
-        else:
-            mime = "image/jpeg"
+def image_mime(image_bytes: bytes, fallback: str | None = None) -> str:
+    if fallback:
+        return fallback
+    if image_bytes.startswith(b"\x89PNG"):
+        return "image/png"
+    if image_bytes.startswith(b"GIF8"):
+        return "image/gif"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
 
+
+async def describe_image(
+    image_bytes: bytes,
+    mime: str | None = None,
+    *,
+    track: Track | None = None,
+) -> str:
+    mime = image_mime(image_bytes, mime)
     b64 = base64.b64encode(image_bytes).decode()
 
-    async def gemini_describe() -> str:
+    async def gemini_describe() -> tuple[str, dict]:
         payload = {
             "contents": [
                 {
@@ -662,9 +1106,9 @@ async def describe_image(image_bytes: bytes, mime: str | None = None) -> str:
             raise RuntimeError(
                 f"Gemini не вернул описание (finishReason={candidates[0].get('finishReason')})"
             )
-        return text
+        return text, data.get("usageMetadata") or {}
 
-    async def groq_describe() -> str:
+    async def groq_describe() -> tuple[str, dict]:
         content = [
             {"type": "text", "text": VISION_PROMPT},
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
@@ -677,16 +1121,109 @@ async def describe_image(image_bytes: bytes, mime: str | None = None) -> str:
         text = (response.choices[0].message.content or "").strip()
         if not text:
             raise RuntimeError("Groq vision вернул пустой ответ")
-        return text
+        return text, response
 
+    started = time.perf_counter()
     try:
-        return await with_retry(gemini_describe, retries=2)
+        text, usage = await with_retry(gemini_describe, retries=2)
+        if track is not None:
+            prompt_tokens = int(usage.get("promptTokenCount") or 0)
+            completion_tokens = int(usage.get("candidatesTokenCount") or 0)
+            reasoning_tokens = int(usage.get("thoughtsTokenCount") or 0)
+            cached_tokens = int(usage.get("cachedContentTokenCount") or 0)
+            await storage.add_call(
+                request_id=track.request_id,
+                user_id=track.user_id,
+                chat_id=track.chat_id,
+                provider="gemini",
+                model=VISION_MODEL,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                reasoning_tokens=reasoning_tokens,
+                cached_tokens=cached_tokens,
+                total_tokens=prompt_tokens + completion_tokens + reasoning_tokens,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        return text
     except Exception as e:
         logging.warning(
             f"Gemini vision failed ({type(e).__name__}: {e}); "
             f"пробую {GROQ_VISION_MODEL}"
         )
-        return await with_retry(groq_describe, retries=2)
+        if track is not None:
+            await storage.add_call(
+                request_id=track.request_id,
+                user_id=track.user_id,
+                chat_id=track.chat_id,
+                provider="gemini",
+                model=VISION_MODEL,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                status="error",
+                error=str(e),
+            )
+
+    started = time.perf_counter()
+    try:
+        text, response = await with_retry(groq_describe, retries=2)
+    except Exception as e:
+        if track is not None:
+            await storage.add_call(
+                request_id=track.request_id,
+                user_id=track.user_id,
+                chat_id=track.chat_id,
+                provider="groq",
+                model=GROQ_VISION_MODEL,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                status="error",
+                error=str(e),
+            )
+        raise
+
+    if track is not None:
+        usage = response.usage
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        await storage.add_call(
+            request_id=track.request_id,
+            user_id=track.user_id,
+            chat_id=track.chat_id,
+            provider="groq",
+            model=GROQ_VISION_MODEL,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+    return text
+
+
+async def describe_image_deepseek(
+    image_bytes: bytes,
+    mime: str | None = None,
+    *,
+    track: Track | None = None,
+) -> str:
+    mime = image_mime(image_bytes, mime)
+    b64 = base64.b64encode(image_bytes).decode()
+    result = await call_model(
+        "deepseek",
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+        track=track,
+        effort="high",
+        max_tokens=DEEPSEEK_MAX_TOKENS,
+    )
+    return (result.content or "").strip()
 
 
 # ============================================================
@@ -736,7 +1273,7 @@ def audio_extension(media, file_path: str | None) -> str:
     return AUDIO_EXT_BY_MIME.get(mime, ".ogg")
 
 
-async def transcribe_voice(file_path: str) -> str:
+async def transcribe_voice(file_path: str, *, track: Track | None = None) -> str:
     ext = os.path.splitext(file_path)[1].lower()
     if ext not in GROQ_AUDIO_EXTENSIONS:
         ext = ".ogg"
@@ -756,7 +1293,32 @@ async def transcribe_voice(file_path: str) -> str:
             )
         return (result.text or "").strip()
 
-    return await with_retry(_do, retries=2)
+    started = time.perf_counter()
+    try:
+        text = await with_retry(_do, retries=2)
+        if track is not None:
+            await storage.add_call(
+                request_id=track.request_id,
+                user_id=track.user_id,
+                chat_id=track.chat_id,
+                provider="groq",
+                model=WHISPER_MODEL,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        return text
+    except Exception as e:
+        if track is not None:
+            await storage.add_call(
+                request_id=track.request_id,
+                user_id=track.user_id,
+                chat_id=track.chat_id,
+                provider="groq",
+                model=WHISPER_MODEL,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                status="error",
+                error=str(e),
+            )
+        raise
 
 
 # ============================================================
@@ -846,9 +1408,9 @@ def render_results(results: list[dict]) -> str:
     if not results:
         return "Поиск не дал результатов."
     lines = []
-    for i, r in enumerate(results[:5], 1):
+    for i, r in enumerate(results[:4], 1):
         lines.append(
-            f"{i}. {r['title']}\n{r['url']}\n{r['snippet'][:350]}"
+            f"{i}. {r['title']}\n{r['url']}\n{r['snippet'][:250]}"
         )
     return "\n\n".join(lines)
 
@@ -921,7 +1483,7 @@ async def generate_image_bytes(prompt_en: str, width: int, height: int) -> bytes
 # ============================================================
 
 
-async def translate_to_english(text: str) -> str:
+async def translate_to_english(text: str, *, track: Track | None = None) -> str:
     async def _do():
         response = await asyncio.wait_for(
             ai_client.chat.completions.create(
@@ -942,13 +1504,41 @@ async def translate_to_english(text: str) -> str:
             ),
             timeout=30.0,
         )
-        return (response.choices[0].message.content or "").strip().strip('"').strip("'")
+        return response
 
+    started = time.perf_counter()
     try:
-        result = await with_retry(_do, retries=2)
+        response = await with_retry(_do, retries=2)
+        result = (response.choices[0].message.content or "").strip().strip('"').strip("'")
+        if track is not None:
+            usage = response.usage
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            await storage.add_call(
+                request_id=track.request_id,
+                user_id=track.user_id,
+                chat_id=track.chat_id,
+                provider="groq",
+                model=FAST_MODEL,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
         return result or text
     except Exception as e:
         logging.warning(f"translate_to_english failed: {e}")
+        if track is not None:
+            await storage.add_call(
+                request_id=track.request_id,
+                user_id=track.user_id,
+                chat_id=track.chat_id,
+                provider="groq",
+                model=FAST_MODEL,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                status="error",
+                error=str(e),
+            )
         return text
 
 # ============================================================
@@ -994,6 +1584,9 @@ class Turn:
     image_sent: bool = False
     image_prompt_ru: str = ""
     image_error: str = ""
+    model: str = "groq"
+    track: Track | None = None
+    tools_used: list[str] = field(default_factory=list)
     status: Status = field(init=False)
 
     def __post_init__(self):
@@ -1113,14 +1706,19 @@ async def download_media_to_temp(message: Message) -> str:
     return path
 
 
-async def get_photo_description(message: Message) -> str:
+async def get_photo_description(
+    message: Message, *, track: Track | None = None, provider: str = "groq"
+) -> str:
     key = (message.chat.id, message.message_id)
     cached = _media_cache.get(key)
     if cached:
         return cached
     try:
         data = await download_image_bytes(message)
-        desc = await describe_image(data)
+        if provider == "deepseek":
+            desc = await describe_image_deepseek(data, track=track)
+        else:
+            desc = await describe_image(data, track=track)
     except Exception as e:
         logging.warning(f"describe photo failed: {e}")
         desc = "[фото] (не удалось описать)"
@@ -1132,7 +1730,7 @@ async def get_photo_description(message: Message) -> str:
     return desc
 
 
-async def get_voice_text(message: Message) -> str:
+async def get_voice_text(message: Message, *, track: Track | None = None) -> str:
     key = (message.chat.id, message.message_id)
     cached = _media_cache.get(key)
     if cached:
@@ -1141,7 +1739,7 @@ async def get_voice_text(message: Message) -> str:
     path = None
     try:
         path = await download_media_to_temp(message)
-        text = await transcribe_voice(path)
+        text = await transcribe_voice(path, track=track)
     except Exception as e:
         logging.warning(f"transcribe failed: {e}")
         text = ""
@@ -1164,7 +1762,13 @@ async def get_voice_text(message: Message) -> str:
 # ============================================================
 
 
-async def build_reply_block(message: Message, need_media: bool = True) -> tuple[str, str]:
+async def build_reply_block(
+    message: Message,
+    need_media: bool = True,
+    *,
+    track: Track | None = None,
+    provider: str = "groq",
+) -> tuple[str, str]:
     """Возвращает (цитата для контекста, описание медиа из реплая)."""
     reply = message.reply_to_message
     if not reply:
@@ -1176,19 +1780,19 @@ async def build_reply_block(message: Message, need_media: bool = True) -> tuple[
 
     if reply.photo:
         if need_media:
-            media_desc = await get_photo_description(reply)
+            media_desc = await get_photo_description(reply, track=track, provider=provider)
             body = f"фото: {media_desc}"
         else:
             body = "[фото]"
     elif reply.document and (reply.document.mime_type or "").startswith("image/"):
         if need_media:
-            media_desc = await get_photo_description(reply)
+            media_desc = await get_photo_description(reply, track=track, provider=provider)
             body = f"фото: {media_desc}"
         else:
             body = "[фото]"
     elif reply.voice or reply.audio:
         if need_media:
-            media_desc = await get_voice_text(reply)
+            media_desc = await get_voice_text(reply, track=track)
             body = f"голосовое: {media_desc}"
         else:
             body = "[голосовое]"
@@ -1216,72 +1820,109 @@ def is_trivial(text: str) -> bool:
 
 
 async def execute_tool(turn: Turn, name: str, args: dict) -> str:
-    if name == "web_search":
-        query = (args.get("query") or "").strip()
-        if not query:
-            return "Ошибка: пустой поисковый запрос."
-        await turn.status.show("🔍 Ищу в интернете…")
-        logging.info(f"[{turn.chat_id}] TOOL web_search: {query}")
-        results = await search_web(query)
-        return render_results(results)
+    started = time.perf_counter()
+    status = "ok"
+    error_text = ""
+    turn.tools_used.append(name)
+    try:
+        if name == "web_search":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return "Ошибка: пустой поисковый запрос."
+            await turn.status.show("🔍 Ищу в интернете…")
+            logging.info(f"[{turn.chat_id}] TOOL web_search: {query}")
+            results = await search_web(query)
+            return render_results(results)
 
-    if name == "generate_image":
-        if turn.image_sent:
-            return "Изображение уже отправлено, повторно не генерируй."
-        prompt_en = (args.get("prompt_en") or "").strip()
-        prompt_ru = (args.get("prompt_ru") or "").strip() or prompt_en
-        if not prompt_en:
-            return "Ошибка: пустой промпт изображения."
+        if name == "generate_image":
+            if turn.image_sent:
+                return "Изображение уже отправлено, повторно не генерируй."
+            prompt_en = (args.get("prompt_en") or "").strip()
+            prompt_ru = (args.get("prompt_ru") or "").strip() or prompt_en
+            if not prompt_en:
+                return "Ошибка: пустой промпт изображения."
 
-        await turn.status.show("🎨 Рисую…")
-        width, height = parse_image_params(turn.user_text)
-        logging.info(f"[{turn.chat_id}] TOOL generate_image: {prompt_en[:100]} ({width}x{height})")
-        try:
-            data = await generate_image_bytes(prompt_en, width, height)
-            turn.image_prompt_ru = prompt_ru
-            ok = await send_photo(turn, data, f"🎨 Нарисовал: <i>{esc(prompt_ru[:300])}</i>")
-            if not ok:
-                turn.image_error = "не удалось отправить изображение в Telegram"
-                return "Ошибка: изображение сгенерировано, но не отправлено."
-            turn.image_sent = True
-            turn.image_error = ""
-            return "Изображение сгенерировано и отправлено пользователю."
-        except Exception as e:
-            turn.image_error = str(e)
-            logging.exception("Image generation error")
-            return f"Ошибка генерации изображения: {e}"
+            await turn.status.show("🎨 Рисую…")
+            width, height = parse_image_params(turn.user_text)
+            logging.info(f"[{turn.chat_id}] TOOL generate_image: {prompt_en[:100]} ({width}x{height})")
+            try:
+                data = await generate_image_bytes(prompt_en, width, height)
+                turn.image_prompt_ru = prompt_ru
+                ok = await send_photo(turn, data, f"🎨 Нарисовал: <i>{esc(prompt_ru[:300])}</i>")
+                if not ok:
+                    turn.image_error = "не удалось отправить изображение в Telegram"
+                    return "Ошибка: изображение сгенерировано, но не отправлено."
+                turn.image_sent = True
+                turn.image_error = ""
+                return "Изображение сгенерировано и отправлено пользователю."
+            except Exception as e:
+                turn.image_error = str(e)
+                logging.exception("Image generation error")
+                return f"Ошибка генерации изображения: {e}"
 
-    return "Неизвестный инструмент."
+        return "Неизвестный инструмент."
+    except Exception as e:
+        status = "error"
+        error_text = str(e)
+        raise
+    finally:
+        if turn.track is not None:
+            await storage.add_tool(
+                request_id=turn.track.request_id,
+                user_id=turn.track.user_id,
+                chat_id=turn.track.chat_id,
+                tool=name,
+                args_preview=json.dumps(args, ensure_ascii=False)[:300],
+                status=status,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                error=error_text,
+            )
 
 
-async def run_tools(messages, tools, executor, forced=None) -> str:
+async def run_tools(
+    messages,
+    tools,
+    executor,
+    forced=None,
+    *,
+    provider: str = "groq",
+    track: Track | None = None,
+    effort: str = "low",
+) -> str:
     choice = forced or "auto"
     for _ in range(4):
         try:
-            response = await groq_chat(messages, tools, choice)
+            result = await call_model(
+                provider,
+                messages,
+                tools=tools,
+                tool_choice=choice,
+                track=track,
+                effort=effort,
+                max_tokens=DEEPSEEK_MAX_TOKENS if provider == "deepseek" else CHAT_MAX_TOKENS,
+            )
         except Exception:
             if choice != "auto":
                 choice = "auto"
                 continue
             raise
 
-        msg = response.choices[0].message
-        tool_calls = getattr(msg, "tool_calls", None)
-        if not tool_calls:
-            return (msg.content or "").strip()
+        if not result.tool_calls:
+            return (result.content or "").strip()
 
-        messages.append(assistant_tool_message(msg))
-        for tc in tool_calls:
+        messages.append(result.assistant_message(include_reasoning=provider == "deepseek"))
+        for tc in result.tool_calls:
+            function = tc.get("function") or {}
             try:
-                args = json.loads(tc.function.arguments or "{}")
+                args = json.loads(function.get("arguments") or "{}")
             except Exception:
                 args = {}
             try:
-                output = await executor(tc.function.name, args)
+                output = await executor(function.get("name") or "", args)
             except Exception as e:
                 output = f"Ошибка инструмента: {e}"
             messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": str(output)[:6000]}
+                {"role": "tool", "tool_call_id": tc.get("id"), "content": str(output)[:6000]}
             )
         choice = "auto"
     return ""
@@ -1292,7 +1933,7 @@ async def fallback_draw(turn: Turn) -> None:
     if not prompt_ru:
         return
     await turn.status.show("🎨 Рисую…")
-    prompt_en = await translate_to_english(prompt_ru)
+    prompt_en = await translate_to_english(prompt_ru, track=turn.track)
     width, height = parse_image_params(turn.user_text)
     try:
         data = await generate_image_bytes(prompt_en, width, height)
@@ -1309,12 +1950,34 @@ async def fallback_draw(turn: Turn) -> None:
         await send_text(turn, f"⚠️ Ошибка генерации: <code>{esc(e)}</code>")
 
 
+async def send_ds_switch_button(turn: Turn, error_text: str) -> None:
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌿 Переключить на Groq", callback_data="model:set:groq")]
+        ]
+    )
+    text = (
+        f"⚠️ DeepSeek не ответил: <code>{esc(error_text[:500])}</code>\n\n"
+        "Модель осталась DeepSeek. Можно переключиться на Groq кнопкой ниже."
+    )
+    try:
+        if turn.is_private:
+            await turn.message.answer(text, reply_markup=keyboard)
+        else:
+            await turn.message.reply(text, reply_markup=keyboard)
+    except Exception:
+        await send_text(turn, text)
+
+
 async def run_ai(turn: Turn) -> None:
+    started = time.perf_counter()
+    provider = turn.model
+    status = "ok"
+    error_text = ""
     try:
         await safe_typing(turn.chat_id)
-        history = _history.setdefault(turn.chat_id, [])
         messages = [{"role": "system", "content": system_prompt()}]
-        messages += [dict(m) for m in history]
+        messages += [dict(m) for m in history_for_model(turn.chat_id, provider)]
 
         if turn.explicit_draw:
             forced = {"type": "function", "function": {"name": "generate_image"}}
@@ -1326,37 +1989,70 @@ async def run_ai(turn: Turn) -> None:
         async def executor(name, args):
             return await execute_tool(turn, name, args)
 
-        answer = await run_tools(messages, TOOLS, executor, forced)
+        effort = "high" if provider == "deepseek" and (
+            turn.explicit_draw or has_search_verb(turn.user_text) or is_complex_task(turn.user_text)
+        ) else "low"
+
+        answer = await run_tools(
+            messages,
+            TOOLS,
+            executor,
+            forced,
+            provider=provider,
+            track=turn.track,
+            effort=effort,
+        )
 
         if turn.explicit_draw and not turn.image_sent and not turn.image_error:
             await fallback_draw(turn)
 
         if turn.image_sent:
-            history.append(
-                {"role": "assistant", "content": f"Отправил сгенерированную картинку: {turn.image_prompt_ru}"}
+            await add_to_history(
+                turn.chat_id,
+                "assistant",
+                f"Отправил сгенерированную картинку: {turn.image_prompt_ru}",
             )
         elif turn.image_error:
-            history.append(
-                {"role": "assistant", "content": f"Не удалось сгенерировать изображение: {turn.image_error}"}
+            await add_to_history(
+                turn.chat_id,
+                "assistant",
+                f"Не удалось сгенерировать изображение: {turn.image_error}",
             )
 
         if answer:
             if not (turn.image_sent and is_trivial(answer)):
                 await send_text(turn, answer)
-                history.append({"role": "assistant", "content": answer})
+                await add_to_history(turn.chat_id, "assistant", answer)
         elif not turn.image_sent and not turn.image_error:
             fallback_text = "Не понял. Повтори, пожалуйста."
             await send_text(turn, fallback_text)
-            history.append({"role": "assistant", "content": fallback_text})
+            await add_to_history(turn.chat_id, "assistant", fallback_text)
 
         _stats[turn.chat_id] = _stats.get(turn.chat_id, 0) + 1
         logging.info(
-            f"[{turn.chat_id}] AI готов | draw={turn.image_sent} | поиск={has_search_verb(turn.user_text)}"
+            f"[{turn.chat_id}] AI готов | model={provider} | draw={turn.image_sent} | "
+            f"поиск={has_search_verb(turn.user_text)}"
         )
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
     except Exception as e:
+        status = "error"
+        error_text = str(e)
         logging.exception("AI handling error")
-        await send_text(turn, f"⚠️ Ошибка: <code>{esc(e)}</code>")
+        if provider == "deepseek":
+            await send_ds_switch_button(turn, friendly_ai_error(e))
+        else:
+            await send_text(turn, f"⚠️ Ошибка: <code>{esc(friendly_ai_error(e))}</code>")
     finally:
+        await finish_track(
+            turn.track,
+            status=status,
+            error=error_text,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            model=provider,
+            tools=",".join(turn.tools_used),
+        )
         await turn.status.clear()
 
 # ============================================================
@@ -1402,6 +2098,12 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     if not command_allowed(message):
         return
+    extra = ""
+    if is_private(message) and message.from_user and deepseek_eligible(message.from_user.id):
+        extra = (
+            "<code>/model</code> — выбрать Groq или DeepSeek\n"
+            + ("<code>/admin</code> — админ-панель\n" if message.from_user.id == OWNER_ID else "")
+        )
     await reply_any(
         message,
         "🌿 <b>Что я умею:</b>\n\n"
@@ -1417,7 +2119,8 @@ async def cmd_help(message: Message):
         "<code>/clear</code> — очистить контекст\n"
         "<code>/context</code> — размер памяти\n"
         "<code>/whoami</code> — твой ID\n"
-        "<code>/stats</code> — статистика",
+        "<code>/stats</code> — статистика\n"
+        f"{extra}",
     )
 
 
@@ -1426,14 +2129,25 @@ async def cmd_about(message: Message):
     if not command_allowed(message):
         return
     chat_id = message.chat.id
+    current = "groq"
+    if is_private(message) and message.from_user:
+        current = selected_model(message.from_user.id)
+    model_line = (
+        f"• Сейчас: <b>{model_label(current)}</b>\n"
+        if is_private(message)
+        else "• В группах: 🌿 Groq\n"
+    )
     await reply_any(
         message,
         "🌿 <b>Мудрый Мох — информация</b>\n\n"
         "<b>📝 Текст:</b>\n"
         f"• <code>{CHAT_MODEL}</code> (Groq)\n"
-        f"• Быстрая модель: <code>{FAST_MODEL}</code>\n\n"
+        f"• <code>{DEEPSEEK_MODEL}</code> (DeepSeek, по запросу)\n"
+        f"• Быстрая модель: <code>{FAST_MODEL}</code>\n"
+        f"{model_line}\n"
         "<b>👁 Vision (фото):</b>\n"
         f"• <code>{VISION_MODEL}</code> (Google Gemini)\n"
+        f"• <code>{DEEPSEEK_MODEL}</code> (DeepSeek, если выбрана эта модель)\n"
         f"• Резерв: <code>{GROQ_VISION_MODEL}</code> (Groq)\n\n"
         "<b>🎙 Голос:</b>\n"
         f"• <code>{WHISPER_MODEL}</code> (Groq)\n\n"
@@ -1453,12 +2167,108 @@ async def cmd_clear(message: Message):
     if not command_allowed(message):
         return
     chat_id = message.chat.id
-    reset_history(chat_id)
-    for key in list(_media_cache.keys()):
-        if key[0] == chat_id:
-            _media_cache.pop(key, None)
+    await clear_chat_context(chat_id)
     await reply_any(message, "🧹 Контекст этого чата очищен. Начинаем с чистого листа!")
     logging.info(f"[{chat_id}] /clear")
+
+
+@dp.message(Command("model"))
+async def cmd_model(message: Message):
+    if not is_private(message) or not message.from_user:
+        return
+    user_id = message.from_user.id
+    if not deepseek_eligible(user_id):
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1:
+        arg = parts[1].strip().lower()
+        aliases = {"deepseek": "deepseek", "ds": "deepseek", "groq": "groq"}
+        if arg in aliases:
+            ok, text = await set_model_for_user(user_id, aliases[arg])
+            await reply_any(message, ("✅ " if ok else "⚠️ ") + text)
+            return
+        await reply_any(
+            message,
+            "Использование: <code>/model</code>, <code>/model deepseek</code> "
+            "или <code>/model groq</code>.",
+        )
+        return
+
+    current = selected_model(user_id)
+    limit_line = ""
+    if user_id != OWNER_ID:
+        used = await storage.get_usage(user_id, msk_today())
+        limit_line = (
+            f"\nЛимит сегодня: <b>{used}</b> / {DEEPSEEK_DAILY_LIMIT}."
+        )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=("✅ " if current == "groq" else "") + "🌿 Groq",
+                    callback_data="model:set:groq",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅ " if current == "deepseek" else "") + "🧠 DeepSeek",
+                    callback_data="model:set:deepseek",
+                )
+            ],
+        ]
+    )
+    await message.answer(
+        f"🧠 <b>Выбор модели</b>\n\nСейчас: <b>{model_label(current)}</b>{limit_line}\n\n"
+        "DeepSeek доступен только в личных сообщениях. "
+        "При переключении контекст и кэш фото очищаются.",
+        reply_markup=keyboard,
+    )
+
+
+@dp.callback_query(F.data.startswith("model:set:"))
+async def on_model_callback(callback: CallbackQuery):
+    if not callback.from_user or not callback.message:
+        return
+    user_id = callback.from_user.id
+    if not deepseek_eligible(user_id) or callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    model = (callback.data or "").rsplit(":", 1)[-1]
+    ok, text = await set_model_for_user(user_id, model)
+    await callback.answer("Готово" if ok else "Ошибка", show_alert=not ok)
+    if not ok:
+        return
+    try:
+        current = selected_model(user_id)
+        limit_line = ""
+        if user_id != OWNER_ID:
+            used = await storage.get_usage(user_id, msk_today())
+            limit_line = f"\nЛимит сегодня: <b>{used}</b> / {DEEPSEEK_DAILY_LIMIT}."
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=("✅ " if current == "groq" else "") + "🌿 Groq",
+                        callback_data="model:set:groq",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=("✅ " if current == "deepseek" else "") + "🧠 DeepSeek",
+                        callback_data="model:set:deepseek",
+                    )
+                ],
+            ]
+        )
+        await callback.message.edit_text(
+            f"🧠 <b>Выбор модели</b>\n\nСейчас: <b>{model_label(current)}</b>{limit_line}\n\n"
+            "DeepSeek доступен только в личных сообщениях. "
+            "При переключении контекст и кэш фото очищаются.",
+            reply_markup=keyboard,
+        )
+    except Exception:
+        pass
 
 
 @dp.message(Command("context"))
@@ -1498,6 +2308,1080 @@ async def cmd_stats(message: Message):
 
 
 # ============================================================
+# АДМИН-ПАНЕЛЬ
+# ============================================================
+
+
+def fmt_int(value) -> str:
+    try:
+        return f"{int(value):,}".replace(",", " ")
+    except Exception:
+        return str(value)
+
+
+def admin_kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_filters(user_id: int) -> dict:
+    return _admin_filter.setdefault(
+        user_id,
+        {"period": "7", "user_id": None, "model": None, "date_from": None},
+    )
+
+
+def admin_period_label(flt: dict) -> str:
+    if flt.get("date_from"):
+        return f"дата {flt['date_from']}"
+    return {"t": "сегодня", "7": "7 дней", "a": "всё время"}.get(
+        flt.get("period", "7"), "7 дней"
+    )
+
+
+def admin_period_bounds(flt: dict) -> tuple[datetime | None, datetime | None]:
+    if flt.get("date_from"):
+        try:
+            day = date.fromisoformat(flt["date_from"])
+            return msk_day_start(day), msk_day_start(day + timedelta(days=1))
+        except Exception:
+            pass
+    period = flt.get("period", "7")
+    today = msk_today()
+    if period == "t":
+        return msk_day_start(today), None
+    if period == "a":
+        return None, None
+    return msk_day_start(today - timedelta(days=6)), None
+
+
+def db_usage_line(size: int) -> str:
+    mb = size / (1024 * 1024)
+    percent = min(100.0, size / DB_LIMIT_BYTES * 100) if size else 0.0
+    line = f"🗄 База: <b>{mb:.1f} МБ</b> из 1024 МБ ({percent:.1f}%)"
+    if percent >= 80:
+        line += "\n⚠️ <b>База заполнена более чем на 80%.</b> Почисти старые логи в «Настройках»."
+    return line
+
+
+def admin_main_text() -> str:
+    current = selected_model(OWNER_ID)
+    return (
+        "🛠 <b>Админ-панель Мудрого Мха</b>\n\n"
+        f"Модель в твоей ЛС: <b>{model_label(current)}</b>\n"
+        f"Групп в белом списке: <b>{len(_groups_cache)}</b>\n"
+        f"Заблокировано ЛС: <b>{len(_dm_blacklist)}</b>\n"
+        f"Доступ к DeepSeek: <b>{len(_deepseek_grants)}</b> чел.\n\n"
+        f"{db_usage_line(_db_size_cache)}\n\n"
+        "Выбери раздел:"
+    )
+
+
+def admin_main_kb() -> InlineKeyboardMarkup:
+    return admin_kb(
+        [
+            [
+                InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats:t"),
+                InlineKeyboardButton(text="🧠 Модель", callback_data="adm:model"),
+            ],
+            [
+                InlineKeyboardButton(text="👥 Группы", callback_data="adm:groups:0"),
+                InlineKeyboardButton(text="🚫 ЛС", callback_data="adm:bl:0"),
+            ],
+            [
+                InlineKeyboardButton(text="🔑 DeepSeek", callback_data="adm:ds:0"),
+                InlineKeyboardButton(text="📝 Запросы", callback_data="adm:req:0"),
+            ],
+            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set")],
+        ]
+    )
+
+
+def stats_text(stats: dict, period: str, flt: dict) -> str:
+    lines = [f"📊 <b>Статистика</b> · {admin_period_label(flt)}", ""]
+    lines.append(
+        f"<b>A.</b> Запросов: <b>{fmt_int(stats['requests'])}</b> · "
+        f"вызовов моделей: <b>{fmt_int(stats['calls'])}</b>"
+    )
+    lines.append("<b>B.</b> Токены по моделям:")
+    models = stats.get("models") or []
+    if not models:
+        lines.append("• пока нет данных")
+    for m in models[:8]:
+        provider = m.get("provider") or "?"
+        name = m.get("model") or "?"
+        lines.append(
+            f"• <code>{esc(provider)}/{esc(name)}</code> — "
+            f"{fmt_int(m['calls'])} выз., {fmt_int(m['total_tokens'])} ток.\n"
+            f"  prompt {fmt_int(m['prompt_tokens'])} · completion {fmt_int(m['completion_tokens'])} · "
+            f"reasoning {fmt_int(m['reasoning_tokens'])} · cached {fmt_int(m['cached_tokens'])}"
+        )
+    lines.append("")
+    lines.append("<b>C.</b> Топ пользователей:")
+    if stats.get("top_users"):
+        for u in stats["top_users"]:
+            uname = f" @{esc(u['username'])}" if u.get("username") else ""
+            lines.append(f"• <code>{u['user_id']}</code>{uname} — {fmt_int(u['requests'])}")
+    else:
+        lines.append("• пока нет")
+    lines.append("Топ чатов:")
+    if stats.get("top_chats"):
+        for c in stats["top_chats"]:
+            lines.append(f"• <code>{c['chat_id']}</code> ({esc(c['chat_type'])}) — {fmt_int(c['requests'])}")
+    else:
+        lines.append("• пока нет")
+    ctx = stats.get("contexts") or {}
+    lines.append("")
+    lines.append(
+        f"<b>D.</b> Контекст: <b>{fmt_int(ctx.get('chats', 0))}</b> чатов, "
+        f"{fmt_int(ctx.get('messages', 0))} сообщений, "
+        f"{fmt_int(ctx.get('chars', 0))} символов (~{fmt_int(ctx.get('tokens_est', 0))} ток.)"
+    )
+    lines.append("<b>E.</b> Инструменты:")
+    if stats.get("tools"):
+        lines.append(
+            " • ".join(f"{esc(t['tool'])}: {fmt_int(t['count'])}" for t in stats["tools"])
+        )
+    else:
+        lines.append("• пока нет")
+    lines.append(
+        f"<b>F.</b> Ошибки запросов: <b>{fmt_int(stats['request_errors'])}</b>, "
+        f"ошибки моделей: <b>{fmt_int(stats['call_errors'])}</b>, "
+        f"средняя задержка: <b>{fmt_int(stats['avg_latency'])} мс</b>"
+    )
+    lines.append(f"<b>G.</b> Кредиты/стоимость: <b>{stats['credits']:.4f}</b>")
+    lines.append(
+        f"\nСообщений в белых группах: <b>{fmt_int(stats['group_messages'])}</b>"
+    )
+    return "\n".join(lines)[:4000]
+
+
+def stats_kb(period: str) -> InlineKeyboardMarkup:
+    def label(code: str, text: str) -> str:
+        return ("✅ " if period == code else "") + text
+
+    return admin_kb(
+        [
+            [
+                InlineKeyboardButton(text=label("t", "Сегодня"), callback_data="adm:stats:t"),
+                InlineKeyboardButton(text=label("7", "7 дней"), callback_data="adm:stats:7"),
+                InlineKeyboardButton(text=label("a", "Всё"), callback_data="adm:stats:a"),
+            ],
+            [
+                InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adm:stats:{period}"),
+                InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main"),
+            ],
+        ]
+    )
+
+
+def model_text() -> str:
+    current = selected_model(OWNER_ID)
+    return (
+        "🧠 <b>Модель для твоей ЛС</b>\n\n"
+        f"Сейчас: <b>{model_label(current)}</b>\n\n"
+        "• 🌿 Groq — быстрый, бесплатный, с Gemini для фото.\n"
+        "• 🧠 DeepSeek — умнее на заданиях, сам читает фото, но только в ЛС.\n\n"
+        "При переключении контекст, кэш фото и незавершённые фотосессии очищаются. "
+        "После рестарта бот снова стартует с Groq."
+    )
+
+
+def model_kb() -> InlineKeyboardMarkup:
+    current = selected_model(OWNER_ID)
+    return admin_kb(
+        [
+            [
+                InlineKeyboardButton(
+                    text=("✅ " if current == "groq" else "") + "🌿 Groq",
+                    callback_data="adm:mset:groq",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅ " if current == "deepseek" else "") + "🧠 DeepSeek",
+                    callback_data="adm:mset:deepseek",
+                )
+            ],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main")],
+        ]
+    )
+
+
+def paginate(items: list, page: int) -> tuple[list, int, int]:
+    total = max(1, (len(items) + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, total - 1))
+    start = page * ADMIN_PAGE_SIZE
+    return items[start: start + ADMIN_PAGE_SIZE], page, total
+
+
+def paginator_kb(prefix: str, page: int, total: int, back: str = "adm:main") -> list[InlineKeyboardButton]:
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton(text="◀️", callback_data=f"{prefix}:{page - 1}"))
+    row.append(InlineKeyboardButton(text=f"{page + 1}/{total}", callback_data="adm:noop"))
+    if page + 1 < total:
+        row.append(InlineKeyboardButton(text="▶️", callback_data=f"{prefix}:{page + 1}"))
+    row.append(InlineKeyboardButton(text="🔄", callback_data=f"{prefix}:{page}"))
+    row.append(InlineKeyboardButton(text="🏠", callback_data=back))
+    return row
+
+
+def groups_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    groups = sorted(_groups_cache.values(), key=lambda g: (g.get("title") or "").lower())
+    page_items, page, total = paginate(groups, page)
+    lines = [f"👥 <b>Белый список групп</b> · всего {len(groups)}", ""]
+    if not groups:
+        lines.append("Список пуст.")
+    for g in page_items:
+        lines.append(f"• <b>{esc(g.get('title') or 'без названия')}</b>\n  <code>{g['chat_id']}</code>")
+    rows = [
+        [InlineKeyboardButton(text="➕ Добавить группу", callback_data="adm:gadd")]
+    ]
+    for g in page_items:
+        title = (g.get("title") or str(g["chat_id"]))[:28]
+        rows.append(
+            [InlineKeyboardButton(text=f"🗑 {title}", callback_data=f"adm:gdel:{g['chat_id']}")]
+        )
+    rows.append(paginator_kb("adm:groups", page, total))
+    return "\n".join(lines), admin_kb(rows)
+
+
+def blacklist_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    items = sorted(
+        _dm_blacklist.values(),
+        key=lambda x: x.get("added_at") or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    page_items, page, total = paginate(items, page)
+    lines = [f"🚫 <b>Чёрный список ЛС</b> · всего {len(items)}", ""]
+    if not items:
+        lines.append("Список пуст.")
+    for u in page_items:
+        name = u.get("full_name") or u.get("username") or "без имени"
+        lines.append(f"• <b>{esc(name)}</b>\n  <code>{u['user_id']}</code>")
+    rows = [[InlineKeyboardButton(text="➕ Заблокировать", callback_data="adm:bladd")]]
+    for u in page_items:
+        name = (u.get("full_name") or u.get("username") or str(u["user_id"]))[:25]
+        rows.append(
+            [InlineKeyboardButton(text=f"🗑 {name}", callback_data=f"adm:bldel:{u['user_id']}")]
+        )
+    rows.append(paginator_kb("adm:bl", page, total))
+    return "\n".join(lines), admin_kb(rows)
+
+
+async def deepseek_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    today = msk_today()
+    usage = await storage.usage_for_day(today)
+    items = sorted(
+        _deepseek_grants.values(),
+        key=lambda x: x.get("granted_at") or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    page_items, page, total = paginate(items, page)
+    lines = [
+        "🔑 <b>Доступ к DeepSeek</b>",
+        "",
+        f"👑 Владелец: <code>{OWNER_ID}</code> — безлимит",
+        f"Другим: <b>{len(items)}</b> чел. · лимит {DEEPSEEK_DAILY_LIMIT} сообщений/день",
+        "",
+    ]
+    if not items:
+        lines.append("Пока никому не выдан.")
+    for u in page_items:
+        name = u.get("full_name") or u.get("username") or "без имени"
+        used = usage.get(int(u["user_id"]), 0)
+        lines.append(
+            f"• <b>{esc(name)}</b> · <code>{u['user_id']}</code>\n"
+            f"  сегодня: {used}/{DEEPSEEK_DAILY_LIMIT}"
+        )
+    rows = [[InlineKeyboardButton(text="➕ Выдать доступ", callback_data="adm:dsadd")]]
+    for u in page_items:
+        name = (u.get("full_name") or u.get("username") or str(u["user_id"]))[:25]
+        rows.append(
+            [InlineKeyboardButton(text=f"🗑 {name}", callback_data=f"adm:dsdel:{u['user_id']}")]
+        )
+    rows.append(paginator_kb("adm:ds", page, total))
+    return "\n".join(lines), admin_kb(rows)
+
+
+async def requests_view_async(page: int, flt: dict) -> tuple[str, InlineKeyboardMarkup]:
+    start, end = admin_period_bounds(flt)
+    rows, total = await storage.list_requests(
+        limit=ADMIN_PAGE_SIZE,
+        offset=max(0, page) * ADMIN_PAGE_SIZE,
+        user_id=flt.get("user_id"),
+        model=flt.get("model"),
+        start=start,
+        end=end,
+    )
+    total_pages = max(1, (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    if page * ADMIN_PAGE_SIZE >= total and total:
+        rows, total = await storage.list_requests(
+            limit=ADMIN_PAGE_SIZE,
+            offset=page * ADMIN_PAGE_SIZE,
+            user_id=flt.get("user_id"),
+            model=flt.get("model"),
+            start=start,
+            end=end,
+        )
+
+    lines = [
+        f"📝 <b>Последние запросы</b> · {admin_period_label(flt)}",
+        f"Фильтры: пользователь <code>{flt.get('user_id') or 'все'}</code>, "
+        f"модель <code>{flt.get('model') or 'все'}</code>",
+        f"Всего: <b>{fmt_int(total)}</b>",
+        "",
+    ]
+    if not rows:
+        lines.append("Ничего не найдено.")
+    for r in rows:
+        created = r.get("created_at")
+        if isinstance(created, datetime):
+            created = created.astimezone(MSK).strftime("%d.%m %H:%M")
+        status = r.get("status") or "?"
+        if status == "logged":
+            icon = "📝"
+        elif status == "ok":
+            icon = "✅"
+        elif status == "running":
+            icon = "⏳"
+        else:
+            icon = "❌"
+        uname = f" @{r.get('username')}" if r.get("username") else ""
+        prompt = (r.get("prompt_preview") or "").replace("\n", " ")[:100]
+        lines.append(
+            f"{icon} <b>#{r.get('id')}</b> {created} · {esc(r.get('kind') or '?')} · "
+            f"{esc(r.get('model') or '—')}\n"
+            f"  <code>{r.get('user_id') or '—'}</code>{esc(uname)} · "
+            f"чат <code>{r.get('chat_id') or '—'}</code> · "
+            f"{fmt_int(r.get('tokens') or 0)} ток."
+            + (f" · {fmt_int(r.get('latency_ms') or 0)} мс" if r.get("latency_ms") else "")
+            + f"\n  {esc(prompt)}"
+        )
+        if r.get("tools"):
+            lines.append(f"  🛠 {esc(r['tools'])}")
+        if r.get("error"):
+            lines.append(f"  ⚠️ {esc((r.get('error') or '')[:120])}")
+    rows_kb = [
+        [
+            InlineKeyboardButton(text="🔎 Фильтры", callback_data="adm:filter"),
+            InlineKeyboardButton(text="⬇️ CSV", callback_data="adm:reqcsv"),
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"adm:req:{page}"),
+            InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main"),
+        ],
+        paginator_kb("adm:req", page, total_pages),
+    ]
+    return "\n".join(lines)[:4000], admin_kb(rows_kb)
+
+
+def filter_view(flt: dict) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "🔎 <b>Фильтры запросов</b>\n\n"
+        f"Период: <b>{admin_period_label(flt)}</b>\n"
+        f"Пользователь: <code>{flt.get('user_id') or 'все'}</code>\n"
+        f"Модель: <code>{flt.get('model') or 'все'}</code>"
+    )
+
+    def mark(value, current, label):
+        return ("✅ " if value == current else "") + label
+
+    rows = [
+        [
+            InlineKeyboardButton(text="Сегодня", callback_data="adm:fperiod:t"),
+            InlineKeyboardButton(text="7 дней", callback_data="adm:fperiod:7"),
+            InlineKeyboardButton(text="Всё", callback_data="adm:fperiod:a"),
+        ],
+        [
+            InlineKeyboardButton(text="👤 Пользователь", callback_data="adm:fuser"),
+            InlineKeyboardButton(text="📅 Дата", callback_data="adm:fdate"),
+        ],
+        [
+            InlineKeyboardButton(text=mark(None, flt.get("model"), "Все модели"), callback_data="adm:fmodel:all"),
+            InlineKeyboardButton(text=mark("groq", flt.get("model"), "Groq"), callback_data="adm:fmodel:groq"),
+            InlineKeyboardButton(text=mark("deepseek", flt.get("model"), "DeepSeek"), callback_data="adm:fmodel:deepseek"),
+        ],
+        [
+            InlineKeyboardButton(text="🗑 Сбросить", callback_data="adm:fclear"),
+            InlineKeyboardButton(text="📝 К запросам", callback_data="adm:req:0"),
+        ],
+    ]
+    return text, admin_kb(rows)
+
+
+async def settings_view() -> tuple[str, InlineKeyboardMarkup]:
+    size = await storage.db_size()
+    ctx = await storage.context_summary()
+    mode = "Postgres (Neon)" if storage.available else "память (DATABASE_URL не задан)"
+    text = (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"Хранилище: <b>{mode}</b>\n"
+        f"{db_usage_line(size)}\n\n"
+        f"Контекст: {fmt_int(ctx['chats'])} чатов, {fmt_int(ctx['messages'])} сообщений\n"
+        f"Логи: <b>хранятся вечно</b> (ручная очистка ниже)\n"
+        f"Сводка: <b>каждый день в 04:00 МСК</b>\n"
+        f"Лимит DeepSeek для гостей: <b>{DEEPSEEK_DAILY_LIMIT}</b> сообщений/день\n"
+        f"Модель DeepSeek: <code>{DEEPSEEK_MODEL}</code>\n"
+        f"Контекст DeepSeek: {fmt_int(DEEPSEEK_HISTORY_CHARS_LIMIT)} символов, "
+        f"ответ до {fmt_int(DEEPSEEK_MAX_TOKENS)} токенов\n\n"
+        "Очистка удаляет запросы, вызовы моделей и инструментов старше указанного срока. "
+        "Контексты и списки не трогает."
+    )
+    rows = [
+        [InlineKeyboardButton(text="⬇️ CSV всех запросов", callback_data="adm:csvall")],
+        [InlineKeyboardButton(text="🧹 Очистить старые логи", callback_data="adm:cleanup")],
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:set"),
+            InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main"),
+        ],
+    ]
+    return text, admin_kb(rows)
+
+
+async def admin_section(
+    section: str, page: int = 0, period: str | None = None
+) -> tuple[str, InlineKeyboardMarkup]:
+    global _db_size_cache
+    if section == "main":
+        _db_size_cache = await storage.db_size()
+        return admin_main_text(), admin_main_kb()
+    if section == "model":
+        return model_text(), model_kb()
+    if section == "groups":
+        return groups_view(page)
+    if section == "bl":
+        return blacklist_view(page)
+    if section == "ds":
+        return await deepseek_view(page)
+    if section == "set":
+        return await settings_view()
+    if section == "filter":
+        return filter_view(admin_filters(OWNER_ID))
+    if section == "req":
+        return await requests_view_async(page, admin_filters(OWNER_ID))
+    if section == "stats":
+        flt = admin_filters(OWNER_ID)
+        if period:
+            flt["period"] = period
+            flt["date_from"] = None
+        start, end = admin_period_bounds(flt)
+        data = await storage.stats(start, end)
+        return stats_text(data, flt.get("period", "7"), flt), stats_kb(flt.get("period", "7"))
+    return admin_main_text(), admin_main_kb()
+
+
+async def edit_admin(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    if callback.message is None:
+        return
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        try:
+            await callback.message.answer(text, reply_markup=kb)
+        except Exception:
+            pass
+
+
+def confirm_kb(ok_callback: str, back_callback: str) -> InlineKeyboardMarkup:
+    return admin_kb(
+        [
+            [
+                InlineKeyboardButton(text="✅ Да, удалить", callback_data=ok_callback),
+                InlineKeyboardButton(text="↩️ Отмена", callback_data=back_callback),
+            ]
+        ]
+    )
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_private(message) or not message.from_user:
+        return
+    if message.from_user.id != OWNER_ID:
+        return
+    _admin_input.pop(OWNER_ID, None)
+    admin_filters(OWNER_ID)
+    text, kb = await admin_section("main")
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    if not is_private(message) or not message.from_user or message.from_user.id != OWNER_ID:
+        return
+    if _admin_input.pop(OWNER_ID, None):
+        await message.answer("Отменено.", reply_markup=admin_main_kb())
+    else:
+        await message.answer("Нечего отменять.")
+
+
+def _forwarded_chat(message: Message) -> tuple[int, str] | None:
+    chat = getattr(message, "forward_from_chat", None)
+    if chat is not None:
+        return int(chat.id), getattr(chat, "title", "") or ""
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        origin_chat = getattr(origin, "chat", None)
+        if origin_chat is not None:
+            return int(origin_chat.id), getattr(origin_chat, "title", "") or ""
+        sender_chat = getattr(origin, "sender_chat", None)
+        if sender_chat is not None:
+            return int(sender_chat.id), getattr(sender_chat, "title", "") or ""
+    return None
+
+
+def _forwarded_user(message: Message) -> tuple[int, str, str] | None:
+    user = getattr(message, "forward_from", None)
+    if user is not None:
+        return int(user.id), user.username or "", user.full_name or ""
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        sender = getattr(origin, "sender_user", None)
+        if sender is not None:
+            return int(sender.id), sender.username or "", sender.full_name or ""
+    return None
+
+
+def _parse_int(text: str) -> int | None:
+    match = re.search(r"-?\d+", text or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except Exception:
+        return None
+
+
+async def maybe_admin_input(message: Message) -> bool:
+    """Перехватывает ввод для админ-панели. Возвращает True, если сообщение съедено."""
+    if not is_private(message) or not message.from_user:
+        return False
+    if message.from_user.id != OWNER_ID:
+        return False
+    state = _admin_input.get(OWNER_ID)
+    if not state:
+        return False
+
+    text = (message.text or "").strip()
+    if text.lower() in ("отмена", "cancel") or text.startswith("/"):
+        _admin_input.pop(OWNER_ID, None)
+        await message.answer("Отменено.", reply_markup=admin_main_kb())
+        return True
+
+    action = state.get("action")
+    try:
+        if action == "group_id":
+            forwarded = _forwarded_chat(message)
+            if forwarded:
+                chat_id, title = forwarded
+            else:
+                chat_id = _parse_int(text)
+                title = ""
+            if chat_id is None or chat_id >= 0:
+                await message.answer(
+                    "Нужен ID группы (отрицательное число, например <code>-100...</code>) "
+                    "или пересланное сообщение из группы. Попробуй ещё раз.",
+                )
+                return True
+            await storage.add_group(chat_id, title or f"Группа {chat_id}", OWNER_ID)
+            ALLOWED_GROUPS.add(chat_id)
+            _groups_cache[chat_id] = {
+                "chat_id": chat_id,
+                "title": title or f"Группа {chat_id}",
+                "added_at": msk_now(),
+            }
+            await storage.add_admin_action(OWNER_ID, "group_add", f"{chat_id} {title}")
+            _admin_input.pop(OWNER_ID, None)
+            await message.answer(
+                f"✅ Группа <b>{esc(title or chat_id)}</b> добавлена в белый список.\n"
+                "Бот начнёт отвечать, когда его позовут.",
+                reply_markup=admin_main_kb(),
+            )
+            return True
+
+        if action == "blacklist_id":
+            forwarded = _forwarded_user(message)
+            if forwarded:
+                user_id, uname, full_name = forwarded
+            else:
+                user_id = _parse_int(text)
+                uname, full_name = "", ""
+            if user_id is None or user_id <= 0:
+                await message.answer(
+                    "Нужен ID пользователя (положительное число) или пересланное сообщение от него."
+                )
+                return True
+            await storage.add_blacklist(user_id, uname, full_name, OWNER_ID)
+            _dm_blacklist[user_id] = {
+                "user_id": user_id,
+                "username": uname,
+                "full_name": full_name,
+                "added_at": msk_now(),
+            }
+            _selected_model.pop(user_id, None)
+            await clear_chat_context(user_id)
+            await storage.add_admin_action(OWNER_ID, "blacklist_add", str(user_id))
+            _admin_input.pop(OWNER_ID, None)
+            await message.answer(
+                f"✅ Пользователь <code>{user_id}</code> заблокирован в ЛС. "
+                "Его контекст удалён. В группах он не блокируется.",
+                reply_markup=admin_main_kb(),
+            )
+            return True
+
+        if action == "grant_id":
+            forwarded = _forwarded_user(message)
+            if forwarded:
+                user_id, uname, full_name = forwarded
+            else:
+                user_id = _parse_int(text)
+                uname, full_name = "", ""
+            if user_id is None or user_id <= 0:
+                await message.answer(
+                    "Нужен ID пользователя (положительное число) или пересланное сообщение от него."
+                )
+                return True
+            if user_id == OWNER_ID:
+                await message.answer("У владельца доступ уже есть.")
+                return True
+            await storage.add_grant(user_id, uname, full_name, OWNER_ID)
+            _deepseek_grants[user_id] = {
+                "user_id": user_id,
+                "username": uname,
+                "full_name": full_name,
+                "granted_at": msk_now(),
+            }
+            await refresh_user_commands(user_id)
+            await storage.add_admin_action(OWNER_ID, "grant_add", str(user_id))
+            _admin_input.pop(OWNER_ID, None)
+            try:
+                await bot.send_message(
+                    user_id,
+                    "🔑 Тебе выдан доступ к DeepSeek.\n"
+                    "Открой личный чат и выбери модель командой /model. "
+                    f"Лимит: {DEEPSEEK_DAILY_LIMIT} сообщений в день.",
+                )
+            except Exception:
+                pass
+            await message.answer(
+                f"✅ Доступ к DeepSeek выдан <code>{user_id}</code>.",
+                reply_markup=admin_main_kb(),
+            )
+            return True
+
+        if action == "cleanup_days":
+            days = _parse_int(text)
+            if days is None or days < 1 or days > 3650:
+                await message.answer("Введи число дней от 1 до 3650.")
+                return True
+            _admin_input.pop(OWNER_ID, None)
+            await message.answer(
+                f"Удалить логи старше <b>{days}</b> дней? Контексты и списки останутся.",
+                reply_markup=confirm_kb(f"adm:cleanok:{days}", "adm:set"),
+            )
+            return True
+
+        if action == "req_user":
+            user_id = _parse_int(text)
+            if user_id is None:
+                await message.answer("Нужен числовой ID пользователя или 0, чтобы сбросить.")
+                return True
+            flt = admin_filters(OWNER_ID)
+            flt["user_id"] = None if user_id == 0 else user_id
+            _admin_input.pop(OWNER_ID, None)
+            txt, kb = await requests_view_async(0, flt)
+            await message.answer(txt, reply_markup=kb)
+            return True
+
+        if action == "req_date":
+            raw = text.strip()
+            day = None
+            for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+                try:
+                    day = datetime.strptime(raw, fmt).date()
+                    break
+                except Exception:
+                    continue
+            if day is None:
+                await message.answer("Введи дату как <code>22.11.2026</code> или <code>2026-11-22</code>.")
+                return True
+            flt = admin_filters(OWNER_ID)
+            flt["date_from"] = day.isoformat()
+            _admin_input.pop(OWNER_ID, None)
+            txt, kb = await requests_view_async(0, flt)
+            await message.answer(txt, reply_markup=kb)
+            return True
+    except Exception as e:
+        logging.exception("Admin input error")
+        _admin_input.pop(OWNER_ID, None)
+        await message.answer(
+            f"⚠️ Ошибка: <code>{esc(e)}</code>", reply_markup=admin_main_kb()
+        )
+        return True
+    return False
+
+
+@dp.callback_query(F.data.startswith("adm:"))
+async def on_admin_callback(callback: CallbackQuery):
+    if not callback.from_user or callback.message is None:
+        return
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Админ-панель работает только в ЛС.", show_alert=True)
+        return
+
+    data = callback.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    try:
+        # Любая кнопка панели отменяет незавершённый текстовый ввод.
+        _admin_input.pop(OWNER_ID, None)
+        if action == "noop":
+            await callback.answer()
+            return
+        if action == "main":
+            _admin_input.pop(OWNER_ID, None)
+            text, kb = await admin_section("main")
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "stats":
+            period = parts[2] if len(parts) > 2 else "t"
+            text, kb = await admin_section("stats", period=period)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "model":
+            text, kb = await admin_section("model")
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "mset":
+            model = parts[2] if len(parts) > 2 else "groq"
+            ok, msg = await set_model_for_user(OWNER_ID, model)
+            await callback.answer(msg[:180], show_alert=not ok)
+            if ok:
+                await storage.add_admin_action(OWNER_ID, "model_set", model)
+            text, kb = await admin_section("model")
+            await edit_admin(callback, text, kb)
+            return
+        if action == "groups":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            text, kb = await admin_section("groups", page)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "bl":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            text, kb = await admin_section("bl", page)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "ds":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            text, kb = await admin_section("ds", page)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "req":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            text, kb = await admin_section("req", page)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "set":
+            text, kb = await admin_section("set")
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "filter":
+            text, kb = filter_view(admin_filters(OWNER_ID))
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+
+        if action == "gadd":
+            _admin_input[OWNER_ID] = {"action": "group_id"}
+            await callback.answer()
+            await callback.message.answer(
+                "Отправь ID группы (например <code>-1001234567890</code>) "
+                "или перешли любое сообщение из этой группы.\n\n/cancel — отмена."
+            )
+            return
+        if action == "gdel":
+            chat_id = int(parts[2])
+            title = (_groups_cache.get(chat_id) or {}).get("title") or str(chat_id)
+            await edit_admin(
+                callback,
+                f"Удалить группу <b>{esc(title)}</b> из белого списка?\n\n"
+                "Бот останется в группе, но перестанет отвечать. Контекст группы будет удалён.",
+                confirm_kb(f"adm:gdelok:{chat_id}", "adm:groups:0"),
+            )
+            await callback.answer()
+            return
+        if action == "gdelok":
+            chat_id = int(parts[2])
+            await storage.remove_group(chat_id)
+            ALLOWED_GROUPS.discard(chat_id)
+            _groups_cache.pop(chat_id, None)
+            await clear_chat_context(chat_id)
+            await storage.add_admin_action(OWNER_ID, "group_remove", str(chat_id))
+            text, kb = await admin_section("groups")
+            await edit_admin(callback, text, kb)
+            await callback.answer("Группа убрана из белого списка.")
+            return
+
+        if action == "bladd":
+            _admin_input[OWNER_ID] = {"action": "blacklist_id"}
+            await callback.answer()
+            await callback.message.answer(
+                "Отправь ID пользователя или перешли его сообщение.\n\n/cancel — отмена."
+            )
+            return
+        if action == "bldel":
+            user_id = int(parts[2])
+            item = _dm_blacklist.get(user_id) or {}
+            name = item.get("full_name") or item.get("username") or str(user_id)
+            await edit_admin(
+                callback,
+                f"Разблокировать <b>{esc(name)}</b> в ЛС?",
+                confirm_kb(f"adm:bldelok:{user_id}", "adm:bl:0"),
+            )
+            await callback.answer()
+            return
+        if action == "bldelok":
+            user_id = int(parts[2])
+            await storage.remove_blacklist(user_id)
+            _dm_blacklist.pop(user_id, None)
+            await storage.add_admin_action(OWNER_ID, "blacklist_remove", str(user_id))
+            text, kb = await admin_section("bl")
+            await edit_admin(callback, text, kb)
+            await callback.answer("Разблокирован.")
+            return
+
+        if action == "dsadd":
+            _admin_input[OWNER_ID] = {"action": "grant_id"}
+            await callback.answer()
+            await callback.message.answer(
+                "Отправь ID пользователя или перешли его сообщение, чтобы выдать DeepSeek.\n\n"
+                "/cancel — отмена."
+            )
+            return
+        if action == "dsdel":
+            user_id = int(parts[2])
+            item = _deepseek_grants.get(user_id) or {}
+            name = item.get("full_name") or item.get("username") or str(user_id)
+            await edit_admin(
+                callback,
+                f"Отозвать доступ к DeepSeek у <b>{esc(name)}</b>?\n\n"
+                "Модель сбросится на Groq, контекст будет очищен.",
+                confirm_kb(f"adm:dsdelok:{user_id}", "adm:ds:0"),
+            )
+            await callback.answer()
+            return
+        if action == "dsdelok":
+            user_id = int(parts[2])
+            await storage.remove_grant(user_id)
+            _deepseek_grants.pop(user_id, None)
+            _selected_model.pop(user_id, None)
+            await clear_chat_context(user_id)
+            await refresh_user_commands(user_id, granted=False)
+            await storage.add_admin_action(OWNER_ID, "grant_remove", str(user_id))
+            try:
+                await bot.send_message(
+                    user_id,
+                    "🔒 Доступ к DeepSeek отозван. Модель переключена на Groq, контекст очищен.",
+                )
+            except Exception:
+                pass
+            text, kb = await admin_section("ds")
+            await edit_admin(callback, text, kb)
+            await callback.answer("Доступ отозван.")
+            return
+
+        if action == "fperiod":
+            period = parts[2] if len(parts) > 2 else "7"
+            flt = admin_filters(OWNER_ID)
+            flt["period"] = period if period in ("t", "7", "a") else "7"
+            flt["date_from"] = None
+            text, kb = filter_view(flt)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "fmodel":
+            model = parts[2] if len(parts) > 2 else "all"
+            flt = admin_filters(OWNER_ID)
+            flt["model"] = None if model == "all" else model
+            text, kb = filter_view(flt)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "fuser":
+            _admin_input[OWNER_ID] = {"action": "req_user"}
+            await callback.answer()
+            await callback.message.answer("Введи ID пользователя или 0, чтобы сбросить.")
+            return
+        if action == "fdate":
+            _admin_input[OWNER_ID] = {"action": "req_date"}
+            await callback.answer()
+            await callback.message.answer(
+                "Введи дату: <code>22.11.2026</code> или <code>2026-11-22</code>."
+            )
+            return
+        if action == "fclear":
+            _admin_filter[OWNER_ID] = {
+                "period": "7",
+                "user_id": None,
+                "model": None,
+                "date_from": None,
+            }
+            text, kb = filter_view(admin_filters(OWNER_ID))
+            await edit_admin(callback, text, kb)
+            await callback.answer("Фильтры сброшены.")
+            return
+
+        if action == "reqcsv":
+            flt = admin_filters(OWNER_ID)
+            start, end = admin_period_bounds(flt)
+            csv_text = await storage.export_requests(
+                user_id=flt.get("user_id"),
+                model=flt.get("model"),
+                start=start,
+                end=end,
+            )
+            filename = f"mox_requests_{msk_now().strftime('%Y%m%d_%H%M')}.csv"
+            await bot.send_document(
+                callback.message.chat.id,
+                BufferedInputFile(csv_text.encode("utf-8"), filename=filename),
+                caption="📄 Экспорт запросов по текущим фильтрам.",
+            )
+            await callback.answer("CSV отправлен.")
+            return
+        if action == "csvall":
+            csv_text = await storage.export_requests(limit=50000)
+            filename = f"mox_all_requests_{msk_now().strftime('%Y%m%d_%H%M')}.csv"
+            await bot.send_document(
+                callback.message.chat.id,
+                BufferedInputFile(csv_text.encode("utf-8"), filename=filename),
+                caption="📄 Все запросы (до 50 000 строк).",
+            )
+            await callback.answer("CSV отправлен.")
+            return
+        if action == "cleanup":
+            _admin_input[OWNER_ID] = {"action": "cleanup_days"}
+            await callback.answer()
+            await callback.message.answer("За сколько дней удалить логи? Введи число, например 30.")
+            return
+        if action == "cleanok":
+            days = int(parts[2])
+            deleted = await storage.cleanup_logs(days)
+            await storage.add_admin_action(OWNER_ID, "logs_cleanup", f"{days} дней")
+            text, kb = await admin_section("set")
+            await edit_admin(
+                callback,
+                f"✅ Удалено записей: <b>{fmt_int(deleted)}</b> (старше {days} дней).\n\n" + text,
+                kb,
+            )
+            await callback.answer("Готово.")
+            return
+
+        await callback.answer()
+    except Exception as e:
+        logging.exception("Admin callback error")
+        await callback.answer(f"Ошибка: {e}"[:180], show_alert=True)
+
+
+async def send_daily_summary() -> None:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=24)
+    data = await storage.stats(start, end)
+    lines = [
+        "📊 <b>Сводка за 24 часа</b>",
+        "",
+        f"Запросов: <b>{fmt_int(data['requests'])}</b>",
+        f"Вызовов моделей: <b>{fmt_int(data['calls'])}</b>",
+        f"Ошибок: <b>{fmt_int(data['request_errors'] + data['call_errors'])}</b>",
+    ]
+    for m in (data.get("models") or [])[:6]:
+        lines.append(
+            f"• <code>{esc(m['model'])}</code>: {fmt_int(m['total_tokens'])} ток."
+        )
+    if data.get("top_users"):
+        lines.append("\nТоп пользователей:")
+        for u in data["top_users"][:5]:
+            lines.append(f"• <code>{u['user_id']}</code> — {fmt_int(u['requests'])}")
+    lines.append(f"\nКредиты: <b>{data['credits']:.4f}</b>")
+    try:
+        await bot.send_message(OWNER_ID, "\n".join(lines))
+    except Exception as e:
+        logging.warning(f"Daily summary send failed: {e}")
+    await storage.set_setting("last_daily_summary", msk_now().isoformat())
+
+
+async def daily_summary_loop() -> None:
+    # Догоняем сводку, если бот был перезапущен после 04:00 и она не ушла.
+    try:
+        now = msk_now()
+        today_four = now.replace(hour=4, minute=0, second=0, microsecond=0)
+        raw = await storage.get_setting("last_daily_summary")
+        last: datetime | None = None
+        if raw:
+            try:
+                last = datetime.fromisoformat(raw)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=MSK)
+                last = last.astimezone(MSK)
+            except ValueError:
+                last = None
+        if last is None:
+            await storage.set_setting("last_daily_summary", now.isoformat())
+        elif now >= today_four and last < today_four:
+            logging.info("Отправляю пропущенную ежедневную сводку")
+            await send_daily_summary()
+    except Exception:
+        logging.exception("Daily summary catch-up failed")
+
+    while True:
+        try:
+            now = msk_now()
+            target = now.replace(hour=4, minute=0, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            wait = (target - now).total_seconds()
+            logging.info(f"Ежедневная сводка через {wait / 3600:.1f} ч")
+            await asyncio.sleep(wait)
+            await send_daily_summary()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Daily summary error")
+            await asyncio.sleep(300)
+
+
+class DMBlacklistMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if (
+            isinstance(event, Message)
+            and event.chat.type == ChatType.PRIVATE
+            and event.from_user
+            and is_blacklisted(event.from_user.id)
+        ):
+            await record_blocked(event)
+            now = time.time()
+            if now - _block_reply_last.get(event.from_user.id, 0) >= BLOCK_REPLY_COOLDOWN:
+                _block_reply_last[event.from_user.id] = now
+                try:
+                    await event.answer("доступ закрыт")
+                except Exception:
+                    pass
+            return
+        return await handler(event, data)
+
+
+# ============================================================
 # СЛУЖЕБНЫЕ СОБЫТИЯ
 # ============================================================
 
@@ -1520,7 +3404,7 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                 "Меня добавили в новую группу.\n"
                 f"Название: <b>{esc(chat.title)}</b>\n"
                 f"ID: <code>{chat.id}</code>\n"
-                "Чтобы включить бота, добавь этот ID в <code>ALLOWED_GROUPS</code>.",
+                "Чтобы включить бота, добавь группу через /admin.",
             )
         except Exception as e:
             logging.warning(f"Owner notify failed: {e}")
@@ -1533,7 +3417,7 @@ async def on_users_join(message: Message):
     for user in message.new_chat_members or []:
         if BOT_ID is not None and user.id == BOT_ID:
             continue
-        add_to_history(message.chat.id, "user", f"[в чат вошёл {display_user(user)}]")
+        await add_to_history(message.chat.id, "user", f"[в чат вошёл {display_user(user)}]")
 
 
 @dp.message(F.left_chat_member)
@@ -1545,7 +3429,7 @@ async def on_user_leave(message: Message):
         return
     if BOT_ID is not None and user.id == BOT_ID:
         return
-    add_to_history(message.chat.id, "user", f"[из чата вышел {display_user(user)}]")
+    await add_to_history(message.chat.id, "user", f"[из чата вышел {display_user(user)}]")
 
 
 # ============================================================
@@ -1553,7 +3437,7 @@ async def on_user_leave(message: Message):
 # ============================================================
 
 
-async def simple_answer(prompt: str) -> str:
+async def simple_answer(prompt: str, *, track: Track | None = None) -> str:
     messages = [
         {"role": "system", "content": system_prompt()},
         {"role": "user", "content": prompt},
@@ -1569,7 +3453,9 @@ async def simple_answer(prompt: str) -> str:
     if has_search_verb(prompt):
         forced = {"type": "function", "function": {"name": "web_search"}}
 
-    return await run_tools(messages, SEARCH_TOOLS, executor, forced)
+    return await run_tools(
+        messages, SEARCH_TOOLS, executor, forced, provider="groq", track=track, effort="low"
+    )
 
 
 @dp.inline_query()
@@ -1593,11 +3479,36 @@ async def on_inline(query: InlineQuery):
         )
         return
 
+    user = query.from_user
+    request_id = await storage.create_request(
+        user_id=user.id if user else None,
+        username=username_of(user),
+        chat_id=None,
+        chat_type="inline",
+        kind="inline",
+        is_request=True,
+        model="groq",
+        prompt_preview=prompt,
+    )
+    track = Track(request_id=request_id, user_id=user.id if user else None, chat_id=None)
+    started = time.perf_counter()
+    status = "ok"
+    error_text = ""
     try:
-        answer = await simple_answer(prompt)
+        answer = await simple_answer(prompt, track=track)
     except Exception as e:
         logging.exception("Inline error")
+        status = "error"
+        error_text = str(e)
         answer = f"⚠️ Ошибка: {e}"
+    finally:
+        await finish_track(
+            track,
+            status=status,
+            error=error_text,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            model="groq",
+        )
 
     answer = sanitize_html(answer)[:3800] or "Пустой ответ."
     # Для inline надёжнее отправить чистый текст: обрезанный HTML может
@@ -1627,18 +3538,54 @@ async def on_inline(query: InlineQuery):
 # ФОТО
 # ============================================================
 
+DEEPSEEK_PHOTO_DESCRIBE_PROMPT = (
+    "Ты — внимательный ассистент. На фото — учебное задание или несколько заданий. "
+    "Сначала полностью перепиши ВЕСЬ видимый текст с каждого фото, включая условия, "
+    "варианты ответов, подписи, формулы и числа. Формулы запиши понятным текстом. "
+    "Опиши схемы, таблицы, графики и рисунки. Обязательно отметь, что видно плохо, "
+    "размыто, обрезано или не помещается в кадр. Не решай задания на этом шаге. "
+    "Сделай разбор по каждому фото, затем короткий общий итог."
+)
 
-async def album_worker(key):
+DEEPSEEK_PHOTO_SOLVE_PROMPT = (
+    "Ниже полное описание всех фото и вопрос пользователя. Реши задания подробно "
+    "и по порядку. Если заданий несколько — реши каждое отдельно, не пропускай. "
+    "Если в описании есть сомнительные или плохо видимые места — скажи об этом. "
+    "Не пересказывай всё описание заново, сразу переходи к решению."
+)
+
+
+async def photo_session_worker(
+    key: tuple[int, int], generation: int, delay: float = PHOTO_SESSION_DELAY
+) -> None:
     try:
-        await asyncio.sleep(ALBUM_DELAY)
-        messages = _album_buffers.pop(key, [])
+        await asyncio.sleep(delay)
+        if _photo_generation.get(key) != generation:
+            return
+        messages = _photo_sessions.pop(key, [])
     finally:
-        _album_tasks.pop(key, None)
+        if _photo_generation.get(key) == generation:
+            _photo_tasks.pop(key, None)
     if messages:
         try:
             await process_photos(messages)
         except Exception:
-            logging.exception("Album processing error")
+            logging.exception("Photo session processing error")
+
+
+def enqueue_photo(message: Message, delay: float = PHOTO_SESSION_DELAY) -> None:
+    if not message.from_user:
+        return
+    key = (message.chat.id, message.from_user.id)
+    _photo_sessions.setdefault(key, []).append(message)
+    _photo_generation[key] = _photo_generation.get(key, 0) + 1
+    generation = _photo_generation[key]
+    old_task = _photo_tasks.pop(key, None)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    if len(_photo_sessions[key]) >= DEEPSEEK_PHOTO_LIMIT:
+        delay = 0.15
+    _photo_tasks[key] = asyncio.create_task(photo_session_worker(key, generation, delay))
 
 
 @dp.message(F.photo)
@@ -1646,72 +3593,118 @@ async def on_photo(message: Message):
     user = message.from_user
     if not user or user.is_bot:
         return
-
-    if message.media_group_id:
-        key = (message.chat.id, message.media_group_id)
-        _album_buffers.setdefault(key, []).append(message)
-        if key not in _album_tasks:
-            _album_tasks[key] = asyncio.create_task(album_worker(key))
+    if await maybe_admin_input(message):
         return
 
-    await process_photos([message])
+    if not is_private(message) and not is_whitelisted(message.chat.id):
+        if is_addressed(message, message.caption) and can_send_fallback(message.chat.id):
+            await message.reply(FALLBACK_TEXT)
+        else:
+            await log_group_event(message, message.caption or "")
+        return
+
+    enqueue_photo(message)
 
 
 async def process_photos(messages: list[Message]) -> None:
+    messages = messages[:DEEPSEEK_PHOTO_LIMIT]
     first = messages[0]
     chat_id = first.chat.id
     private = is_private(first)
+    user = first.from_user
 
     if not private and not is_whitelisted(chat_id):
-        addressed = any(is_addressed(m, m.caption) for m in messages)
-        if addressed and can_send_fallback(chat_id):
+        if any(is_addressed(m, m.caption) for m in messages) and can_send_fallback(chat_id):
             await first.reply(FALLBACK_TEXT)
+        else:
+            for m in messages:
+                await log_group_event(m, m.caption or "")
         return
 
     addressed = private or any(is_addressed(m, m.caption) for m in messages)
     if not addressed:
-        # В группах фото без обращения не попадает в контекст (только текст,
-        # стикеры и прочие медиа логируются заглушками).
+        for m in messages:
+            await log_group_event(m, m.caption or "")
         return
+
+    if not private:
+        for m in messages:
+            await log_group_event(m, m.caption or "")
 
     if is_on_cooldown(first):
         return
 
-    turn = Turn(message=first, chat_id=chat_id, is_private=private)
+    model = await resolve_model(user.id if user else None, private)
+
+    caption = next((m.caption.strip() for m in messages if m.caption), "")
+    question = strip_triggers(caption) if caption else ""
+    if not question:
+        question = "реши подробно" if model == "deepseek" else "Что на фото?"
+
+    track = await begin_request(
+        first,
+        kind="photo",
+        prompt=question,
+        model=model,
+    )
+    started = time.perf_counter()
+
+    if model == "deepseek" and private:
+        async with chat_lock(chat_id):
+            await process_deepseek_photos(messages, question, track, started)
+        return
+
+    await process_groq_photos(messages, question, track, started)
+
+
+async def process_groq_photos(messages: list[Message], question: str, track: Track, started: float) -> None:
+    first = messages[0]
+    chat_id = first.chat.id
+    private = is_private(first)
+    turn = Turn(message=first, chat_id=chat_id, is_private=private, model="groq", track=track)
     await turn.status.show("👁 Смотрю фото…")
 
     descriptions: list[str] = []
-    last_error = ""
-    for m in messages[:MAX_ALBUM_PHOTOS]:
+    failed: list[int] = []
+    for index, m in enumerate(messages, 1):
         try:
             data = await download_image_bytes(m)
-            desc = await describe_image(data)
+            desc = await describe_image(data, track=track)
             if desc:
                 descriptions.append(desc)
                 _media_cache[(chat_id, m.message_id)] = desc
+            else:
+                failed.append(index)
         except Exception as e:
-            last_error = str(e)
+            failed.append(index)
             logging.warning(f"Photo describe failed: {e}")
 
     if not descriptions:
         await turn.status.clear()
-        await send_text(turn, f"⚠️ Не удалось посмотреть фото: <code>{esc(last_error or 'неизвестная ошибка')}</code>")
+        await send_text(
+            turn,
+            "⚠️ Не удалось посмотреть фото. Попробуй отправить ещё раз.",
+        )
+        await finish_track(
+            track,
+            status="error",
+            error="all photos failed",
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            model="groq",
+        )
         return
-
-    caption = next((m.caption.strip() for m in messages if m.caption), "")
-    question = strip_triggers(caption) if caption else ""
-    question = question or "Что на фото?"
 
     if len(descriptions) == 1:
         photo_block = descriptions[0]
     else:
         photo_block = "\n".join(f"{i}) {d}" for i, d in enumerate(descriptions, 1))
+    if failed:
+        photo_block += "\n\nНе удалось прочитать фото: " + ", ".join(str(i) for i in failed)
 
     quote = ""
     for m in messages:
         if m.reply_to_message:
-            # Если отвечают на чужое фото/голосовое — описываем его через Gemini/Whisper.
-            quote, _ = await build_reply_block(m, need_media=True)
+            quote, _ = await build_reply_block(m, need_media=True, track=track)
             break
 
     if private:
@@ -1724,7 +3717,7 @@ async def process_photos(messages: list[Message]) -> None:
             f"{display_user(first.from_user)}: {quote}прислал фото:\n{photo_block}\n\n"
             f"Вопрос/подпись: {question}"
         )
-    add_to_history(chat_id, "user", entry)
+    await add_to_history(chat_id, "user", entry)
 
     turn.user_text = question
     draw = detect_explicit_draw(question)
@@ -1732,9 +3725,195 @@ async def process_photos(messages: list[Message]) -> None:
         draw = f"{draw}. Референс: {'; '.join(descriptions)}"
     turn.explicit_draw = draw
 
-    logging.info(f"[{chat_id}] ФОТО ({len(descriptions)}) | {question[:80]}")
+    if failed:
+        await send_text(
+            turn,
+            "⚠️ Не удалось прочитать фото: <b>"
+            + ", ".join(str(i) for i in failed)
+            + "</b>. Остальные обработал.",
+        )
+
+    logging.info(f"[{chat_id}] ФОТО Groq ({len(descriptions)}) | {question[:80]}")
     async with chat_lock(chat_id):
         await run_ai(turn)
+
+
+def _deepseek_photo_messages(images: list[tuple[str, bytes]], text: str) -> list[dict]:
+    content: list[dict] = [{"type": "text", "text": text}]
+    for mime, data in images:
+        b64 = base64.b64encode(data).decode()
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            }
+        )
+    return [{"role": "user", "content": content}]
+
+
+async def process_deepseek_photos(
+    messages: list[Message],
+    question: str,
+    track: Track,
+    started: float,
+) -> None:
+    first = messages[0]
+    chat_id = first.chat.id
+    private = is_private(first)
+    turn = Turn(
+        message=first,
+        chat_id=chat_id,
+        is_private=private,
+        user_text=question,
+        model="deepseek",
+        track=track,
+    )
+    status = "ok"
+    error_text = ""
+    try:
+        await turn.status.show("👁 DeepSeek читает фото…")
+        images: list[tuple[str, bytes]] = []
+        failed: list[int] = []
+        for index, m in enumerate(messages, 1):
+            try:
+                data = await download_image_bytes(m)
+                mime = image_mime(
+                    data,
+                    (m.document.mime_type if m.document else None),
+                )
+                images.append((mime, data))
+            except Exception as e:
+                failed.append(index)
+                logging.warning(f"DeepSeek photo download failed: {e}")
+
+        if not images:
+            await send_text(turn, "⚠️ Не удалось скачать ни одного фото.")
+            status = "error"
+            error_text = "all photos failed"
+            return
+
+        failed_note = ""
+        if failed:
+            failed_note = (
+                "\n\nВнимание: фото " + ", ".join(str(i) for i in failed)
+                + " не удалось прочитать. Реши то, что видно на остальных."
+            )
+
+        describe_text = DEEPSEEK_PHOTO_DESCRIBE_PROMPT + failed_note
+        describe_result = await call_model(
+            "deepseek",
+            _deepseek_photo_messages(images, describe_text),
+            track=track,
+            effort="high",
+            max_tokens=DEEPSEEK_MAX_TOKENS,
+        )
+        description = (describe_result.content or "").strip()
+        if not description:
+            raise RuntimeError("DeepSeek не вернул описание фото")
+
+        await turn.status.show("🧠 Решаю задание…")
+        needs_high = True
+        user_question = question or "реши подробно"
+        solve_text = (
+            DEEPSEEK_PHOTO_SOLVE_PROMPT
+            + "\n\nОПИСАНИЕ ФОТО:\n"
+            + description
+            + "\n\nВОПРОС ПОЛЬЗОВАТЕЛЯ: "
+            + user_question
+            + failed_note
+        )
+        solve_messages = [
+            {"role": "system", "content": system_prompt()},
+            *_deepseek_photo_messages(images, solve_text),
+        ]
+
+        turn.explicit_draw = draw_with_reference(detect_explicit_draw(question), description)
+        if turn.explicit_draw:
+            forced = {"type": "function", "function": {"name": "generate_image"}}
+        elif has_search_verb(user_question):
+            forced = {"type": "function", "function": {"name": "web_search"}}
+        else:
+            forced = None
+
+        async def executor(name, args):
+            return await execute_tool(turn, name, args)
+
+        answer = await run_tools(
+            solve_messages,
+            TOOLS,
+            executor,
+            forced,
+            provider="deepseek",
+            track=track,
+            effort="high" if needs_high else "low",
+        )
+
+        photo_label = "фото" if len(images) == 1 else f"фото ({len(images)})"
+        if private:
+            entry = (
+                f"Пользователь прислал {photo_label}:\n{description}\n\n"
+                f"Вопрос/подпись: {user_question}{failed_note}"
+            )
+        else:
+            entry = (
+                f"{display_user(first.from_user)}: прислал {photo_label}:\n{description}\n\n"
+                f"Вопрос/подпись: {user_question}{failed_note}"
+            )
+        await add_to_history(chat_id, "user", entry)
+
+        if failed:
+            await send_text(
+                turn,
+                "⚠️ Не удалось прочитать фото: <b>"
+                + ", ".join(str(i) for i in failed)
+                + "</b>. Остальные обработал.",
+            )
+
+        if turn.explicit_draw and not turn.image_sent and not turn.image_error:
+            await fallback_draw(turn)
+
+        if turn.image_sent:
+            await add_to_history(
+                chat_id,
+                "assistant",
+                f"Отправил сгенерированную картинку: {turn.image_prompt_ru}",
+            )
+        elif turn.image_error:
+            await add_to_history(
+                chat_id,
+                "assistant",
+                f"Не удалось сгенерировать изображение: {turn.image_error}",
+            )
+
+        if answer:
+            if not (turn.image_sent and is_trivial(answer)):
+                await send_text(turn, answer)
+                await add_to_history(chat_id, "assistant", answer)
+        elif not turn.image_sent and not turn.image_error:
+            fallback_text = "Не смог разобрать задание. Попробуй сфотографировать чётче."
+            await send_text(turn, fallback_text)
+            await add_to_history(chat_id, "assistant", fallback_text)
+
+        _stats[chat_id] = _stats.get(chat_id, 0) + 1
+        logging.info(f"[{chat_id}] ФОТО DeepSeek ({len(images)}) | {question[:80]}")
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
+    except Exception as e:
+        status = "error"
+        error_text = str(e)
+        logging.exception("DeepSeek photo error")
+        await send_ds_switch_button(turn, friendly_ai_error(e))
+    finally:
+        await finish_track(
+            track,
+            status=status,
+            error=error_text,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            model="deepseek",
+            tools=",".join(turn.tools_used),
+        )
+        await turn.status.clear()
 
 
 # ============================================================
@@ -1747,9 +3926,17 @@ async def on_document(message: Message):
     user = message.from_user
     if not user or user.is_bot:
         return
+    if await maybe_admin_input(message):
+        return
     mime = (message.document.mime_type or "") if message.document else ""
     if mime.startswith("image/"):
-        await process_photos([message])
+        if not is_private(message) and not is_whitelisted(message.chat.id):
+            if is_addressed(message, message.caption) and can_send_fallback(message.chat.id):
+                await message.reply(FALLBACK_TEXT)
+            else:
+                await log_group_event(message, message.caption or "")
+            return
+        enqueue_photo(message)
         return
     await log_other(message)
 
@@ -1764,6 +3951,8 @@ async def on_voice(message: Message):
     user = message.from_user
     if not user or user.is_bot:
         return
+    if await maybe_admin_input(message):
+        return
 
     chat_id = message.chat.id
     private = is_private(message)
@@ -1773,16 +3962,42 @@ async def on_voice(message: Message):
             await message.reply(FALLBACK_TEXT)
         return
 
+    if private and is_on_cooldown(message):
+        return
+
     await safe_typing(chat_id)
 
+    model = await resolve_model(user.id, private) if private else "groq"
+    track: Track | None = None
+    if private:
+        # Запрос создаём до расшифровки, чтобы вызов Whisper попал в лог,
+        # а превью обновим распознанным текстом сразу после транскрипции.
+        track = await begin_request(
+            message,
+            kind="voice",
+            prompt="(голосовое)",
+            model=model,
+        )
+
     path = None
+    whisper_started = time.perf_counter()
     try:
         path = await download_media_to_temp(message)
-        transcript = await transcribe_voice(path)
+        transcript = await transcribe_voice(path, track=track)
     except Exception as e:
         logging.warning(f"Voice transcription failed: {e}")
+        if track is not None:
+            await finish_track(
+                track,
+                status="error",
+                error=str(e),
+                latency_ms=int((time.perf_counter() - whisper_started) * 1000),
+                model=model,
+            )
+        if not private:
+            await log_group_event(message, "(голосовое, не удалось расшифровать)")
         if private or is_reply_to_bot(message):
-            await reply_any(message, f"⚠️ Не удалось расшифровать голосовое: <code>{esc(e)}</code>")
+            await reply_any(message, f"⚠️ Не удалось расшифровать голосовое: <code>{esc(friendly_ai_error(e))}</code>")
         return
     finally:
         if path:
@@ -1791,27 +4006,81 @@ async def on_voice(message: Message):
             except Exception:
                 pass
 
+    whisper_ms = int((time.perf_counter() - whisper_started) * 1000)
+
     if not transcript:
+        if track is not None:
+            await finish_track(
+                track,
+                status="error",
+                error="empty transcript",
+                latency_ms=whisper_ms,
+                model=model,
+            )
+        if not private:
+            await log_group_event(message, "(голосовое, не удалось распознать)")
         if private or is_reply_to_bot(message):
             await reply_any(message, "🤔 Не удалось распознать голосовое.")
         return
 
     addressed = private or is_reply_to_bot(message) or starts_with_trigger(transcript)
     if not addressed:
-        # В группах голосовые без обращения в контекст не попадают.
-        return
-
-    if is_on_cooldown(message):
+        await log_group_event(message, f"(голосовое, расшифровка): {transcript}")
+        # В неадресованных сообщениях запроса нет, но Whisper уже вызван —
+        # фиксируем его как отдельный вызов модели.
+        await storage.add_call(
+            request_id=None,
+            user_id=user.id,
+            chat_id=chat_id,
+            provider="groq",
+            model=WHISPER_MODEL,
+            latency_ms=whisper_ms,
+        )
         return
 
     cleaned = strip_triggers(transcript) if starts_with_trigger(transcript) else transcript
+    if not cleaned:
+        cleaned = "реши подробно" if private else "(обратился без вопроса)"
     _media_cache[(chat_id, message.message_id)] = cleaned
 
-    quote, media_desc = await build_reply_block(message, need_media=True)
+    if not private:
+        await log_group_event(message, f"(голосовое, расшифровка): {cleaned}")
+
+    if not private and is_on_cooldown(message):
+        # Whisper уже отработал, поэтому фиксируем вызов даже без ответа.
+        await storage.add_call(
+            request_id=None,
+            user_id=user.id,
+            chat_id=chat_id,
+            provider="groq",
+            model=WHISPER_MODEL,
+            latency_ms=whisper_ms,
+        )
+        return
+
+    if not private:
+        track = await begin_request(
+            message,
+            kind="voice",
+            prompt=cleaned,
+            model=model,
+        )
+        await storage.add_call(
+            request_id=track.request_id,
+            user_id=user.id,
+            chat_id=chat_id,
+            provider="groq",
+            model=WHISPER_MODEL,
+            latency_ms=whisper_ms,
+        )
+    else:
+        await storage.update_request_preview(track.request_id, cleaned)
+    quote, media_desc = await build_reply_block(
+        message, need_media=True, track=track, provider=model
+    )
     label = "" if private else f"{display_user(user)}: "
-    entry_text = cleaned or "(обратился без вопроса)"
-    entry = f"{label}{quote}(голосовое, расшифровка, возможны ошибки): {entry_text}"
-    add_to_history(chat_id, "user", entry)
+    entry = f"{label}{quote}(голосовое, расшифровка, возможны ошибки): {cleaned}"
+    await add_to_history(chat_id, "user", entry)
 
     draw = detect_explicit_draw(cleaned)
     if draw and media_desc and re.search(r"(такое же|похожее|это же|это)", draw, flags=re.IGNORECASE):
@@ -1822,9 +4091,11 @@ async def on_voice(message: Message):
         is_private=private,
         user_text=cleaned,
         explicit_draw=draw,
+        model=model,
+        track=track,
     )
 
-    logging.info(f"[{chat_id}] ГОЛОС | {cleaned[:80]}")
+    logging.info(f"[{chat_id}] ГОЛОС | model={model} | {cleaned[:80]}")
     async with chat_lock(chat_id):
         await run_ai(turn)
 
@@ -1849,8 +4120,13 @@ async def handle_private_text(message: Message) -> None:
         return
 
     chat_id = message.chat.id
-    quote, media_desc = await build_reply_block(message, need_media=True)
-    add_to_history(chat_id, "user", f"{quote}{text}")
+    user = message.from_user
+    model = await resolve_model(user.id if user else None, True)
+    track = await begin_request(message, kind="text", prompt=text, model=model)
+    quote, media_desc = await build_reply_block(
+        message, need_media=True, track=track, provider=model
+    )
+    await add_to_history(chat_id, "user", f"{quote}{text}")
 
     turn = Turn(
         message=message,
@@ -1858,8 +4134,10 @@ async def handle_private_text(message: Message) -> None:
         is_private=True,
         user_text=text,
         explicit_draw=draw_with_reference(detect_explicit_draw(text), media_desc),
+        model=model,
+        track=track,
     )
-    logging.info(f"[{chat_id}] ЛС | {text[:100]}")
+    logging.info(f"[{chat_id}] ЛС | model={model} | {text[:100]}")
     async with chat_lock(chat_id):
         await run_ai(turn)
 
@@ -1874,29 +4152,43 @@ async def handle_group_text(message: Message) -> None:
             await message.reply(FALLBACK_TEXT)
         return
 
+    # В белых группах логируем каждое сообщение отдельно.
+    await log_group_event(message, text)
+
     addressed = is_addressed(message, text)
 
     if not addressed:
         quote, _ = await build_reply_block(message, need_media=False)
-        add_to_history(chat_id, "user", f"{display_user(user)}: {quote}{text}")
+        await add_to_history(chat_id, "user", f"{display_user(user)}: {quote}{text}")
+        return
+
+    if is_on_cooldown(message):
         return
 
     quote, media_desc = await build_reply_block(message, need_media=True)
     cleaned = strip_triggers(text)
     entry_text = cleaned or "(обратился без вопроса)"
-    add_to_history(chat_id, "user", f"{display_user(user)}: {quote}{entry_text}")
+    if not cleaned:
+        cleaned = "реши подробно"
+    await add_to_history(chat_id, "user", f"{display_user(user)}: {quote}{entry_text}")
+
+    track = await begin_request(
+        message,
+        kind="group_request",
+        prompt=text,
+        model="groq",
+    )
 
     logging.info(f"{display_user(user)} | {text[:100]}")
-
-    if is_on_cooldown(message):
-        return
 
     turn = Turn(
         message=message,
         chat_id=chat_id,
         is_private=False,
-        user_text=cleaned or text,
+        user_text=cleaned,
         explicit_draw=draw_with_reference(detect_explicit_draw(cleaned), media_desc),
+        model="groq",
+        track=track,
     )
     async with chat_lock(chat_id):
         await run_ai(turn)
@@ -1906,6 +4198,8 @@ async def handle_group_text(message: Message) -> None:
 async def on_text(message: Message):
     user = message.from_user
     if not user or user.is_bot:
+        return
+    if await maybe_admin_input(message):
         return
     if is_private(message):
         await handle_private_text(message)
@@ -1924,19 +4218,22 @@ async def log_other(message: Message) -> None:
         return
     caption = f" (подпись: {message.caption[:200]})" if message.caption else ""
     if is_private(message):
-        add_to_history(message.chat.id, "user", f"{placeholder}{caption}")
+        await add_to_history(message.chat.id, "user", f"{placeholder}{caption}")
     elif is_whitelisted(message.chat.id):
-        add_to_history(
+        await add_to_history(
             message.chat.id,
             "user",
             f"{display_user(message.from_user)}: {placeholder}{caption}",
         )
+        await log_group_event(message, f"{placeholder}{caption}")
 
 
 @dp.message()
 async def on_other(message: Message):
     user = message.from_user
     if not user or user.is_bot:
+        return
+    if await maybe_admin_input(message):
         return
     if (
         not is_private(message)
@@ -1954,17 +4251,67 @@ async def on_other(message: Message):
 # ============================================================
 
 
+BASE_COMMANDS = [
+    BotCommand(command="start", description="Приветствие"),
+    BotCommand(command="help", description="Что я умею"),
+    BotCommand(command="about", description="Инфо обо мне и моделях"),
+    BotCommand(command="clear", description="Очистить контекст чата"),
+    BotCommand(command="context", description="Сколько сообщений в памяти"),
+    BotCommand(command="whoami", description="Мой ID и username"),
+    BotCommand(command="stats", description="Статистика чата"),
+]
+
+
+async def refresh_user_commands(user_id: int, granted: bool | None = None) -> None:
+    if granted is None:
+        granted = int(user_id) == OWNER_ID or int(user_id) in _deepseek_grants
+    commands = list(BASE_COMMANDS)
+    if granted:
+        commands.append(BotCommand(command="model", description="Выбрать модель"))
+    if int(user_id) == OWNER_ID:
+        commands.append(BotCommand(command="admin", description="Админ-панель"))
+    try:
+        await bot.set_my_commands(
+            commands, scope=BotCommandScopeChat(chat_id=int(user_id))
+        )
+    except Exception as e:
+        logging.info(f"set commands for {user_id} skipped: {e}")
+
+
 async def set_commands() -> None:
-    commands = [
-        BotCommand(command="start", description="Приветствие"),
-        BotCommand(command="help", description="Что я умею"),
-        BotCommand(command="about", description="Инфо обо мне и моделях"),
-        BotCommand(command="clear", description="Очистить контекст чата"),
-        BotCommand(command="context", description="Сколько сообщений в памяти"),
-        BotCommand(command="whoami", description="Мой ID и username"),
-        BotCommand(command="stats", description="Статистика чата"),
-    ]
-    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(BASE_COMMANDS, scope=BotCommandScopeDefault())
+    await refresh_user_commands(OWNER_ID, granted=True)
+    for user_id in list(_deepseek_grants.keys()):
+        await refresh_user_commands(user_id, granted=True)
+
+
+async def load_runtime_state() -> None:
+    await storage.connect()
+    groups = await storage.load_groups()
+    _groups_cache.clear()
+    _groups_cache.update(groups)
+    ALLOWED_GROUPS.clear()
+    ALLOWED_GROUPS.update(groups.keys())
+
+    blacklist = await storage.load_blacklist()
+    _dm_blacklist.clear()
+    _dm_blacklist.update(blacklist)
+
+    grants = await storage.load_grants()
+    _deepseek_grants.clear()
+    _deepseek_grants.update(grants)
+
+    contexts = await storage.load_contexts()
+    _history.clear()
+    for chat_id, messages in contexts.items():
+        if isinstance(messages, list):
+            _trim_history(messages)
+            _history[int(chat_id)] = messages
+
+    logging.info(
+        f"Загружено: групп={len(_groups_cache)}, ЛС в блоке={len(_dm_blacklist)}, "
+        f"DeepSeek={len(_deepseek_grants)}, контекстов={len(_history)}"
+    )
 
 
 async def health_server() -> None:
@@ -2001,9 +4348,14 @@ async def main() -> None:
     BOT_USERNAME = me.username or ""
     logging.info(f"Бот запущен: @{BOT_USERNAME} (id={BOT_ID})")
     logging.info(f"Chat: {CHAT_MODEL} (Groq), fast: {FAST_MODEL}")
+    logging.info(f"DeepSeek: {DEEPSEEK_MODEL} ({'настроен' if deepseek_client.configured else 'нет AIKEYS_API'})")
     logging.info(f"Vision: {VISION_MODEL} (Gemini), fallback: {GROQ_VISION_MODEL} (Groq)")
     logging.info(f"Voice: {WHISPER_MODEL} (Groq)")
     logging.info("Search: Tavily + DDG fallback")
+
+    await load_runtime_state()
+    dp.message.outer_middleware(DMBlacklistMiddleware())
+
     logging.info(f"Allowed groups: {sorted(ALLOWED_GROUPS)}")
 
     try:
@@ -2015,8 +4367,12 @@ async def main() -> None:
     except Exception:
         logging.exception("delete_webhook failed")
 
+    tasks.append(asyncio.create_task(daily_summary_loop()))
     tasks.append(asyncio.create_task(dp.start_polling(bot)))
-    await asyncio.gather(*tasks)
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        await storage.close()
 
 
 if __name__ == "__main__":
