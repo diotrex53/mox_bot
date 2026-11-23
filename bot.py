@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import html
+import inspect
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ from aiogram.enums import ChatAction, ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     BotCommandScopeDefault,
     BufferedInputFile,
@@ -28,6 +30,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultArticle,
+    InputRichMessage,
     InputTextMessageContent,
     Message,
 )
@@ -60,35 +63,76 @@ GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
 
 TAVILY_API_KEY = os.environ.get("TAVIL_API", "")
 
-# DeepSeek — только для владельца и явно выданных пользователей.
+# DeepSeek (aikeysforyou) и Qwen (voidluv) — только владелец и выданные пользователи.
 AIKEYS_API_KEY = os.environ.get("AIKEYS_API", "")
 DEEPSEEK_BASE_URL = "https://api.aikeysforyou.com/v1"
 DEEPSEEK_MODEL = "deepseek-v4.1-flash"
-DEEPSEEK_HISTORY_CHARS_LIMIT = 60000
-DEEPSEEK_MAX_TOKENS = 4000
-DEEPSEEK_DAILY_LIMIT = 50
+
+QWEN_API_KEY = os.environ.get("QWEN_API", "")
+QWEN_BASE_URL = "https://api.voidluv.com/v1"
+# Публичная страница баланса ключа voidluv (её можно переопределить через env).
+VOIDLUV_BALANCE_URL = os.environ.get(
+    "VOIDLUV_BALANCE_URL",
+    "https://voidluv.com/u/05dadbd0-082b-4405-bf35-95e5e0785a62",
+)
+
+# Реестр моделей: ключ -> подпись, провайдер, реальный model id.
+MODEL_REGISTRY: dict[str, dict] = {
+    "groq": {"label": "Groq", "provider": "groq", "model": CHAT_MODEL},
+    "deepseek": {
+        "label": "deepseek-v4.1-flash",
+        "provider": "deepseek",
+        "model": DEEPSEEK_MODEL,
+    },
+    "deepseek-pro": {
+        "label": "deepseek-v4-pro",
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro-0813",
+    },
+    "qwen4-max": {"label": "qwen4-max", "provider": "qwen", "model": "qwen4-max"},
+    "qwen3.8-max": {"label": "qwen3.8-max", "provider": "qwen", "model": "qwen3.8-max"},
+    "qwen3.8-flash": {
+        "label": "qwen3.8-flash",
+        "provider": "qwen",
+        "model": "qwen3.8-flash",
+    },
+}
+PREMIUM_MODELS = [key for key in MODEL_REGISTRY if key != "groq"]
+PROVIDER_LIMITS = {"deepseek": 50, "qwen": 75}
+PROVIDER_NAMES = {"deepseek": "DeepSeek", "qwen": "Qwen"}
+# Для фото используем модель провайдера, которая умеет смотреть картинки.
+PROVIDER_VISION_MODEL = {"deepseek": "deepseek-v4.1-flash", "qwen": "qwen4-max"}
+
+PREMIUM_HISTORY_CHARS_LIMIT = 300000
+PREMIUM_MAX_TOKENS = 16000
+PREMIUM_MAX_TOKENS_CAP = 32000
 DEEPSEEK_PHOTO_LIMIT = 10
 
-# Если запускаешь локально и нужен SOCKS-прокси — впиши сюда,
-# например "socks5://127.0.0.1:10808". На Render оставь пустым.
-PROXY_URL = os.environ.get("PROXY_URL", "")
-
 OWNER_ID = 6101597477
+OWNER_USERNAME = "Diotrex"
 ALLOWED_GROUPS: set[int] = {-1002495961136}
 
 HISTORY_LIMIT = 50
-HISTORY_STORE_CHARS_LIMIT = 60000
+HISTORY_STORE_CHARS_LIMIT = 300000
 HISTORY_CHARS_LIMIT = 14000
 MAX_REPLY_LENGTH = 4000
+MAX_RICH_REPLY_LENGTH = 30000
 CHAT_MAX_TOKENS = 1200
 COOLDOWN_SECONDS = 2
-AI_TIMEOUT = 120.0
+AI_TIMEOUT = 180.0
 TYPING_INTERVAL = 4.0
 FALLBACK_COOLDOWN = 600
 PHOTO_SESSION_DELAY = 2.0
 MAX_ALBUM_PHOTOS = DEEPSEEK_PHOTO_LIMIT
 ADMIN_PAGE_SIZE = 6
 BLOCK_REPLY_COOLDOWN = 5.0
+RICH_DRAFT_INTERVAL = 1.1
+BALANCE_REFRESH_SECONDS = 3600
+BALANCE_ALERT_PERCENT = 20
+
+# Если запускаешь локально и нужен SOCKS-прокси — впиши сюда,
+# например "socks5://127.0.0.1:10808". На Render оставь пустым.
+PROXY_URL = os.environ.get("PROXY_URL", "")
 
 TRIGGER_ROOTS = ("мох", "mox", "moh")
 FALLBACK_TEXT = "Чтобы добавить меня в чат, напишите владельцу @Diotrex."
@@ -131,7 +175,22 @@ deepseek_client = DeepSeekClient(
     model=DEEPSEEK_MODEL,
     http_client=http_client,
     timeout=AI_TIMEOUT,
+    label="DeepSeek",
 )
+
+qwen_client = DeepSeekClient(
+    api_key=QWEN_API_KEY,
+    base_url=QWEN_BASE_URL,
+    model="qwen4-max",
+    http_client=http_client,
+    timeout=AI_TIMEOUT,
+    label="Qwen",
+)
+
+PROVIDER_CLIENTS: dict[str, DeepSeekClient] = {
+    "deepseek": deepseek_client,
+    "qwen": qwen_client,
+}
 
 BOT_ID: int | None = None
 BOT_USERNAME = ""
@@ -151,14 +210,16 @@ _photo_sessions: dict[tuple[int, int], list[Message]] = {}
 _photo_tasks: dict[tuple[int, int], asyncio.Task] = {}
 _photo_generation: dict[tuple[int, int], int] = {}
 
-# Выбранная модель живёт только в памяти: после рестарта снова Groq.
-_selected_model: dict[int, str] = {}
-_deepseek_grants: dict[int, dict] = {}
+# Настройки пользователей и доступы живут в Postgres, здесь — кэш.
+_user_settings: dict[int, dict] = {}
+_grants: dict[tuple[int, str], dict] = {}
 _dm_blacklist: dict[int, dict] = {}
 _groups_cache: dict[int, dict] = {}
-_ds_usage: dict[tuple[int, str], int] = {}
-_ds_limit_notified: set[tuple[int, str]] = set()
+_limit_notified: set[tuple[int, str, str]] = set()
 _block_reply_last: dict[int, float] = {}
+_balance: dict[str, dict] = {}
+_balance_alerted: set[str] = set()
+_model_blocked: dict[str, str] = {}
 
 # Состояние админ-панели
 _admin_input: dict[int, dict] = {}
@@ -355,7 +416,7 @@ def get_history(chat_id: int) -> list[dict]:
 
 
 def history_for_model(chat_id: int, model: str) -> list[dict]:
-    limit = DEEPSEEK_HISTORY_CHARS_LIMIT if model == "deepseek" else HISTORY_CHARS_LIMIT
+    limit = HISTORY_CHARS_LIMIT if model == "groq" else PREMIUM_HISTORY_CHARS_LIMIT
     source = list(_history.get(chat_id, []))
     total = sum(len(str(m.get("content") or "")) for m in source)
     while len(source) > 1 and total > limit:
@@ -444,24 +505,62 @@ def can_send_fallback(chat_id: int) -> bool:
 
 
 # ============================================================
-# МОДЕЛИ И ДОСТУП К DEEPSEEK
+# МОДЕЛИ, ДОСТУП И НАСТРОЙКИ
 # ============================================================
 
 
-def deepseek_eligible(user_id: int | None) -> bool:
+DEFAULT_SETTINGS = {"model": "groq", "rich": True, "deepthink": "off", "search": "auto"}
+
+
+def user_settings(user_id: int | None) -> dict:
+    if user_id is None:
+        return dict(DEFAULT_SETTINGS)
+    return _user_settings.setdefault(int(user_id), dict(DEFAULT_SETTINGS))
+
+
+def provider_of(model_key: str) -> str:
+    return (MODEL_REGISTRY.get(model_key) or {}).get("provider", "groq")
+
+
+def provider_eligible(user_id: int | None, provider: str) -> bool:
+    if provider == "groq":
+        return True
     if user_id is None:
         return False
-    return int(user_id) == OWNER_ID or int(user_id) in _deepseek_grants
+    if int(user_id) == OWNER_ID:
+        return True
+    return (int(user_id), provider) in _grants
 
 
-def selected_model(user_id: int) -> str:
-    if not deepseek_eligible(user_id):
+def model_available(user_id: int | None, model_key: str) -> bool:
+    """Доступна ли модель пользователю (без учёта дневного лимита)."""
+    info = MODEL_REGISTRY.get(model_key)
+    if not info:
+        return False
+    provider = info["provider"]
+    if provider == "groq":
+        return True
+    if not provider_eligible(user_id, provider):
+        return False
+    if model_key in _model_blocked:
+        return False
+    client = PROVIDER_CLIENTS.get(provider)
+    return bool(client and client.configured)
+
+
+def selected_model(user_id: int | None) -> str:
+    """Выбранная модель. Если доступ пропал — Groq."""
+    if user_id is None:
         return "groq"
-    return _selected_model.get(int(user_id), "groq")
+    key = user_settings(user_id).get("model") or "groq"
+    if not model_available(user_id, key):
+        return "groq"
+    return key
 
 
-def model_label(model: str) -> str:
-    return "🧠 DeepSeek" if model == "deepseek" else "🌿 Groq"
+def model_label(model_key: str) -> str:
+    info = MODEL_REGISTRY.get(model_key)
+    return info["label"] if info else str(model_key)
 
 
 def is_blacklisted(user_id: int | None) -> bool:
@@ -497,61 +596,102 @@ def is_complex_task(text: str) -> bool:
     return False
 
 
-async def notify_ds_limit(user_id: int) -> None:
-    key = (int(user_id), msk_today().isoformat())
-    if key in _ds_limit_notified:
+async def notify_limit(user_id: int, provider: str, limit: int) -> None:
+    key = (int(user_id), provider, msk_today().isoformat())
+    if key in _limit_notified:
         return
-    _ds_limit_notified.add(key)
+    _limit_notified.add(key)
+    name = PROVIDER_NAMES.get(provider, provider)
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🌿 Перейти на Groq", callback_data="model:set:groq")]
+        ]
+    )
     try:
         await bot.send_message(
             user_id,
-            "⚠️ Лимит DeepSeek на сегодня исчерпан "
-            f"({DEEPSEEK_DAILY_LIMIT} сообщений). Отвечаю через Groq. "
+            f"⚠️ Лимит {name} на сегодня исчерпан "
+            f"({limit} сообщений). Отвечаю через Groq. "
             "Лимит сбросится в 00:00 МСК.",
+            reply_markup=keyboard,
         )
     except Exception:
         pass
 
 
 async def resolve_model(user_id: int | None, private: bool) -> str:
-    """Возвращает фактическую модель и списывает дневной лимит DeepSeek."""
+    """Возвращает модель для запроса и списывает дневной лимит провайдера."""
     if not private or user_id is None:
         return "groq"
-    if selected_model(user_id) != "deepseek":
+    key = selected_model(user_id)
+    provider = provider_of(key)
+    if provider == "groq":
         return "groq"
     if int(user_id) == OWNER_ID:
-        return "deepseek"
+        return key
+    limit = PROVIDER_LIMITS.get(provider, 0)
     today = msk_today()
-    used = await storage.get_usage(int(user_id), today)
-    if used >= DEEPSEEK_DAILY_LIMIT:
-        await notify_ds_limit(int(user_id))
+    used = await storage.get_usage(int(user_id), provider, today)
+    if used >= limit:
+        await notify_limit(int(user_id), provider, limit)
         return "groq"
-    await storage.inc_usage(int(user_id), today)
-    return "deepseek"
+    await storage.inc_usage(int(user_id), provider, today)
+    return key
 
 
-async def set_model_for_user(user_id: int, model: str) -> tuple[bool, str]:
-    """Переключает модель и очищает всё выбранное. Возвращает (ok, текст)."""
-    if model not in ("groq", "deepseek"):
+async def set_model_for_user(user_id: int, model_key: str) -> tuple[bool, str]:
+    """Переключает модель. Контекст, кэш фото и фотосессии сохраняются."""
+    if model_key not in MODEL_REGISTRY:
         return False, "Неизвестная модель."
-    if int(user_id) != OWNER_ID and int(user_id) not in _deepseek_grants:
-        return False, "DeepSeek тебе не выдан."
-    if model == "deepseek" and not deepseek_client.configured:
-        return False, "DeepSeek не настроен: на сервере нет AIKEYS_API."
-    old = selected_model(user_id)
-    if old == model:
-        return True, f"Уже выбрана модель {model_label(model)}. Контекст не тронут."
-    await clear_chat_context(int(user_id))
-    _selected_model[int(user_id)] = model
-    limit_note = ""
-    if model == "deepseek" and int(user_id) != OWNER_ID:
-        used = await storage.get_usage(int(user_id), msk_today())
-        limit_note = f"\nОсталось сегодня: <b>{max(0, DEEPSEEK_DAILY_LIMIT - used)}</b>."
+    if model_key in _model_blocked:
+        return False, (
+            f"{esc(model_label(model_key))}: {esc(_model_blocked[model_key])}."
+        )
+    if not model_available(user_id, model_key):
+        provider = provider_of(model_key)
+        name = PROVIDER_NAMES.get(provider, provider)
+        return False, f"{name} тебе не выдан. Напиши владельцу @{OWNER_USERNAME}."
+    info = MODEL_REGISTRY[model_key]
+    client = PROVIDER_CLIENTS.get(info["provider"])
+    if info["provider"] != "groq" and (client is None or not client.configured):
+        name = PROVIDER_NAMES.get(info["provider"], info["provider"])
+        return False, f"{name} не настроен на сервере."
+    settings = user_settings(user_id)
+    if settings.get("model") == model_key:
+        return True, f"Уже выбрана модель {model_label(model_key)}."
+    settings["model"] = model_key
+    await storage.save_user_settings(int(user_id), model=model_key)
+    note = ""
+    provider = info["provider"]
+    if provider != "groq" and int(user_id) != OWNER_ID:
+        used = await storage.get_usage(int(user_id), provider, msk_today())
+        limit = PROVIDER_LIMITS.get(provider, 0)
+        note = f"\nОсталось сегодня: <b>{max(0, limit - used)}</b> из {limit}."
     return (
         True,
-        f"Модель переключена на {model_label(model)}. "
-        f"Контекст, кэш фото и незавершённые фотосессии очищены.{limit_note}",
+        f"Модель переключена на <b>{esc(model_label(model_key))}</b>. "
+        f"Контекст сохранён.{note}",
     )
+
+
+async def save_toggle(user_id: int, field: str, value) -> None:
+    settings = user_settings(user_id)
+    settings[field] = value
+    await storage.save_user_settings(int(user_id), **{field: value})
+
+
+def user_rich(user_id: int | None) -> bool:
+    return bool(user_settings(user_id).get("rich", True))
+
+
+def user_effort(user_id: int | None) -> str:
+    level = user_settings(user_id).get("deepthink", "off")
+    return level if level in ("low", "medium", "high") else "off"
+
+
+def user_search_mode(user_id: int | None) -> str:
+    mode = user_settings(user_id).get("search", "auto")
+    return mode if mode in ("auto", "always", "off") else "auto"
 
 
 async def safe_typing(chat_id: int) -> None:
@@ -827,7 +967,7 @@ def media_placeholder(message: Message) -> str:
 # СИСТЕМНЫЙ ПРОМПТ
 # ============================================================
 
-SYSTEM_PROMPT = """Ты — Мудрый Мох, дружелюбный ассистент в Telegram. Отвечай по-русски, по делу, с лёгким юмором. Если пользователь просит написать текст на другом языке (письмо, код, задание) — напиши на нём.
+SYSTEM_PROMPT_BASE = """Ты — Мудрый Мох, дружелюбный ассистент в Telegram. Отвечай по-русски, по делу, с лёгким юмором. Если пользователь просит написать текст на другом языке (письмо, код, задание) — напиши на нём.
 
 КОНТЕКСТ ЧАТА:
 - Ты видишь историю разговора. В группе каждое сообщение пользователя выглядит как «Имя (id): текст». Твои прошлые ответы — обычные сообщения ассистента. Не путай авторов и отвечай тому, кто обратился последним.
@@ -844,18 +984,37 @@ SYSTEM_PROMPT = """Ты — Мудрый Мох, дружелюбный асси
 ПРАВИЛА:
 - Не здоровайся в каждом сообщении: приветствие уместно только в начале диалога или если пользователь сам поздоровался.
 - После web_search опирайся на найденные данные, а не на свои знания. Если данных нет — честно скажи об этом. В конце ответа добавь строку «Источники:» с 1–3 самыми полезными ссылками из результатов.
-- Не выводи служебные пометки, названия инструментов и технические маркеры.
+- Не выводи служебные пометки, названия инструментов и технические маркеры."""
 
-ФОРМАТИРОВАНИЕ — СТРОГО:
+CLASSIC_FORMAT = """ФОРМАТИРОВАНИЕ — СТРОГО:
 - Разрешены только теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">, <blockquote>, <tg-spoiler>.
 - Запрещены: <ul>, <ol>, <li>, <p>, <br>, <div>, <span>, <h1>-<h6>, <table>, <img>.
 - Списки — символами •, — или «1.», «2.» без тегов. Переносы строк — реальные.
 - Никакого Markdown (** и _). Максимум 1–2 <b> на ответ.
 - Символы <, >, & в обычном тексте экранируй как &lt;, &gt;, &amp;."""
 
+RICH_FORMAT = """ФОРМАТИРОВАНИЕ — Telegram Rich Message (HTML), как статья:
+- Структурируй ответ: <h1>, <h2>, <h3>, <p>, <ul><li>, <ol><li>, <blockquote>.
+- Таблицы: <table><tr><th>…</th><th>…</th></tr><tr><td>…</td></tr></table>.
+- Код: <pre><code>…</code></pre>. Акценты: <b>, <i>, <s>, <a href="...">, <mark>.
+- Раскрывающийся блок: <details><summary>Заголовок</summary><p>текст</p></details>.
+- Между блоками оставляй пустую строку. Не используй <br>, <div>, <span>, <img>.
+- Заголовки и таблицы уместны для ответов от 3–4 абзацев. Короткий ответ — просто <p> без заголовка.
+- Списки — когда перечисляешь 3+ пункта; не превращай каждый ответ в список.
+- Символы <, >, & в обычном тексте экранируй как &lt;, &gt;, &amp;. Никакого Markdown."""
 
-def system_prompt() -> str:
-    return SYSTEM_PROMPT + f"\n\nСегодня: {date.today().isoformat()}."
+# Совместимость со старым именем.
+SYSTEM_PROMPT = SYSTEM_PROMPT_BASE
+
+
+def system_prompt(rich: bool = False) -> str:
+    fmt = RICH_FORMAT if rich else CLASSIC_FORMAT
+    return (
+        SYSTEM_PROMPT_BASE
+        + "\n\n"
+        + fmt
+        + f"\n\nСегодня: {date.today().isoformat()}."
+    )
 
 
 TOOLS = [
@@ -965,6 +1124,124 @@ def openai_to_chat_result(response, provider: str, model: str) -> ChatResult:
     )
 
 
+async def groq_stream(
+    messages,
+    tools=None,
+    tool_choice="auto",
+    max_tokens: int | None = None,
+    on_delta=None,
+) -> ChatResult:
+    """Стриминг Groq с накоплением текста, мыслей и tool-call'ов."""
+    base = {
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": int(max_tokens or CHAT_MAX_TOKENS),
+        "stream": True,
+    }
+    if tools:
+        base["tools"] = tools
+        base["tool_choice"] = tool_choice or "auto"
+
+    async def _open(with_usage: bool):
+        kwargs = dict(base)
+        if with_usage:
+            kwargs["stream_options"] = {"include_usage": True}
+        return await asyncio.wait_for(
+            ai_client.chat.completions.create(**kwargs), timeout=AI_TIMEOUT
+        )
+
+    try:
+        stream = await _open(True)
+    except Exception:
+        stream = await _open(False)
+
+    content: list[str] = []
+    reasoning: list[str] = []
+    calls: dict[int, dict] = {}
+    finish = ""
+    usage = None
+
+    async def emit(kind: str, piece: str) -> None:
+        if not piece or on_delta is None:
+            return
+        try:
+            result = on_delta(kind, piece)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            logging.warning(f"Groq on_delta failed: {e}")
+
+    async for chunk in stream:
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = chunk_usage
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if getattr(choice, "finish_reason", None):
+            finish = choice.finish_reason
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+        piece = getattr(delta, "content", None)
+        if piece:
+            content.append(piece)
+            await emit("content", piece)
+        rpiece = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+        if rpiece:
+            reasoning.append(rpiece)
+            await emit("reasoning", rpiece)
+        for tc in (getattr(delta, "tool_calls", None) or []):
+            idx = getattr(tc, "index", 0) or 0
+            slot = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            if getattr(tc, "id", None):
+                slot["id"] = tc.id
+            function = getattr(tc, "function", None)
+            if function is not None:
+                if getattr(function, "name", None):
+                    slot["name"] = function.name
+                if getattr(function, "arguments", None):
+                    slot["arguments"] += function.arguments
+
+    tool_calls = [
+        {
+            "id": slot["id"] or f"call_{idx}",
+            "type": "function",
+            "function": {"name": slot["name"], "arguments": slot["arguments"] or "{}"},
+        }
+        for idx, slot in sorted(calls.items())
+        if slot["name"]
+    ]
+
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+    total_tokens = int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
+    reasoning_tokens = 0
+    cached_tokens = 0
+    if usage is not None:
+        details = getattr(usage, "completion_tokens_details", None)
+        if details is not None:
+            reasoning_tokens = int(getattr(details, "reasoning_tokens", 0) or 0)
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        if prompt_details is not None:
+            cached_tokens = int(getattr(prompt_details, "cached_tokens", 0) or 0)
+
+    return ChatResult(
+        content="".join(content).strip(),
+        reasoning_content="".join(reasoning).strip(),
+        tool_calls=tool_calls,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_tokens=cached_tokens,
+        total_tokens=total_tokens or prompt_tokens + completion_tokens,
+        model=CHAT_MODEL,
+        finish_reason=finish or "",
+    )
+
+
 async def call_model(
     provider: str,
     messages: list[dict],
@@ -974,31 +1251,51 @@ async def call_model(
     track: Track | None = None,
     effort: str = "low",
     max_tokens: int | None = None,
+    model: str | None = None,
+    on_delta=None,
 ) -> ChatResult:
     started = time.perf_counter()
     status = "ok"
     error_text = ""
     result: ChatResult | None = None
+    client = PROVIDER_CLIENTS.get(provider)
+    model_name = model or (
+        CHAT_MODEL if provider == "groq" else (client.model if client else provider)
+    )
+    default_max = CHAT_MAX_TOKENS if provider == "groq" else PREMIUM_MAX_TOKENS
     try:
-        if provider == "deepseek":
-            result = await with_retry(
-                lambda: deepseek_client.chat(
+        if provider == "groq":
+            if on_delta is not None:
+                result = await groq_stream(
                     messages,
+                    tools,
+                    tool_choice or "auto",
+                    max_tokens or default_max,
+                    on_delta,
+                )
+            else:
+                response = await groq_chat(
+                    messages,
+                    tools,
+                    tool_choice or "auto",
+                    max_tokens or default_max,
+                )
+                result = openai_to_chat_result(response, provider, CHAT_MODEL)
+        else:
+            if client is None or not client.configured:
+                raise RuntimeError(f"{PROVIDER_NAMES.get(provider, provider)} не настроен")
+            result = await with_retry(
+                lambda: client.chat(
+                    messages,
+                    model=model_name,
                     tools=tools,
                     tool_choice=tool_choice,
-                    max_tokens=max_tokens or DEEPSEEK_MAX_TOKENS,
+                    max_tokens=max_tokens or default_max,
                     effort=effort,
+                    on_delta=on_delta,
                 ),
-                retries=2,
+                retries=1 if on_delta is not None else 2,
             )
-        else:
-            response = await groq_chat(
-                messages,
-                tools,
-                tool_choice or "auto",
-                max_tokens=max_tokens or CHAT_MAX_TOKENS,
-            )
-            result = openai_to_chat_result(response, "groq", CHAT_MODEL)
         return result
     except Exception as e:
         status = "error"
@@ -1012,7 +1309,7 @@ async def call_model(
                 user_id=track.user_id,
                 chat_id=track.chat_id,
                 provider=provider,
-                model=(result.model if result else (DEEPSEEK_MODEL if provider == "deepseek" else CHAT_MODEL)),
+                model=(result.model if result else model_name),
                 prompt_tokens=result.prompt_tokens if result else 0,
                 completion_tokens=result.completion_tokens if result else 0,
                 reasoning_tokens=result.reasoning_tokens if result else 0,
@@ -1197,16 +1494,19 @@ async def describe_image(
     return text
 
 
-async def describe_image_deepseek(
+async def describe_image_premium(
     image_bytes: bytes,
     mime: str | None = None,
     *,
+    provider: str = "deepseek",
     track: Track | None = None,
 ) -> str:
+    """Описание фото моделью провайдера (DeepSeek или Qwen)."""
     mime = image_mime(image_bytes, mime)
     b64 = base64.b64encode(image_bytes).decode()
+    vision_model = PROVIDER_VISION_MODEL.get(provider)
     result = await call_model(
-        "deepseek",
+        provider,
         [
             {
                 "role": "user",
@@ -1220,8 +1520,9 @@ async def describe_image_deepseek(
             }
         ],
         track=track,
-        effort="high",
-        max_tokens=DEEPSEEK_MAX_TOKENS,
+        effort="off",
+        max_tokens=1500,
+        model=vision_model,
     )
     return (result.content or "").strip()
 
@@ -1587,6 +1888,7 @@ class Turn:
     model: str = "groq"
     track: Track | None = None
     tools_used: list[str] = field(default_factory=list)
+    rich_allowed: bool = True
     status: Status = field(init=False)
 
     def __post_init__(self):
@@ -1655,6 +1957,170 @@ async def send_text(turn: Turn, text: str) -> None:
             logging.error(f"send_text plain fallback error: {e2}")
 
 
+RICH_ALLOWED_TAGS = (
+    "h1|h2|h3|h4|h5|h6|p|ul|ol|li|blockquote|pre|code|b|i|u|s|a|mark|"
+    "details|summary|table|thead|tbody|tr|td|th|tg-spoiler"
+)
+RICH_DROP_TAGS = ("script", "style", "iframe", "svg", "object", "embed", "form", "video", "audio")
+
+
+def sanitize_rich(text: str) -> str:
+    """Чистит HTML от опасных тегов, оставляя разметку Rich Message."""
+    if not text:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    for tag in RICH_DROP_TAGS:
+        text = re.sub(
+            rf"<{tag}\b[^>]*>.*?</{tag}>", "", text, flags=re.IGNORECASE | re.DOTALL
+        )
+        text = re.sub(rf"</?{tag}\b[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<img\b[^>]*>", "", text, flags=re.IGNORECASE)
+
+    allowed_pattern = re.compile(
+        rf"</?(?:{RICH_ALLOWED_TAGS})(?:\s+[^>]*)?>", re.IGNORECASE
+    )
+    placeholders: dict[str, str] = {}
+
+    def _hide(match):
+        key = placeholder_key(len(placeholders))
+        placeholders[key] = match.group(0)
+        return key
+
+    text = allowed_pattern.sub(_hide, text)
+    text = re.sub(
+        r"&(?!(?:amp|lt|gt|quot|#\d+|#x[0-9a-f]+);)", "&amp;", text, flags=re.IGNORECASE
+    )
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    for key, tag in placeholders.items():
+        text = text.replace(key, tag)
+    return text
+
+
+def split_rich(text: str, limit: int = MAX_RICH_REPLY_LENGTH) -> list[str]:
+    if len(text) <= limit:
+        return [text] if text.strip() else []
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut < limit * 0.4:
+            cut = remaining.rfind("\n", 0, limit)
+        if cut < limit * 0.4:
+            cut = remaining.rfind(". ", 0, limit)
+        if cut < limit * 0.4:
+            cut = limit
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return [c for c in chunks if c]
+
+
+def plain_from_rich(text: str) -> str:
+    text = re.sub(
+        r"<details\b[^>]*>.*?</details>", "", text, flags=re.IGNORECASE | re.DOTALL
+    )
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"</(?:p|div|h[1-6]|li|tr|blockquote)>", "\n", text, flags=re.IGNORECASE
+    )
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+class RichStreamer:
+    """Draft-стриминг Rich Message: мысли в <details>, текст — как статья."""
+
+    def __init__(self, turn: Turn) -> None:
+        self.turn = turn
+        self.draft_id = random.randint(1, 2**31 - 1)
+        self.content: list[str] = []
+        self.reasoning: list[str] = []
+        self.draft_ok = True
+        self.finished = False
+        self.last_update = 0.0
+
+    def reset(self) -> None:
+        self.content.clear()
+        self.reasoning.clear()
+
+    def _thoughts_html(self) -> str:
+        raw = "".join(self.reasoning).strip()
+        if not raw:
+            return ""
+        body = sanitize_rich(raw[:20000])
+        return f"<details><summary>🧠 Размышления</summary>\n<p>{body}</p>\n</details>"
+
+    def build_html(self) -> str:
+        parts: list[str] = []
+        thoughts = self._thoughts_html()
+        if thoughts:
+            parts.append(thoughts)
+        body = sanitize_rich("".join(self.content))
+        if body:
+            parts.append(body)
+        return "\n\n".join(parts)
+
+    async def on_delta(self, kind: str, piece: str) -> None:
+        if kind == "content":
+            self.content.append(piece)
+        else:
+            self.reasoning.append(piece)
+        now = time.monotonic()
+        if now - self.last_update < RICH_DRAFT_INTERVAL:
+            return
+        self.last_update = now
+        await self.push_draft()
+
+    async def push_draft(self) -> None:
+        if not self.draft_ok:
+            return
+        html_text = self.build_html()
+        if not html_text:
+            return
+        if len(html_text) > MAX_RICH_REPLY_LENGTH:
+            pieces = split_rich(html_text)
+            html_text = pieces[0] if pieces else html_text[:MAX_RICH_REPLY_LENGTH]
+        try:
+            await bot.send_rich_message_draft(
+                chat_id=self.turn.chat_id,
+                draft_id=self.draft_id,
+                rich_message=InputRichMessage(html=html_text),
+            )
+        except Exception as e:
+            logging.info(f"rich draft disabled: {e}")
+            self.draft_ok = False
+
+    async def finish(self, answer: str = "") -> None:
+        if self.finished:
+            return
+        self.finished = True
+        raw = "".join(self.content).strip()
+        if not raw:
+            raw = (answer or "").strip()
+        if not raw:
+            return
+        chunks = split_rich(raw)
+        for index, chunk in enumerate(chunks):
+            html_text = sanitize_rich(chunk)
+            if index == 0:
+                thoughts = self._thoughts_html()
+                if thoughts:
+                    html_text = thoughts + "\n\n" + html_text
+            if not html_text.strip():
+                continue
+            try:
+                await bot.send_rich_message(
+                    chat_id=self.turn.chat_id,
+                    rich_message=InputRichMessage(html=html_text),
+                )
+            except Exception as e:
+                logging.warning(f"send_rich_message failed: {e}; fallback to text")
+                plain = plain_from_rich(html_text)
+                if plain:
+                    await send_text(self.turn, plain)
+
+
 async def send_photo(turn: Turn, data: bytes, caption: str) -> bool:
     ext = "png" if data.startswith(b"\x89PNG") else "jpg"
     caption = caption[:1000]
@@ -1715,8 +2181,8 @@ async def get_photo_description(
         return cached
     try:
         data = await download_image_bytes(message)
-        if provider == "deepseek":
-            desc = await describe_image_deepseek(data, track=track)
+        if provider in ("deepseek", "qwen"):
+            desc = await describe_image_premium(data, track=track, provider=provider)
         else:
             desc = await describe_image(data, track=track)
     except Exception as e:
@@ -1887,9 +2353,13 @@ async def run_tools(
     *,
     provider: str = "groq",
     track: Track | None = None,
-    effort: str = "low",
+    effort: str = "off",
+    model: str | None = None,
+    on_delta=None,
+    reset_cb=None,
 ) -> str:
     choice = forced or "auto"
+    max_tokens = CHAT_MAX_TOKENS if provider == "groq" else PREMIUM_MAX_TOKENS
     for _ in range(4):
         try:
             result = await call_model(
@@ -1899,7 +2369,9 @@ async def run_tools(
                 tool_choice=choice,
                 track=track,
                 effort=effort,
-                max_tokens=DEEPSEEK_MAX_TOKENS if provider == "deepseek" else CHAT_MAX_TOKENS,
+                max_tokens=max_tokens,
+                model=model,
+                on_delta=on_delta,
             )
         except Exception:
             if choice != "auto":
@@ -1910,6 +2382,8 @@ async def run_tools(
         if not result.tool_calls:
             return (result.content or "").strip()
 
+        if reset_cb is not None:
+            reset_cb()
         messages.append(result.assistant_message(include_reasoning=provider == "deepseek"))
         for tc in result.tool_calls:
             function = tc.get("function") or {}
@@ -1950,15 +2424,18 @@ async def fallback_draw(turn: Turn) -> None:
         await send_text(turn, f"⚠️ Ошибка генерации: <code>{esc(e)}</code>")
 
 
-async def send_ds_switch_button(turn: Turn, error_text: str) -> None:
+async def send_switch_button(turn: Turn, error_text: str) -> None:
+    provider = provider_of(turn.model)
+    name = PROVIDER_NAMES.get(provider, "Модель")
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🌿 Переключить на Groq", callback_data="model:set:groq")]
+            [InlineKeyboardButton(text="🌿 Перейти на Groq", callback_data="model:set:groq")]
         ]
     )
     text = (
-        f"⚠️ DeepSeek не ответил: <code>{esc(error_text[:500])}</code>\n\n"
-        "Модель осталась DeepSeek. Можно переключиться на Groq кнопкой ниже."
+        f"⚠️ {name} не ответил: <code>{esc(error_text[:500])}</code>\n\n"
+        f"Модель осталась {esc(model_label(turn.model))}. "
+        "Можно переключиться на Groq кнопкой ниже."
     )
     try:
         if turn.is_private:
@@ -1971,36 +2448,56 @@ async def send_ds_switch_button(turn: Turn, error_text: str) -> None:
 
 async def run_ai(turn: Turn) -> None:
     started = time.perf_counter()
-    provider = turn.model
+    model_key = turn.model if turn.model in MODEL_REGISTRY else "groq"
+    info = MODEL_REGISTRY[model_key]
+    provider = info["provider"]
+    model_id = info["model"]
+    user = turn.message.from_user
+    user_id = user.id if user else None
+    settings_active = turn.is_private and user_id is not None
+    rich = bool(turn.rich_allowed and settings_active and user_rich(user_id))
+    streamer = RichStreamer(turn) if rich else None
     status = "ok"
     error_text = ""
     try:
         await safe_typing(turn.chat_id)
-        messages = [{"role": "system", "content": system_prompt()}]
-        messages += [dict(m) for m in history_for_model(turn.chat_id, provider)]
+        messages = [{"role": "system", "content": system_prompt(rich)}]
+        messages += [dict(m) for m in history_for_model(turn.chat_id, model_key)]
+
+        search_mode = user_search_mode(user_id) if settings_active else "auto"
+        tools = TOOLS
+        if search_mode == "off":
+            tools = [
+                t
+                for t in TOOLS
+                if (t.get("function") or {}).get("name") != "web_search"
+            ]
 
         if turn.explicit_draw:
             forced = {"type": "function", "function": {"name": "generate_image"}}
+        elif search_mode == "always":
+            forced = {"type": "function", "function": {"name": "web_search"}}
         elif has_search_verb(turn.user_text):
             forced = {"type": "function", "function": {"name": "web_search"}}
         else:
             forced = None
 
+        effort = user_effort(user_id) if settings_active else "off"
+
         async def executor(name, args):
             return await execute_tool(turn, name, args)
 
-        effort = "high" if provider == "deepseek" and (
-            turn.explicit_draw or has_search_verb(turn.user_text) or is_complex_task(turn.user_text)
-        ) else "low"
-
         answer = await run_tools(
             messages,
-            TOOLS,
+            tools,
             executor,
             forced,
             provider=provider,
             track=turn.track,
             effort=effort,
+            model=model_id,
+            on_delta=streamer.on_delta if streamer else None,
+            reset_cb=streamer.reset if streamer else None,
         )
 
         if turn.explicit_draw and not turn.image_sent and not turn.image_error:
@@ -2021,17 +2518,23 @@ async def run_ai(turn: Turn) -> None:
 
         if answer:
             if not (turn.image_sent and is_trivial(answer)):
-                await send_text(turn, answer)
+                if streamer is not None:
+                    await streamer.finish(answer)
+                else:
+                    await send_text(turn, answer)
                 await add_to_history(turn.chat_id, "assistant", answer)
         elif not turn.image_sent and not turn.image_error:
             fallback_text = "Не понял. Повтори, пожалуйста."
-            await send_text(turn, fallback_text)
+            if streamer is not None:
+                await streamer.finish(fallback_text)
+            else:
+                await send_text(turn, fallback_text)
             await add_to_history(turn.chat_id, "assistant", fallback_text)
 
         _stats[turn.chat_id] = _stats.get(turn.chat_id, 0) + 1
         logging.info(
-            f"[{turn.chat_id}] AI готов | model={provider} | draw={turn.image_sent} | "
-            f"поиск={has_search_verb(turn.user_text)}"
+            f"[{turn.chat_id}] AI готов | model={model_key} | rich={rich} | "
+            f"draw={turn.image_sent} | поиск={search_mode}"
         )
     except asyncio.CancelledError:
         status = "cancelled"
@@ -2040,8 +2543,8 @@ async def run_ai(turn: Turn) -> None:
         status = "error"
         error_text = str(e)
         logging.exception("AI handling error")
-        if provider == "deepseek":
-            await send_ds_switch_button(turn, friendly_ai_error(e))
+        if provider in ("deepseek", "qwen"):
+            await send_switch_button(turn, friendly_ai_error(e))
         else:
             await send_text(turn, f"⚠️ Ошибка: <code>{esc(friendly_ai_error(e))}</code>")
     finally:
@@ -2050,7 +2553,7 @@ async def run_ai(turn: Turn) -> None:
             status=status,
             error=error_text,
             latency_ms=int((time.perf_counter() - started) * 1000),
-            model=provider,
+            model=model_key,
             tools=",".join(turn.tools_used),
         )
         await turn.status.clear()
@@ -2089,8 +2592,9 @@ async def cmd_start(message: Message):
         "• <b>Рисование</b>: <code>мох нарисуй кота</code>\n"
         "• <b>Поиск</b> — включается сам, когда нужны свежие данные.\n"
         "• <b>Inline</b>: <code>@M0XAIBOT запрос</code>\n\n"
-        "🧹 Сбросить контекст: <code>/clear</code>\n"
-        "ℹ️ Обо мне: <code>/about</code>",
+        "🧩 Модели и режимы: /models\n"
+        "🧹 Сбросить контекст: /clear\n"
+        "ℹ️ Обо мне: /about",
     )
 
 
@@ -2099,11 +2603,10 @@ async def cmd_help(message: Message):
     if not command_allowed(message):
         return
     extra = ""
-    if is_private(message) and message.from_user and deepseek_eligible(message.from_user.id):
-        extra = (
-            "<code>/model</code> — выбрать Groq или DeepSeek\n"
-            + ("<code>/admin</code> — админ-панель\n" if message.from_user.id == OWNER_ID else "")
-        )
+    if is_private(message) and message.from_user:
+        extra = "/models — выбрать модель и режимы\n"
+        if message.from_user.id == OWNER_ID:
+            extra += "/admin — админ-панель\n"
     await reply_any(
         message,
         "🌿 <b>Что я умею:</b>\n\n"
@@ -2113,13 +2616,13 @@ async def cmd_help(message: Message):
         "• Ищу в интернете, когда нужно\n"
         "• Отвечаю в inline-режиме\n\n"
         "<b>Команды:</b>\n"
-        "<code>/start</code> — приветствие\n"
-        "<code>/help</code> — это меню\n"
-        "<code>/about</code> — инфо обо мне\n"
-        "<code>/clear</code> — очистить контекст\n"
-        "<code>/context</code> — размер памяти\n"
-        "<code>/whoami</code> — твой ID\n"
-        "<code>/stats</code> — статистика\n"
+        "/start — приветствие\n"
+        "/help — это меню\n"
+        "/about — инфо обо мне\n"
+        "/clear — очистить контекст\n"
+        "/context — размер памяти\n"
+        "/whoami — твой ID\n"
+        "/stats — статистика\n"
         f"{extra}",
     )
 
@@ -2132,22 +2635,23 @@ async def cmd_about(message: Message):
     current = "groq"
     if is_private(message) and message.from_user:
         current = selected_model(message.from_user.id)
-    model_line = (
-        f"• Сейчас: <b>{model_label(current)}</b>\n"
+    current_line = (
+        f"\nСейчас: <b>{esc(model_label(current))}</b> (только в личке)"
         if is_private(message)
-        else "• В группах: 🌿 Groq\n"
+        else "\nВ группах: 🌿 Groq"
+    )
+    model_lines = "\n".join(
+        f"• {esc(info['label'])}"
+        for info in MODEL_REGISTRY.values()
     )
     await reply_any(
         message,
         "🌿 <b>Мудрый Мох — информация</b>\n\n"
-        "<b>📝 Текст:</b>\n"
-        f"• <code>{CHAT_MODEL}</code> (Groq)\n"
-        f"• <code>{DEEPSEEK_MODEL}</code> (DeepSeek, по запросу)\n"
-        f"• Быстрая модель: <code>{FAST_MODEL}</code>\n"
-        f"{model_line}\n"
-        "<b>👁 Vision (фото):</b>\n"
-        f"• <code>{VISION_MODEL}</code> (Google Gemini)\n"
-        f"• <code>{DEEPSEEK_MODEL}</code> (DeepSeek, если выбрана эта модель)\n"
+        "<b>🧩 Модели:</b>\n"
+        f"{model_lines}{current_line}\n\n"
+        "<b>👁 Фото:</b>\n"
+        f"• <code>{VISION_MODEL}</code> (Gemini) для Groq\n"
+        "• Своя vision-модель для DeepSeek и Qwen\n"
         f"• Резерв: <code>{GROQ_VISION_MODEL}</code> (Groq)\n\n"
         "<b>🎙 Голос:</b>\n"
         f"• <code>{WHISPER_MODEL}</code> (Groq)\n\n"
@@ -2155,10 +2659,16 @@ async def cmd_about(message: Message):
         "• Pollinations.ai\n\n"
         "<b>🔍 Поиск:</b>\n"
         "• Tavily (+ запасной DuckDuckGo)\n\n"
-        f"<b>📊 Статистика:</b>\n"
+        f"<b>📊 Статистика чата:</b>\n"
         f"• Время работы: <b>{format_uptime()}</b>\n"
         f"• Запросов в этом чате: <b>{_stats.get(chat_id, 0)}</b>\n"
-        f"• В контексте: <b>{get_history_size(chat_id)}</b> из {HISTORY_LIMIT}",
+        f"• В контексте: <b>{get_history_size(chat_id)}</b> из {HISTORY_LIMIT}\n\n"
+        "<b>🛠 Служебные команды:</b>\n"
+        "/models — модели и режимы\n"
+        "/clear — очистить контекст\n"
+        "/context — размер памяти\n"
+        "/whoami — ID и username\n"
+        "/stats — статистика чата",
     )
 
 
@@ -2172,58 +2682,229 @@ async def cmd_clear(message: Message):
     logging.info(f"[{chat_id}] /clear")
 
 
-@dp.message(Command("model"))
-async def cmd_model(message: Message):
-    if not is_private(message) or not message.from_user:
-        return
-    user_id = message.from_user.id
-    if not deepseek_eligible(user_id):
-        return
+MODEL_ICONS = {"groq": "🌿", "deepseek": "🧠", "qwen": "🐳"}
+DEEPTHINK_LABELS = {"off": "выкл", "low": "низкий", "medium": "средний", "high": "высокий"}
+DEEPTHINK_ORDER = ["off", "low", "medium", "high"]
+SEARCH_LABELS = {"auto": "авто", "always": "всегда", "off": "выкл"}
+SEARCH_ORDER = ["auto", "always", "off"]
 
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) > 1:
-        arg = parts[1].strip().lower()
-        aliases = {"deepseek": "deepseek", "ds": "deepseek", "groq": "groq"}
-        if arg in aliases:
-            ok, text = await set_model_for_user(user_id, aliases[arg])
-            await reply_any(message, ("✅ " if ok else "⚠️ ") + text)
-            return
-        await reply_any(
-            message,
-            "Использование: <code>/model</code>, <code>/model deepseek</code> "
-            "или <code>/model groq</code>.",
+
+def _tab_row(active: str) -> list[InlineKeyboardButton]:
+    row = []
+    for tab, label in (
+        ("models", "🧩 Модели"),
+        ("modes", "⚙️ Режимы"),
+        ("access", "🔑 Доступ"),
+    ):
+        row.append(
+            InlineKeyboardButton(
+                text=("• " if tab == active else "") + label,
+                callback_data=f"models:tab:{tab}",
+            )
         )
-        return
+    return row
 
+
+async def models_panel_view(user_id: int, tab: str = "models") -> tuple[str, InlineKeyboardMarkup]:
     current = selected_model(user_id)
-    limit_line = ""
-    if user_id != OWNER_ID:
-        used = await storage.get_usage(user_id, msk_today())
-        limit_line = (
-            f"\nЛимит сегодня: <b>{used}</b> / {DEEPSEEK_DAILY_LIMIT}."
+    settings = user_settings(user_id)
+    rows: list[list[InlineKeyboardButton]] = [_tab_row(tab)]
+
+    if tab == "modes":
+        rich_on = bool(settings.get("rich", True))
+        level = settings.get("deepthink", "off")
+        search = settings.get("search", "auto")
+        text = (
+            "⚙️ <b>Режимы</b>\n\n"
+            "🧩 <b>Rich-статьи</b> — оформленные ответы со стримингом "
+            "(заголовки, таблицы, раскрывающиеся мысли).\n"
+            "🧠 <b>Deepthink</b> — сколько модель размышляет перед ответом. "
+            "Мысли показываются в свёрнутом блоке и не попадают в контекст.\n"
+            "🔍 <b>Поиск</b> — когда обращаться в интернет: сам по необходимости, "
+            "всегда или никогда.\n\n"
+            f"Rich: <b>{'включён' if rich_on else 'выключен'}</b>\n"
+            f"Deepthink: <b>{DEEPTHINK_LABELS.get(level, 'выкл')}</b>\n"
+            f"Поиск: <b>{SEARCH_LABELS.get(search, 'авто')}</b>"
         )
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
+        rows += [
             [
                 InlineKeyboardButton(
-                    text=("✅ " if current == "groq" else "") + "🌿 Groq",
-                    callback_data="model:set:groq",
+                    text=f"{'✅' if rich_on else '⬜️'} Rich-статьи",
+                    callback_data="models:toggle:rich:modes",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=("✅ " if current == "deepseek" else "") + "🧠 DeepSeek",
-                    callback_data="model:set:deepseek",
+                    text=f"🧠 Deepthink: {DEEPTHINK_LABELS.get(level, 'выкл')}",
+                    callback_data="models:cycle:deepthink:modes",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🔍 Поиск: {SEARCH_LABELS.get(search, 'авто')}",
+                    callback_data="models:cycle:search:modes",
                 )
             ],
         ]
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if tab == "access":
+        lines = [
+            "🔑 <b>Доступ</b>",
+            "",
+            f"👑 Владелец: <a href=\"https://t.me/{OWNER_USERNAME}\">@{OWNER_USERNAME}</a>",
+            "",
+        ]
+        today = msk_today()
+        for provider, name in PROVIDER_NAMES.items():
+            allowed = (int(user_id) == OWNER_ID) or ((int(user_id), provider) in _grants)
+            limit = PROVIDER_LIMITS.get(provider, 0)
+            client = PROVIDER_CLIENTS.get(provider)
+            configured = bool(client and client.configured)
+            if not configured:
+                lines.append(f"⚠️ {name}: не настроен на сервере")
+            elif not allowed:
+                lines.append(f"🔒 {name}: нет доступа")
+            elif int(user_id) == OWNER_ID:
+                lines.append(f"✅ {name}: безлимит")
+            else:
+                used = await storage.get_usage(int(user_id), provider, today)
+                lines.append(f"✅ {name}: {used}/{limit} сегодня")
+        lines.append("")
+        if int(user_id) == OWNER_ID:
+            lines.append("У тебя есть доступ ко всем моделям.")
+        else:
+            lines.append(
+                f"Доступ выдаёт владелец "
+                f"<a href=\"https://t.me/{OWNER_USERNAME}\">@{OWNER_USERNAME}</a>."
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🌿 Перейти на Groq", callback_data="model:set:groq"
+                )
+            ]
+        )
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+    lines = [
+        "🧩 <b>Модели</b>",
+        "",
+        "Смена модели сохраняет контекст, кэш фото и фотосессии.",
+        "",
+    ]
+    for key, info in MODEL_REGISTRY.items():
+        allowed = model_available(user_id, key)
+        provider = info["provider"]
+        client = PROVIDER_CLIENTS.get(provider)
+        configured = provider == "groq" or bool(client and client.configured)
+        blocked = key in _model_blocked
+        if int(user_id) == OWNER_ID:
+            mark = "⚠️ " if (blocked or not configured) else ("✅ " if key == current else "")
+        else:
+            if not allowed:
+                mark = "🔒 "
+            elif key == current:
+                mark = "✅ "
+            else:
+                mark = ""
+        lines.append(f"{mark}{info['label']}")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark}{info['label']}",
+                    callback_data=(
+                        f"model:set:{key}" if allowed else f"model:locked:{key}"
+                    ),
+                )
+            ]
+        )
+    owner_line = (
+        "У тебя доступ ко всем моделям."
+        if int(user_id) == OWNER_ID
+        else "🔒 — доступ выдаёт владелец "
+        f"<a href=\"https://t.me/{OWNER_USERNAME}\">@{OWNER_USERNAME}</a>."
     )
-    await message.answer(
-        f"🧠 <b>Выбор модели</b>\n\nСейчас: <b>{model_label(current)}</b>{limit_line}\n\n"
-        "DeepSeek доступен только в личных сообщениях. "
-        "При переключении контекст и кэш фото очищаются.",
-        reply_markup=keyboard,
+    blocked_notes = []
+    if int(user_id) == OWNER_ID:
+        for key, reason in _model_blocked.items():
+            blocked_notes.append(
+                f"⚠️ {esc(MODEL_REGISTRY[key]['label'])}: {esc(reason)}"
+            )
+        for key, info in MODEL_REGISTRY.items():
+            provider = info["provider"]
+            client = PROVIDER_CLIENTS.get(provider)
+            if provider != "groq" and (client is None or not client.configured):
+                blocked_notes.append(
+                    f"⚠️ {esc(info['label'])}: нет API-ключа на сервере"
+                )
+    lines.append("")
+    lines.append(owner_line)
+    if blocked_notes:
+        lines.append("")
+        lines.extend(blocked_notes)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("models"))
+async def cmd_models(message: Message):
+    if not is_private(message) or not message.from_user:
+        return
+    text, kb = await models_panel_view(message.from_user.id, "models")
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("model:locked"))
+async def on_model_locked(callback: CallbackQuery):
+    parts = (callback.data or "").split(":")
+    key = parts[2] if len(parts) > 2 else ""
+    reason = _model_blocked.get(key)
+    if reason:
+        await callback.answer(f"Модель недоступна: {reason}.", show_alert=True)
+        return
+    await callback.answer(
+        f"Доступ выдаёт владелец @{OWNER_USERNAME} (t.me/{OWNER_USERNAME}).",
+        show_alert=True,
     )
+
+
+@dp.callback_query(F.data.startswith("models:"))
+async def on_models_callback(callback: CallbackQuery):
+    if not callback.from_user or callback.message is None:
+        return
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Только в личке.", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    tab = parts[-1] if action in ("toggle", "cycle") else "models"
+    if action == "tab":
+        tab = parts[2] if len(parts) > 2 else "models"
+    elif action == "toggle":
+        field = parts[2] if len(parts) > 2 else "rich"
+        if field == "rich":
+            await save_toggle(user_id, "rich", not user_rich(user_id))
+    elif action == "cycle":
+        field = parts[2] if len(parts) > 2 else ""
+        if field == "deepthink":
+            level = user_settings(user_id).get("deepthink", "off")
+            index = (DEEPTHINK_ORDER.index(level) + 1) % len(DEEPTHINK_ORDER) if level in DEEPTHINK_ORDER else 1
+            await save_toggle(user_id, "deepthink", DEEPTHINK_ORDER[index])
+        elif field == "search":
+            mode = user_search_mode(user_id)
+            index = (SEARCH_ORDER.index(mode) + 1) % len(SEARCH_ORDER) if mode in SEARCH_ORDER else 0
+            await save_toggle(user_id, "search", SEARCH_ORDER[index])
+    text, kb = await models_panel_view(user_id, tab)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            try:
+                await callback.message.answer(text, reply_markup=kb)
+            except Exception:
+                pass
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("model:set:"))
@@ -2231,42 +2912,17 @@ async def on_model_callback(callback: CallbackQuery):
     if not callback.from_user or not callback.message:
         return
     user_id = callback.from_user.id
-    if not deepseek_eligible(user_id) or callback.message.chat.type != ChatType.PRIVATE:
-        await callback.answer("Нет доступа.", show_alert=True)
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Модели доступны только в личке.", show_alert=True)
         return
     model = (callback.data or "").rsplit(":", 1)[-1]
     ok, text = await set_model_for_user(user_id, model)
-    await callback.answer("Готово" if ok else "Ошибка", show_alert=not ok)
+    await callback.answer(("✅ " if ok else "⚠️ ") + text[:180], show_alert=not ok)
     if not ok:
         return
+    panel, kb = await models_panel_view(user_id, "models")
     try:
-        current = selected_model(user_id)
-        limit_line = ""
-        if user_id != OWNER_ID:
-            used = await storage.get_usage(user_id, msk_today())
-            limit_line = f"\nЛимит сегодня: <b>{used}</b> / {DEEPSEEK_DAILY_LIMIT}."
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=("✅ " if current == "groq" else "") + "🌿 Groq",
-                        callback_data="model:set:groq",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text=("✅ " if current == "deepseek" else "") + "🧠 DeepSeek",
-                        callback_data="model:set:deepseek",
-                    )
-                ],
-            ]
-        )
-        await callback.message.edit_text(
-            f"🧠 <b>Выбор модели</b>\n\nСейчас: <b>{model_label(current)}</b>{limit_line}\n\n"
-            "DeepSeek доступен только в личных сообщениях. "
-            "При переключении контекст и кэш фото очищаются.",
-            reply_markup=keyboard,
-        )
+        await callback.message.edit_text(panel, reply_markup=kb)
     except Exception:
         pass
 
@@ -2363,14 +3019,195 @@ def db_usage_line(size: int) -> str:
     return line
 
 
+def fmt_number(value) -> str:
+    try:
+        return f"{float(value):,.0f}".replace(",", " ")
+    except Exception:
+        return "—"
+
+
+def balance_short() -> str:
+    parts = []
+    for key, name in (("deepseek", "DeepSeek"), ("qwen", "Qwen")):
+        item = _balance.get(key) or {}
+        if item.get("error"):
+            parts.append(f"{name}: ошибка")
+        elif item.get("amount") is None:
+            parts.append(f"{name}: —")
+        else:
+            parts.append(f"{name}: {fmt_number(item['amount'])}")
+    return " · ".join(parts)
+
+
+def balance_block() -> str:
+    lines = ["💳 <b>Балансы</b>"]
+    for key, name in (("deepseek", "aikeysforyou (DeepSeek)"), ("qwen", "voidluv (Qwen)")):
+        item = _balance.get(key) or {}
+        if item.get("error"):
+            lines.append(f"• {name}: ⚠️ {esc(str(item['error'])[:120])}")
+            continue
+        if item.get("amount") is None:
+            lines.append(f"• {name}: нет данных")
+            continue
+        line = f"• {name}: <b>{fmt_number(item['amount'])}</b>"
+        total = item.get("total")
+        if total:
+            percent = item["amount"] / total * 100
+            line += f" из {fmt_number(total)} ({percent:.1f}%)"
+        lines.append(line)
+    updated = max(
+        (
+            float((_balance.get(k) or {}).get("updated") or 0)
+            for k in ("deepseek", "qwen")
+        ),
+        default=0,
+    )
+    if updated:
+        stamp = datetime.fromtimestamp(updated, MSK).strftime("%d.%m %H:%M")
+        lines.append(f"Обновлено: {stamp} МСК")
+    return "\n".join(lines)
+
+
+def _page_stat(text: str, label: str) -> int | None:
+    match = re.search(
+        rf'<div class="k">{label}</div>\s*<div class="v">[^<]*</div>\s*'
+        rf'<div class="n">([\d\s\u00a0]+)</div>',
+        text,
+    )
+    if not match:
+        return None
+    digits = re.sub(r"[^\d]", "", match.group(1))
+    return int(digits) if digits else None
+
+
+async def refresh_balance(provider: str) -> dict:
+    item: dict = {
+        "amount": None,
+        "total": None,
+        "updated": time.time(),
+        "error": "",
+    }
+    prev = _balance.get(provider) or {}
+    try:
+        if provider == "deepseek":
+            if not deepseek_client.configured:
+                raise RuntimeError("нет AIKEYS_API")
+            response = await http_client.get(
+                f"{DEEPSEEK_BASE_URL}/balance",
+                headers={"Authorization": f"Bearer {AIKEYS_API_KEY}"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            amount = float((response.json() or {}).get("token_balance") or 0)
+            item["amount"] = amount
+            item["total"] = max(float(prev.get("total") or 0), amount)
+        else:
+            response = await http_client.get(
+                VOIDLUV_BALANCE_URL, timeout=30, follow_redirects=True
+            )
+            response.raise_for_status()
+            total = _page_stat(response.text, "Лимит")
+            left = _page_stat(response.text, "Осталось")
+            if left is None:
+                raise RuntimeError("не удалось разобрать страницу баланса")
+            item["amount"] = float(left)
+            item["total"] = float(total) if total else float(prev.get("total") or 0) or None
+    except Exception as e:
+        item["error"] = str(e)
+        if prev.get("amount") is not None:
+            item["amount"] = prev.get("amount")
+            item["total"] = prev.get("total")
+    _balance[provider] = item
+    return item
+
+
+async def check_balance_alert(provider: str) -> None:
+    item = _balance.get(provider) or {}
+    amount = item.get("amount")
+    total = item.get("total")
+    if amount is None:
+        return
+    name = PROVIDER_NAMES.get(provider, provider)
+    if not total:
+        return
+    percent = amount / total * 100
+    if percent >= BALANCE_ALERT_PERCENT:
+        _balance_alerted.discard(provider)
+        return
+    if provider in _balance_alerted:
+        return
+    _balance_alerted.add(provider)
+    try:
+        await bot.send_message(
+            OWNER_ID,
+            f"⚠️ Баланс <b>{name}</b> ниже {BALANCE_ALERT_PERCENT}%: "
+            f"{fmt_number(amount)} из {fmt_number(total)} ({percent:.1f}%).",
+        )
+    except Exception:
+        pass
+
+
+async def refresh_all_balances(notify: bool = False) -> None:
+    for provider in ("deepseek", "qwen"):
+        await refresh_balance(provider)
+        await check_balance_alert(provider)
+    if notify:
+        try:
+            await bot.send_message(OWNER_ID, balance_block())
+        except Exception:
+            pass
+
+
+async def balances_loop() -> None:
+    while True:
+        try:
+            await refresh_all_balances()
+        except Exception:
+            logging.exception("balance refresh failed")
+        await asyncio.sleep(BALANCE_REFRESH_SECONDS)
+
+
+async def probe_premium_models() -> None:
+    """Проверяет, какие премиум-модели реально доступны на ключах."""
+    for key, info in MODEL_REGISTRY.items():
+        provider = info["provider"]
+        if provider == "groq":
+            continue
+        client = PROVIDER_CLIENTS.get(provider)
+        if client is None or not client.configured:
+            continue
+        old_timeout = client.timeout
+        try:
+            client.timeout = 12.0
+            await client.chat(
+                [{"role": "user", "content": "ping"}],
+                model=info["model"],
+                effort="off",
+                max_tokens=8,
+            )
+            _model_blocked.pop(key, None)
+        except Exception as e:
+            text = str(e).lower()
+            if "model_not_allowed" in text or "not enabled" in text or "permission" in text:
+                _model_blocked[key] = "модель не включена для API-ключа"
+                logging.warning(f"Модель {key} недоступна на ключе: {e}")
+            else:
+                logging.warning(f"Проверка модели {key} не удалась: {e}")
+        finally:
+            client.timeout = old_timeout
+
+
 def admin_main_text() -> str:
     current = selected_model(OWNER_ID)
+    ds_count = sum(1 for (_, p) in _grants if p == "deepseek")
+    qwen_count = sum(1 for (_, p) in _grants if p == "qwen")
     return (
         "🛠 <b>Админ-панель Мудрого Мха</b>\n\n"
-        f"Модель в твоей ЛС: <b>{model_label(current)}</b>\n"
+        f"Модель в твоей ЛС: <b>{esc(model_label(current))}</b>\n"
         f"Групп в белом списке: <b>{len(_groups_cache)}</b>\n"
         f"Заблокировано ЛС: <b>{len(_dm_blacklist)}</b>\n"
-        f"Доступ к DeepSeek: <b>{len(_deepseek_grants)}</b> чел.\n\n"
+        f"Доступ DeepSeek: <b>{ds_count}</b> · Qwen: <b>{qwen_count}</b>\n"
+        f"💰 {balance_short()}\n\n"
         f"{db_usage_line(_db_size_cache)}\n\n"
         "Выбери раздел:"
     )
@@ -2388,8 +3225,12 @@ def admin_main_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🚫 ЛС", callback_data="adm:bl:0"),
             ],
             [
-                InlineKeyboardButton(text="🔑 DeepSeek", callback_data="adm:ds:0"),
+                InlineKeyboardButton(text="🔑 DeepSeek", callback_data="adm:acc:deepseek:0"),
+                InlineKeyboardButton(text="🐳 Qwen", callback_data="adm:acc:qwen:0"),
+            ],
+            [
                 InlineKeyboardButton(text="📝 Запросы", callback_data="adm:req:0"),
+                InlineKeyboardButton(text="💳 Балансы", callback_data="adm:bal"),
             ],
             [InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set")],
         ]
@@ -2476,35 +3317,40 @@ def stats_kb(period: str) -> InlineKeyboardMarkup:
 
 def model_text() -> str:
     current = selected_model(OWNER_ID)
-    return (
-        "🧠 <b>Модель для твоей ЛС</b>\n\n"
-        f"Сейчас: <b>{model_label(current)}</b>\n\n"
-        "• 🌿 Groq — быстрый, бесплатный, с Gemini для фото.\n"
-        "• 🧠 DeepSeek — умнее на заданиях, сам читает фото, но только в ЛС.\n\n"
-        "При переключении контекст, кэш фото и незавершённые фотосессии очищаются. "
-        "После рестарта бот снова стартует с Groq."
-    )
+    lines = [
+        "🧠 <b>Модель для твоей ЛС</b>",
+        "",
+        f"Сейчас: <b>{esc(model_label(current))}</b>",
+        "",
+    ]
+    for key, info in MODEL_REGISTRY.items():
+        note = ""
+        if key in _model_blocked:
+            note = f" · ⚠️ {esc(_model_blocked[key])}"
+        lines.append(f"• <b>{esc(info['label'])}</b> · {info['provider']}{note}")
+    lines += [
+        "",
+        "При переключении контекст, кэш фото и фотосессии сохраняются. "
+        "Выбор запоминается после рестарта.",
+    ]
+    return "\n".join(lines)
 
 
 def model_kb() -> InlineKeyboardMarkup:
     current = selected_model(OWNER_ID)
-    return admin_kb(
-        [
+    rows = []
+    for key, info in MODEL_REGISTRY.items():
+        prefix = "⚠️ " if key in _model_blocked else ("✅ " if key == current else "")
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text=("✅ " if current == "groq" else "") + "🌿 Groq",
-                    callback_data="adm:mset:groq",
+                    text=prefix + info["label"],
+                    callback_data=f"adm:mset:{key}",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text=("✅ " if current == "deepseek" else "") + "🧠 DeepSeek",
-                    callback_data="adm:mset:deepseek",
-                )
-            ],
-            [InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main")],
-        ]
-    )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main")])
+    return admin_kb(rows)
 
 
 def paginate(items: list, page: int) -> tuple[list, int, int]:
@@ -2568,37 +3414,62 @@ def blacklist_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), admin_kb(rows)
 
 
-async def deepseek_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+async def access_view(provider: str, page: int) -> tuple[str, InlineKeyboardMarkup]:
+    if provider not in PROVIDER_NAMES:
+        provider = "deepseek"
+    name = PROVIDER_NAMES[provider]
+    limit = PROVIDER_LIMITS.get(provider, 0)
     today = msk_today()
-    usage = await storage.usage_for_day(today)
+    usage = await storage.usage_for_day(today, provider)
     items = sorted(
-        _deepseek_grants.values(),
+        (g for (uid, prov), g in _grants.items() if prov == provider),
         key=lambda x: x.get("granted_at") or datetime.min.replace(tzinfo=timezone.utc),
     )
     page_items, page, total = paginate(items, page)
     lines = [
-        "🔑 <b>Доступ к DeepSeek</b>",
+        f"🔑 <b>Доступ к {name}</b>",
         "",
         f"👑 Владелец: <code>{OWNER_ID}</code> — безлимит",
-        f"Другим: <b>{len(items)}</b> чел. · лимит {DEEPSEEK_DAILY_LIMIT} сообщений/день",
+        f"Другим: <b>{len(items)}</b> чел. · лимит {limit} сообщений/день",
         "",
     ]
     if not items:
         lines.append("Пока никому не выдан.")
     for u in page_items:
-        name = u.get("full_name") or u.get("username") or "без имени"
-        used = usage.get(int(u["user_id"]), 0)
+        item_name = u.get("full_name") or u.get("username") or "без имени"
+        used = usage.get((int(u["user_id"]), provider), 0)
         lines.append(
-            f"• <b>{esc(name)}</b> · <code>{u['user_id']}</code>\n"
-            f"  сегодня: {used}/{DEEPSEEK_DAILY_LIMIT}"
+            f"• <b>{esc(item_name)}</b> · <code>{u['user_id']}</code>\n"
+            f"  сегодня: {used}/{limit}"
         )
-    rows = [[InlineKeyboardButton(text="➕ Выдать доступ", callback_data="adm:dsadd")]]
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=("• " if provider == "deepseek" else "") + "🔑 DeepSeek",
+                callback_data="adm:acc:deepseek:0",
+            ),
+            InlineKeyboardButton(
+                text=("• " if provider == "qwen" else "") + "🐳 Qwen",
+                callback_data="adm:acc:qwen:0",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"➕ Выдать {name}", callback_data=f"adm:accadd:{provider}"
+            )
+        ],
+    ]
     for u in page_items:
-        name = (u.get("full_name") or u.get("username") or str(u["user_id"]))[:25]
+        item_name = (u.get("full_name") or u.get("username") or str(u["user_id"]))[:25]
         rows.append(
-            [InlineKeyboardButton(text=f"🗑 {name}", callback_data=f"adm:dsdel:{u['user_id']}")]
+            [
+                InlineKeyboardButton(
+                    text=f"🗑 {item_name}",
+                    callback_data=f"adm:accdel:{provider}:{u['user_id']}",
+                )
+            ]
         )
-    rows.append(paginator_kb("adm:ds", page, total))
+    rows.append(paginator_kb(f"adm:acc:{provider}", page, total))
     return "\n".join(lines), admin_kb(rows)
 
 
@@ -2699,7 +3570,15 @@ def filter_view(flt: dict) -> tuple[str, InlineKeyboardMarkup]:
         [
             InlineKeyboardButton(text=mark(None, flt.get("model"), "Все модели"), callback_data="adm:fmodel:all"),
             InlineKeyboardButton(text=mark("groq", flt.get("model"), "Groq"), callback_data="adm:fmodel:groq"),
-            InlineKeyboardButton(text=mark("deepseek", flt.get("model"), "DeepSeek"), callback_data="adm:fmodel:deepseek"),
+            InlineKeyboardButton(text=mark("deepseek", flt.get("model"), "deepseek-v4.1-flash"), callback_data="adm:fmodel:deepseek"),
+        ],
+        [
+            InlineKeyboardButton(text=mark("deepseek-pro", flt.get("model"), "deepseek-v4-pro"), callback_data="adm:fmodel:deepseek-pro"),
+            InlineKeyboardButton(text=mark("qwen4-max", flt.get("model"), "qwen4-max"), callback_data="adm:fmodel:qwen4-max"),
+        ],
+        [
+            InlineKeyboardButton(text=mark("qwen3.8-max", flt.get("model"), "qwen3.8-max"), callback_data="adm:fmodel:qwen3.8-max"),
+            InlineKeyboardButton(text=mark("qwen3.8-flash", flt.get("model"), "qwen3.8-flash"), callback_data="adm:fmodel:qwen3.8-flash"),
         ],
         [
             InlineKeyboardButton(text="🗑 Сбросить", callback_data="adm:fclear"),
@@ -2720,14 +3599,16 @@ async def settings_view() -> tuple[str, InlineKeyboardMarkup]:
         f"Контекст: {fmt_int(ctx['chats'])} чатов, {fmt_int(ctx['messages'])} сообщений\n"
         f"Логи: <b>хранятся вечно</b> (ручная очистка ниже)\n"
         f"Сводка: <b>каждый день в 04:00 МСК</b>\n"
-        f"Лимит DeepSeek для гостей: <b>{DEEPSEEK_DAILY_LIMIT}</b> сообщений/день\n"
-        f"Модель DeepSeek: <code>{DEEPSEEK_MODEL}</code>\n"
-        f"Контекст DeepSeek: {fmt_int(DEEPSEEK_HISTORY_CHARS_LIMIT)} символов, "
-        f"ответ до {fmt_int(DEEPSEEK_MAX_TOKENS)} токенов\n\n"
+        f"Лимиты: DeepSeek <b>{PROVIDER_LIMITS['deepseek']}</b>, "
+        f"Qwen <b>{PROVIDER_LIMITS['qwen']}</b> сообщений/день\n"
+        f"Контекст премиум-моделей: {fmt_int(PREMIUM_HISTORY_CHARS_LIMIT)} символов, "
+        f"ответ до {fmt_int(PREMIUM_MAX_TOKENS)} токенов\n\n"
+        f"{balance_block()}\n\n"
         "Очистка удаляет запросы, вызовы моделей и инструментов старше указанного срока. "
         "Контексты и списки не трогает."
     )
     rows = [
+        [InlineKeyboardButton(text="💳 Обновить балансы", callback_data="adm:balrefresh")],
         [InlineKeyboardButton(text="⬇️ CSV всех запросов", callback_data="adm:csvall")],
         [InlineKeyboardButton(text="🧹 Очистить старые логи", callback_data="adm:cleanup")],
         [
@@ -2739,7 +3620,7 @@ async def settings_view() -> tuple[str, InlineKeyboardMarkup]:
 
 
 async def admin_section(
-    section: str, page: int = 0, period: str | None = None
+    section: str, page: int = 0, period: str | None = None, provider: str | None = None
 ) -> tuple[str, InlineKeyboardMarkup]:
     global _db_size_cache
     if section == "main":
@@ -2751,8 +3632,8 @@ async def admin_section(
         return groups_view(page)
     if section == "bl":
         return blacklist_view(page)
-    if section == "ds":
-        return await deepseek_view(page)
+    if section == "acc":
+        return await access_view(provider or "deepseek", page)
     if section == "set":
         return await settings_view()
     if section == "filter":
@@ -2918,7 +3799,6 @@ async def maybe_admin_input(message: Message) -> bool:
                 "full_name": full_name,
                 "added_at": msk_now(),
             }
-            _selected_model.pop(user_id, None)
             await clear_chat_context(user_id)
             await storage.add_admin_action(OWNER_ID, "blacklist_add", str(user_id))
             _admin_input.pop(OWNER_ID, None)
@@ -2944,27 +3824,37 @@ async def maybe_admin_input(message: Message) -> bool:
             if user_id == OWNER_ID:
                 await message.answer("У владельца доступ уже есть.")
                 return True
-            await storage.add_grant(user_id, uname, full_name, OWNER_ID)
-            _deepseek_grants[user_id] = {
+            provider = state.get("provider") or "deepseek"
+            if provider not in PROVIDER_NAMES:
+                provider = "deepseek"
+            provider_name = PROVIDER_NAMES[provider]
+            await storage.add_grant(
+                user_id, provider, uname, full_name, OWNER_ID
+            )
+            _grants[(user_id, provider)] = {
                 "user_id": user_id,
+                "provider": provider,
                 "username": uname,
                 "full_name": full_name,
                 "granted_at": msk_now(),
             }
             await refresh_user_commands(user_id)
-            await storage.add_admin_action(OWNER_ID, "grant_add", str(user_id))
+            await storage.add_admin_action(
+                OWNER_ID, "grant_add", f"{provider}:{user_id}"
+            )
             _admin_input.pop(OWNER_ID, None)
+            limit = PROVIDER_LIMITS.get(provider, 0)
             try:
                 await bot.send_message(
                     user_id,
-                    "🔑 Тебе выдан доступ к DeepSeek.\n"
-                    "Открой личный чат и выбери модель командой /model. "
-                    f"Лимит: {DEEPSEEK_DAILY_LIMIT} сообщений в день.",
+                    f"🔑 Тебе выдан доступ к {provider_name}.\n"
+                    "Открой /models в личке и выбери модель. "
+                    f"Лимит: {limit} сообщений в день.",
                 )
             except Exception:
                 pass
             await message.answer(
-                f"✅ Доступ к DeepSeek выдан <code>{user_id}</code>.",
+                f"✅ Доступ к {provider_name} выдан <code>{user_id}</code>.",
                 reply_markup=admin_main_kb(),
             )
             return True
@@ -3080,11 +3970,30 @@ async def on_admin_callback(callback: CallbackQuery):
             await edit_admin(callback, text, kb)
             await callback.answer()
             return
-        if action == "ds":
-            page = int(parts[2]) if len(parts) > 2 else 0
-            text, kb = await admin_section("ds", page)
+        if action == "acc":
+            page = int(parts[3]) if len(parts) > 3 else 0
+            provider = parts[2] if len(parts) > 2 else "deepseek"
+            text, kb = await admin_section("acc", page, provider=provider)
             await edit_admin(callback, text, kb)
             await callback.answer()
+            return
+        if action == "bal":
+            await refresh_all_balances()
+            text = balance_block()
+            kb = admin_kb(
+                [
+                    [InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:bal")],
+                    [InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main")],
+                ]
+            )
+            await edit_admin(callback, text, kb)
+            await callback.answer("Балансы обновлены.")
+            return
+        if action == "balrefresh":
+            await refresh_all_balances()
+            text, kb = await admin_section("set")
+            await edit_admin(callback, text, kb)
+            await callback.answer("Балансы обновлены.")
             return
         if action == "req":
             page = int(parts[2]) if len(parts) > 2 else 0
@@ -3162,42 +4071,56 @@ async def on_admin_callback(callback: CallbackQuery):
             await callback.answer("Разблокирован.")
             return
 
-        if action == "dsadd":
-            _admin_input[OWNER_ID] = {"action": "grant_id"}
+        if action == "accadd":
+            provider = parts[2] if len(parts) > 2 else "deepseek"
+            if provider not in PROVIDER_NAMES:
+                provider = "deepseek"
+            provider_name = PROVIDER_NAMES[provider]
+            _admin_input[OWNER_ID] = {"action": "grant_id", "provider": provider}
             await callback.answer()
             await callback.message.answer(
-                "Отправь ID пользователя или перешли его сообщение, чтобы выдать DeepSeek.\n\n"
-                "/cancel — отмена."
+                f"Отправь ID пользователя или перешли его сообщение, "
+                f"чтобы выдать {provider_name}.\n\n/cancel — отмена."
             )
             return
-        if action == "dsdel":
-            user_id = int(parts[2])
-            item = _deepseek_grants.get(user_id) or {}
-            name = item.get("full_name") or item.get("username") or str(user_id)
+        if action == "accdel":
+            provider = parts[2] if len(parts) > 2 else "deepseek"
+            user_id = int(parts[3]) if len(parts) > 3 else 0
+            item = _grants.get((user_id, provider)) or {}
+            item_name = item.get("full_name") or item.get("username") or str(user_id)
+            provider_name = PROVIDER_NAMES.get(provider, provider)
             await edit_admin(
                 callback,
-                f"Отозвать доступ к DeepSeek у <b>{esc(name)}</b>?\n\n"
-                "Модель сбросится на Groq, контекст будет очищен.",
-                confirm_kb(f"adm:dsdelok:{user_id}", "adm:ds:0"),
+                f"Отозвать доступ к {provider_name} у <b>{esc(item_name)}</b>?\n\n"
+                "Модель переключится на Groq, контекст сохранится.",
+                confirm_kb(
+                    f"adm:accdelok:{provider}:{user_id}",
+                    f"adm:acc:{provider}:0",
+                ),
             )
             await callback.answer()
             return
-        if action == "dsdelok":
-            user_id = int(parts[2])
-            await storage.remove_grant(user_id)
-            _deepseek_grants.pop(user_id, None)
-            _selected_model.pop(user_id, None)
-            await clear_chat_context(user_id)
-            await refresh_user_commands(user_id, granted=False)
-            await storage.add_admin_action(OWNER_ID, "grant_remove", str(user_id))
+        if action == "accdelok":
+            provider = parts[2] if len(parts) > 2 else "deepseek"
+            user_id = int(parts[3]) if len(parts) > 3 else 0
+            provider_name = PROVIDER_NAMES.get(provider, provider)
+            await storage.remove_grant(user_id, provider)
+            _grants.pop((user_id, provider), None)
+            if provider_of(selected_model(user_id)) == provider:
+                await storage.save_user_settings(user_id, model="groq")
+            await storage.add_admin_action(
+                OWNER_ID, "grant_remove", f"{provider}:{user_id}"
+            )
+            await refresh_user_commands(user_id)
             try:
                 await bot.send_message(
                     user_id,
-                    "🔒 Доступ к DeepSeek отозван. Модель переключена на Groq, контекст очищен.",
+                    f"🔒 Доступ к {provider_name} отозван. "
+                    "Модель переключена на Groq, контекст сохранён.",
                 )
             except Exception:
                 pass
-            text, kb = await admin_section("ds")
+            text, kb = await admin_section("acc", 0, provider=provider)
             await edit_admin(callback, text, kb)
             await callback.answer("Доступ отозван.")
             return
@@ -3635,11 +4558,12 @@ async def process_photos(messages: list[Message]) -> None:
         return
 
     model = await resolve_model(user.id if user else None, private)
+    provider = provider_of(model)
 
     caption = next((m.caption.strip() for m in messages if m.caption), "")
     question = strip_triggers(caption) if caption else ""
     if not question:
-        question = "реши подробно" if model == "deepseek" else "Что на фото?"
+        question = "реши подробно" if provider in ("deepseek", "qwen") else "Что на фото?"
 
     track = await begin_request(
         first,
@@ -3649,9 +4573,9 @@ async def process_photos(messages: list[Message]) -> None:
     )
     started = time.perf_counter()
 
-    if model == "deepseek" and private:
+    if provider in ("deepseek", "qwen") and private:
         async with chat_lock(chat_id):
-            await process_deepseek_photos(messages, question, track, started)
+            await process_premium_photos(messages, question, track, started, model)
         return
 
     await process_groq_photos(messages, question, track, started)
@@ -3738,7 +4662,7 @@ async def process_groq_photos(messages: list[Message], question: str, track: Tra
         await run_ai(turn)
 
 
-def _deepseek_photo_messages(images: list[tuple[str, bytes]], text: str) -> list[dict]:
+def _photo_content_messages(images: list[tuple[str, bytes]], text: str) -> list[dict]:
     content: list[dict] = [{"type": "text", "text": text}]
     for mime, data in images:
         b64 = base64.b64encode(data).decode()
@@ -3751,27 +4675,39 @@ def _deepseek_photo_messages(images: list[tuple[str, bytes]], text: str) -> list
     return [{"role": "user", "content": content}]
 
 
-async def process_deepseek_photos(
+async def process_premium_photos(
     messages: list[Message],
     question: str,
     track: Track,
     started: float,
+    model_key: str,
 ) -> None:
     first = messages[0]
     chat_id = first.chat.id
     private = is_private(first)
+    info = MODEL_REGISTRY.get(model_key) or MODEL_REGISTRY["deepseek"]
+    provider = info["provider"]
+    provider_name = PROVIDER_NAMES.get(provider, provider)
+    # Фото всегда обрабатывает vision-модель провайдера:
+    # для DeepSeek — deepseek-v4.1-flash (в т.ч. при выбранной pro), для Qwen — qwen4-max.
+    vision_model = PROVIDER_VISION_MODEL.get(provider)
+    solve_model = vision_model or info["model"]
+    user = first.from_user
+    user_id = user.id if user else None
+    rich = bool(private and user_rich(user_id))
     turn = Turn(
         message=first,
         chat_id=chat_id,
         is_private=private,
         user_text=question,
-        model="deepseek",
+        model=model_key,
         track=track,
     )
+    streamer = RichStreamer(turn) if rich else None
     status = "ok"
     error_text = ""
     try:
-        await turn.status.show("👁 DeepSeek читает фото…")
+        await turn.status.show(f"👁 {provider_name} читает фото…")
         images: list[tuple[str, bytes]] = []
         failed: list[int] = []
         for index, m in enumerate(messages, 1):
@@ -3784,7 +4720,7 @@ async def process_deepseek_photos(
                 images.append((mime, data))
             except Exception as e:
                 failed.append(index)
-                logging.warning(f"DeepSeek photo download failed: {e}")
+                logging.warning(f"Premium photo download failed: {e}")
 
         if not images:
             await send_text(turn, "⚠️ Не удалось скачать ни одного фото.")
@@ -3801,18 +4737,18 @@ async def process_deepseek_photos(
 
         describe_text = DEEPSEEK_PHOTO_DESCRIBE_PROMPT + failed_note
         describe_result = await call_model(
-            "deepseek",
-            _deepseek_photo_messages(images, describe_text),
+            provider,
+            _photo_content_messages(images, describe_text),
             track=track,
-            effort="high",
-            max_tokens=DEEPSEEK_MAX_TOKENS,
+            effort="off",
+            max_tokens=4000,
+            model=vision_model,
         )
         description = (describe_result.content or "").strip()
         if not description:
-            raise RuntimeError("DeepSeek не вернул описание фото")
+            raise RuntimeError(f"{provider_name} не вернул описание фото")
 
         await turn.status.show("🧠 Решаю задание…")
-        needs_high = True
         user_question = question or "реши подробно"
         solve_text = (
             DEEPSEEK_PHOTO_SOLVE_PROMPT
@@ -3822,30 +4758,42 @@ async def process_deepseek_photos(
             + user_question
             + failed_note
         )
+        search_mode = user_search_mode(user_id) if private else "auto"
+        tools = TOOLS
+        if search_mode == "off":
+            tools = [
+                t for t in TOOLS
+                if (t.get("function") or {}).get("name") != "web_search"
+            ]
         solve_messages = [
-            {"role": "system", "content": system_prompt()},
-            *_deepseek_photo_messages(images, solve_text),
+            {"role": "system", "content": system_prompt(rich)},
+            {"role": "user", "content": solve_text},
         ]
 
         turn.explicit_draw = draw_with_reference(detect_explicit_draw(question), description)
         if turn.explicit_draw:
             forced = {"type": "function", "function": {"name": "generate_image"}}
-        elif has_search_verb(user_question):
+        elif search_mode == "always" or has_search_verb(user_question):
             forced = {"type": "function", "function": {"name": "web_search"}}
         else:
             forced = None
+
+        effort = user_effort(user_id) if private else "off"
 
         async def executor(name, args):
             return await execute_tool(turn, name, args)
 
         answer = await run_tools(
             solve_messages,
-            TOOLS,
+            tools,
             executor,
             forced,
-            provider="deepseek",
+            provider=provider,
             track=track,
-            effort="high" if needs_high else "low",
+            effort=effort,
+            model=solve_model,
+            on_delta=streamer.on_delta if streamer else None,
+            reset_cb=streamer.reset if streamer else None,
         )
 
         photo_label = "фото" if len(images) == 1 else f"фото ({len(images)})"
@@ -3887,30 +4835,38 @@ async def process_deepseek_photos(
 
         if answer:
             if not (turn.image_sent and is_trivial(answer)):
-                await send_text(turn, answer)
+                if streamer is not None:
+                    await streamer.finish(answer)
+                else:
+                    await send_text(turn, answer)
                 await add_to_history(chat_id, "assistant", answer)
         elif not turn.image_sent and not turn.image_error:
             fallback_text = "Не смог разобрать задание. Попробуй сфотографировать чётче."
-            await send_text(turn, fallback_text)
+            if streamer is not None:
+                await streamer.finish(fallback_text)
+            else:
+                await send_text(turn, fallback_text)
             await add_to_history(chat_id, "assistant", fallback_text)
 
         _stats[chat_id] = _stats.get(chat_id, 0) + 1
-        logging.info(f"[{chat_id}] ФОТО DeepSeek ({len(images)}) | {question[:80]}")
+        logging.info(
+            f"[{chat_id}] ФОТО {provider_name} ({len(images)}) | {question[:80]}"
+        )
     except asyncio.CancelledError:
         status = "cancelled"
         raise
     except Exception as e:
         status = "error"
         error_text = str(e)
-        logging.exception("DeepSeek photo error")
-        await send_ds_switch_button(turn, friendly_ai_error(e))
+        logging.exception("Premium photo error")
+        await send_switch_button(turn, friendly_ai_error(e))
     finally:
         await finish_track(
             track,
             status=status,
             error=error_text,
             latency_ms=int((time.perf_counter() - started) * 1000),
-            model="deepseek",
+            model=model_key,
             tools=",".join(turn.tools_used),
         )
         await turn.status.clear()
@@ -4076,7 +5032,7 @@ async def on_voice(message: Message):
     else:
         await storage.update_request_preview(track.request_id, cleaned)
     quote, media_desc = await build_reply_block(
-        message, need_media=True, track=track, provider=model
+        message, need_media=True, track=track, provider=provider_of(model)
     )
     label = "" if private else f"{display_user(user)}: "
     entry = f"{label}{quote}(голосовое, расшифровка, возможны ошибки): {cleaned}"
@@ -4093,6 +5049,7 @@ async def on_voice(message: Message):
         explicit_draw=draw,
         model=model,
         track=track,
+        rich_allowed=False,
     )
 
     logging.info(f"[{chat_id}] ГОЛОС | model={model} | {cleaned[:80]}")
@@ -4124,7 +5081,7 @@ async def handle_private_text(message: Message) -> None:
     model = await resolve_model(user.id if user else None, True)
     track = await begin_request(message, kind="text", prompt=text, model=model)
     quote, media_desc = await build_reply_block(
-        message, need_media=True, track=track, provider=model
+        message, need_media=True, track=track, provider=provider_of(model)
     )
     await add_to_history(chat_id, "user", f"{quote}{text}")
 
@@ -4251,7 +5208,7 @@ async def on_other(message: Message):
 # ============================================================
 
 
-BASE_COMMANDS = [
+GROUP_COMMANDS = [
     BotCommand(command="start", description="Приветствие"),
     BotCommand(command="help", description="Что я умею"),
     BotCommand(command="about", description="Инфо обо мне и моделях"),
@@ -4260,14 +5217,21 @@ BASE_COMMANDS = [
     BotCommand(command="whoami", description="Мой ID и username"),
     BotCommand(command="stats", description="Статистика чата"),
 ]
+PRIVATE_COMMANDS = [
+    BotCommand(command="start", description="Приветствие"),
+    BotCommand(command="help", description="Что я умею"),
+    BotCommand(command="about", description="Инфо обо мне и моделях"),
+    BotCommand(command="models", description="Модели и режимы"),
+    BotCommand(command="clear", description="Очистить контекст чата"),
+    BotCommand(command="context", description="Сколько сообщений в памяти"),
+    BotCommand(command="whoami", description="Мой ID и username"),
+    BotCommand(command="stats", description="Статистика чата"),
+]
+BASE_COMMANDS = GROUP_COMMANDS
 
 
-async def refresh_user_commands(user_id: int, granted: bool | None = None) -> None:
-    if granted is None:
-        granted = int(user_id) == OWNER_ID or int(user_id) in _deepseek_grants
-    commands = list(BASE_COMMANDS)
-    if granted:
-        commands.append(BotCommand(command="model", description="Выбрать модель"))
+async def refresh_user_commands(user_id: int) -> None:
+    commands = list(PRIVATE_COMMANDS)
     if int(user_id) == OWNER_ID:
         commands.append(BotCommand(command="admin", description="Админ-панель"))
     try:
@@ -4279,10 +5243,9 @@ async def refresh_user_commands(user_id: int, granted: bool | None = None) -> No
 
 
 async def set_commands() -> None:
-    await bot.set_my_commands(BASE_COMMANDS, scope=BotCommandScopeDefault())
-    await refresh_user_commands(OWNER_ID, granted=True)
-    for user_id in list(_deepseek_grants.keys()):
-        await refresh_user_commands(user_id, granted=True)
+    await bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    await refresh_user_commands(OWNER_ID)
 
 
 async def load_runtime_state() -> None:
@@ -4298,8 +5261,12 @@ async def load_runtime_state() -> None:
     _dm_blacklist.update(blacklist)
 
     grants = await storage.load_grants()
-    _deepseek_grants.clear()
-    _deepseek_grants.update(grants)
+    _grants.clear()
+    _grants.update(grants)
+
+    settings = await storage.load_user_settings()
+    _user_settings.clear()
+    _user_settings.update(settings)
 
     contexts = await storage.load_contexts()
     _history.clear()
@@ -4310,7 +5277,8 @@ async def load_runtime_state() -> None:
 
     logging.info(
         f"Загружено: групп={len(_groups_cache)}, ЛС в блоке={len(_dm_blacklist)}, "
-        f"DeepSeek={len(_deepseek_grants)}, контекстов={len(_history)}"
+        f"доступов={len(_grants)}, настроек={len(_user_settings)}, "
+        f"контекстов={len(_history)}"
     )
 
 
@@ -4348,12 +5316,20 @@ async def main() -> None:
     BOT_USERNAME = me.username or ""
     logging.info(f"Бот запущен: @{BOT_USERNAME} (id={BOT_ID})")
     logging.info(f"Chat: {CHAT_MODEL} (Groq), fast: {FAST_MODEL}")
-    logging.info(f"DeepSeek: {DEEPSEEK_MODEL} ({'настроен' if deepseek_client.configured else 'нет AIKEYS_API'})")
+    logging.info(
+        f"DeepSeek: {DEEPSEEK_MODEL} "
+        f"({'настроен' if deepseek_client.configured else 'нет AIKEYS_API'})"
+    )
+    logging.info(
+        f"Qwen: qwen4-max "
+        f"({'настроен' if qwen_client.configured else 'нет QWEN_API'})"
+    )
     logging.info(f"Vision: {VISION_MODEL} (Gemini), fallback: {GROQ_VISION_MODEL} (Groq)")
     logging.info(f"Voice: {WHISPER_MODEL} (Groq)")
     logging.info("Search: Tavily + DDG fallback")
 
     await load_runtime_state()
+    await probe_premium_models()
     dp.message.outer_middleware(DMBlacklistMiddleware())
 
     logging.info(f"Allowed groups: {sorted(ALLOWED_GROUPS)}")
@@ -4368,6 +5344,7 @@ async def main() -> None:
         logging.exception("delete_webhook failed")
 
     tasks.append(asyncio.create_task(daily_summary_loop()))
+    tasks.append(asyncio.create_task(balances_loop()))
     tasks.append(asyncio.create_task(dp.start_polling(bot)))
     try:
         await asyncio.gather(*tasks)

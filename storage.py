@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS dm_blacklist (
     added_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Старые таблицы DeepSeek оставлены для миграции данных.
 CREATE TABLE IF NOT EXISTS deepseek_grants (
     user_id BIGINT PRIMARY KEY,
     username TEXT,
@@ -58,6 +59,33 @@ CREATE TABLE IF NOT EXISTS deepseek_usage (
     day DATE NOT NULL,
     requests INT NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS provider_grants (
+    user_id BIGINT NOT NULL,
+    provider TEXT NOT NULL,
+    username TEXT,
+    full_name TEXT,
+    granted_by BIGINT,
+    granted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, provider)
+);
+
+CREATE TABLE IF NOT EXISTS usage_daily (
+    user_id BIGINT NOT NULL,
+    provider TEXT NOT NULL,
+    day DATE NOT NULL,
+    requests INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, provider, day)
+);
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id BIGINT PRIMARY KEY,
+    model TEXT NOT NULL DEFAULT 'groq',
+    rich BOOLEAN NOT NULL DEFAULT TRUE,
+    deepthink TEXT NOT NULL DEFAULT 'off',
+    search TEXT NOT NULL DEFAULT 'auto',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS contexts (
@@ -137,6 +165,25 @@ CREATE TABLE IF NOT EXISTS admin_actions (
 );
 """
 
+# Миграция старых данных DeepSeek в общие таблицы. После успешного копирования
+# старые строки удаляются, чтобы отозванные гранты не возвращались при рестарте.
+MIGRATIONS = """
+INSERT INTO provider_grants (user_id, provider, username, full_name, granted_by, granted_at)
+SELECT user_id, 'deepseek', username, full_name, granted_by, granted_at
+FROM deepseek_grants
+WHERE TRUE
+ON CONFLICT (user_id, provider) DO NOTHING;
+
+INSERT INTO usage_daily (user_id, provider, day, requests)
+SELECT user_id, 'deepseek', day, requests
+FROM deepseek_usage
+WHERE TRUE
+ON CONFLICT (user_id, provider, day) DO NOTHING;
+
+DELETE FROM deepseek_grants;
+DELETE FROM deepseek_usage;
+"""
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -168,8 +215,9 @@ class Storage:
             }
         }
         self._blacklist: dict[int, dict] = {}
-        self._grants: dict[int, dict] = {}
-        self._usage: dict[tuple[int, str], int] = {}
+        self._grants: dict[tuple[int, str], dict] = {}
+        self._usage: dict[tuple[int, str, str], int] = {}
+        self._user_settings: dict[int, dict] = {}
         self._contexts: dict[int, list[dict]] = {}
         self._requests: list[dict] = []
         self._calls: list[dict] = []
@@ -211,6 +259,10 @@ class Storage:
             )
             async with self.pool.acquire() as conn:
                 await conn.execute(SCHEMA)
+                try:
+                    await conn.execute(MIGRATIONS)
+                except Exception as e:
+                    logging.warning(f"Миграция старых данных не удалась: {e}")
                 count = await conn.fetchval("SELECT count(*) FROM allowed_groups")
                 if not count:
                     await conn.execute(
@@ -381,19 +433,20 @@ class Storage:
             logging.warning(f"remove_blacklist failed: {e}")
 
     # ------------------------------------------------------------------
-    # Доступ к DeepSeek
+    # Доступ к провайдерам (DeepSeek / Qwen)
     # ------------------------------------------------------------------
 
-    async def load_grants(self) -> dict[int, dict]:
+    async def load_grants(self) -> dict[tuple[int, str], dict]:
         try:
             if self.available:
                 rows = await self.pool.fetch(
-                    "SELECT user_id, username, full_name, granted_at FROM deepseek_grants "
-                    "ORDER BY granted_at"
+                    "SELECT user_id, provider, username, full_name, granted_at "
+                    "FROM provider_grants ORDER BY granted_at"
                 )
                 self._grants = {
-                    int(r["user_id"]): {
+                    (int(r["user_id"]), str(r["provider"])): {
                         "user_id": int(r["user_id"]),
+                        "provider": str(r["provider"]),
                         "username": r["username"] or "",
                         "full_name": r["full_name"] or "",
                         "granted_at": r["granted_at"],
@@ -408,12 +461,14 @@ class Storage:
     async def add_grant(
         self,
         user_id: int,
+        provider: str = "deepseek",
         username: str = "",
         full_name: str = "",
         granted_by: int | None = None,
     ) -> None:
-        self._grants[int(user_id)] = {
+        self._grants[(int(user_id), provider)] = {
             "user_id": int(user_id),
+            "provider": provider,
             "username": username or "",
             "full_name": full_name or "",
             "granted_at": _now(),
@@ -421,11 +476,13 @@ class Storage:
         try:
             if self.available:
                 await self.pool.execute(
-                    "INSERT INTO deepseek_grants (user_id, username, full_name, granted_by) "
-                    "VALUES ($1, $2, $3, $4) "
-                    "ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, "
-                    "full_name = EXCLUDED.full_name",
+                    "INSERT INTO provider_grants "
+                    "(user_id, provider, username, full_name, granted_by) "
+                    "VALUES ($1, $2, $3, $4, $5) "
+                    "ON CONFLICT (user_id, provider) DO UPDATE SET "
+                    "username = EXCLUDED.username, full_name = EXCLUDED.full_name",
                     int(user_id),
+                    provider,
                     username or "",
                     full_name or "",
                     granted_by,
@@ -433,25 +490,29 @@ class Storage:
         except Exception as e:
             logging.warning(f"add_grant failed: {e}")
 
-    async def remove_grant(self, user_id: int) -> None:
-        self._grants.pop(int(user_id), None)
+    async def remove_grant(self, user_id: int, provider: str = "deepseek") -> None:
+        self._grants.pop((int(user_id), provider), None)
         try:
             if self.available:
                 await self.pool.execute(
-                    "DELETE FROM deepseek_grants WHERE user_id = $1", int(user_id)
+                    "DELETE FROM provider_grants WHERE user_id = $1 AND provider = $2",
+                    int(user_id),
+                    provider,
                 )
         except Exception as e:
             logging.warning(f"remove_grant failed: {e}")
 
-    async def get_usage(self, user_id: int, day: date) -> int:
-        key = (int(user_id), day.isoformat())
+    async def get_usage(self, user_id: int, provider: str, day: date) -> int:
+        key = (int(user_id), provider, day.isoformat())
         if key in self._usage:
             return self._usage[key]
         try:
             if self.available:
                 value = await self.pool.fetchval(
-                    "SELECT requests FROM deepseek_usage WHERE user_id = $1 AND day = $2",
+                    "SELECT requests FROM usage_daily "
+                    "WHERE user_id = $1 AND provider = $2 AND day = $3",
                     int(user_id),
+                    provider,
                     day,
                 )
                 self._usage[key] = int(value or 0)
@@ -460,40 +521,107 @@ class Storage:
             logging.warning(f"get_usage failed: {e}")
         return 0
 
-    async def inc_usage(self, user_id: int, day: date) -> int:
-        key = (int(user_id), day.isoformat())
+    async def inc_usage(self, user_id: int, provider: str, day: date) -> int:
+        key = (int(user_id), provider, day.isoformat())
         current = self._usage.get(key)
         if current is None:
-            current = await self.get_usage(user_id, day)
+            current = await self.get_usage(user_id, provider, day)
         current += 1
         self._usage[key] = current
         try:
             if self.available:
                 await self.pool.execute(
-                    "INSERT INTO deepseek_usage (user_id, day, requests) VALUES ($1, $2, 1) "
-                    "ON CONFLICT (user_id, day) DO UPDATE SET requests = deepseek_usage.requests + 1",
+                    "INSERT INTO usage_daily (user_id, provider, day, requests) "
+                    "VALUES ($1, $2, $3, 1) "
+                    "ON CONFLICT (user_id, provider, day) DO UPDATE SET "
+                    "requests = usage_daily.requests + 1",
                     int(user_id),
+                    provider,
                     day,
                 )
         except Exception as e:
             logging.warning(f"inc_usage failed: {e}")
         return current
 
-    async def usage_for_day(self, day: date) -> dict[int, int]:
+    async def usage_for_day(
+        self, day: date, provider: str | None = None
+    ) -> dict[tuple[int, str], int]:
         try:
             if self.available:
-                rows = await self.pool.fetch(
-                    "SELECT user_id, requests FROM deepseek_usage WHERE day = $1", day
-                )
-                return {int(r["user_id"]): int(r["requests"]) for r in rows}
+                if provider:
+                    rows = await self.pool.fetch(
+                        "SELECT user_id, provider, requests FROM usage_daily "
+                        "WHERE day = $1 AND provider = $2",
+                        day,
+                        provider,
+                    )
+                else:
+                    rows = await self.pool.fetch(
+                        "SELECT user_id, provider, requests FROM usage_daily "
+                        "WHERE day = $1",
+                        day,
+                    )
+                return {
+                    (int(r["user_id"]), str(r["provider"])): int(r["requests"])
+                    for r in rows
+                }
         except Exception as e:
             logging.warning(f"usage_for_day failed: {e}")
         prefix = day.isoformat()
         return {
-            user_id: count
-            for (user_id, d), count in self._usage.items()
-            if d == prefix
+            (user_id, prov): count
+            for (user_id, prov, d), count in self._usage.items()
+            if d == prefix and (provider is None or prov == provider)
         }
+
+    # ------------------------------------------------------------------
+    # Настройки пользователей
+    # ------------------------------------------------------------------
+
+    async def load_user_settings(self) -> dict[int, dict]:
+        try:
+            if self.available:
+                rows = await self.pool.fetch(
+                    "SELECT user_id, model, rich, deepthink, search FROM user_settings"
+                )
+                self._user_settings = {
+                    int(r["user_id"]): {
+                        "model": r["model"] or "groq",
+                        "rich": bool(r["rich"]),
+                        "deepthink": r["deepthink"] or "off",
+                        "search": r["search"] or "auto",
+                    }
+                    for r in rows
+                }
+            return dict(self._user_settings)
+        except Exception as e:
+            logging.warning(f"load_user_settings failed: {e}")
+            return dict(self._user_settings)
+
+    async def save_user_settings(self, user_id: int, **fields) -> None:
+        allowed = {"model", "rich", "deepthink", "search"}
+        values = {k: v for k, v in fields.items() if k in allowed}
+        if not values:
+            return
+        current = self._user_settings.setdefault(
+            int(user_id),
+            {"model": "groq", "rich": True, "deepthink": "off", "search": "auto"},
+        )
+        current.update(values)
+        try:
+            if not self.available:
+                return
+            columns = list(values.keys())
+            placeholders = ", ".join(f"${i + 2}" for i in range(len(columns)))
+            updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns)
+            sql = (
+                f"INSERT INTO user_settings (user_id, {', '.join(columns)}) "
+                f"VALUES ($1, {placeholders}) "
+                f"ON CONFLICT (user_id) DO UPDATE SET {updates}, updated_at = now()"
+            )
+            await self.pool.execute(sql, int(user_id), *[values[c] for c in columns])
+        except Exception as e:
+            logging.warning(f"save_user_settings failed: {e}")
 
     # ------------------------------------------------------------------
     # Контекст
