@@ -388,6 +388,11 @@ def esc(text) -> str:
     return html.escape(str(text), quote=False)
 
 
+def plain_text(text) -> str:
+    """Убирает HTML-теги: callback-ответы Telegram показываются без разметки."""
+    return html.unescape(re.sub(r"<[^>]+>", "", str(text or ""))).strip()
+
+
 # ============================================================
 # КОНТЕКСТ
 # ============================================================
@@ -644,9 +649,7 @@ async def set_model_for_user(user_id: int, model_key: str) -> tuple[bool, str]:
     if model_key not in MODEL_REGISTRY:
         return False, "Неизвестная модель."
     if model_key in _model_blocked:
-        return False, (
-            f"{esc(model_label(model_key))}: {esc(_model_blocked[model_key])}."
-        )
+        return False, f"{model_label(model_key)}: {_model_blocked[model_key]}."
     if not model_available(user_id, model_key):
         provider = provider_of(model_key)
         name = PROVIDER_NAMES.get(provider, provider)
@@ -666,11 +669,10 @@ async def set_model_for_user(user_id: int, model_key: str) -> tuple[bool, str]:
     if provider != "groq" and int(user_id) != OWNER_ID:
         used = await storage.get_usage(int(user_id), provider, msk_today())
         limit = PROVIDER_LIMITS.get(provider, 0)
-        note = f"\nОсталось сегодня: <b>{max(0, limit - used)}</b> из {limit}."
+        note = f"\nОсталось сегодня: {max(0, limit - used)} из {limit}."
     return (
         True,
-        f"Модель переключена на <b>{esc(model_label(model_key))}</b>. "
-        f"Контекст сохранён.{note}",
+        f"Модель переключена на {model_label(model_key)}. Контекст сохранён.{note}",
     )
 
 
@@ -2802,8 +2804,10 @@ async def models_panel_view(user_id: int, tab: str = "models") -> tuple[str, Inl
         if int(user_id) == OWNER_ID:
             mark = "⚠️ " if (blocked or not configured) else ("✅ " if key == current else "")
         else:
-            if not allowed:
+            if not provider_eligible(user_id, provider):
                 mark = "🔒 "
+            elif blocked or not configured:
+                mark = "⚠️ "
             elif key == current:
                 mark = "✅ "
             else:
@@ -2862,6 +2866,19 @@ async def on_model_locked(callback: CallbackQuery):
     if reason:
         await callback.answer(f"Модель недоступна: {reason}.", show_alert=True)
         return
+    info = MODEL_REGISTRY.get(key)
+    if info and info["provider"] != "groq":
+        provider = info["provider"]
+        client = PROVIDER_CLIENTS.get(provider)
+        if client is None or not client.configured:
+            name = PROVIDER_NAMES.get(provider, provider)
+            await callback.answer(
+                f"{name} не настроен на сервере: нет API-ключа.", show_alert=True
+            )
+            return
+    if callback.from_user and int(callback.from_user.id) == OWNER_ID:
+        await callback.answer("Эта модель сейчас недоступна.", show_alert=True)
+        return
     await callback.answer(
         f"Доступ выдаёт владелец @{OWNER_USERNAME} (t.me/{OWNER_USERNAME}).",
         show_alert=True,
@@ -2917,7 +2934,7 @@ async def on_model_callback(callback: CallbackQuery):
         return
     model = (callback.data or "").rsplit(":", 1)[-1]
     ok, text = await set_model_for_user(user_id, model)
-    await callback.answer(("✅ " if ok else "⚠️ ") + text[:180], show_alert=not ok)
+    await callback.answer(("✅ " if ok else "⚠️ ") + plain_text(text)[:180], show_alert=not ok)
     if not ok:
         return
     panel, kb = await models_panel_view(user_id, "models")
@@ -3952,7 +3969,7 @@ async def on_admin_callback(callback: CallbackQuery):
         if action == "mset":
             model = parts[2] if len(parts) > 2 else "groq"
             ok, msg = await set_model_for_user(OWNER_ID, model)
-            await callback.answer(msg[:180], show_alert=not ok)
+            await callback.answer(plain_text(msg)[:180], show_alert=not ok)
             if ok:
                 await storage.add_admin_action(OWNER_ID, "model_set", model)
             text, kb = await admin_section("model")
@@ -4214,7 +4231,7 @@ async def on_admin_callback(callback: CallbackQuery):
         await callback.answer()
     except Exception as e:
         logging.exception("Admin callback error")
-        await callback.answer(f"Ошибка: {e}"[:180], show_alert=True)
+        await callback.answer(plain_text(f"Ошибка: {e}")[:180], show_alert=True)
 
 
 async def send_daily_summary() -> None:
