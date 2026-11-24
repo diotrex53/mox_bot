@@ -36,7 +36,9 @@ from aiogram.types import (
     InputRichMessage,
     InputTextMessageContent,
     LinkPreviewOptions,
+    MenuButtonWebApp,
     Message,
+    WebAppInfo,
 )
 from openai import AsyncOpenAI
 
@@ -140,6 +142,33 @@ OWNER_ID = 6101597477
 OWNER_USERNAME = "Diotrex"
 ALLOWED_GROUPS: set[int] = {-1002495961136}
 
+# ---- Mini App админки ----------------------------------------------------
+try:
+    import webapp as webapp_module
+
+    WEBAPP_MODULE = True
+except Exception:  # pragma: no cover
+    webapp_module = None
+    WEBAPP_MODULE = False
+    logging.warning("webapp.py не загружен: Mini App админки отключён")
+
+
+def resolve_webapp_url() -> str:
+    """Публичный HTTPS-адрес страницы админки."""
+    base = (
+        os.environ.get("WEBAPP_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or ""
+    ).strip()
+    if not base:
+        return ""
+    if base.startswith("http://"):
+        base = "https://" + base[len("http://") :]
+    return base.rstrip("/") + "/admin"
+
+
+WEBAPP_URL = resolve_webapp_url() if WEBAPP_MODULE else ""
+
 HISTORY_LIMIT = 50
 HISTORY_STORE_CHARS_LIMIT = 300000
 HISTORY_CHARS_LIMIT = 14000
@@ -200,7 +229,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
-APP_BUILD = "2026-11-24 widgets-text-fallback"
+APP_BUILD = "2026-11-24 mini-app-admin"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -3818,38 +3847,53 @@ def admin_main_text() -> str:
         f"Доступ DeepSeek: <b>{ds_count}</b> · Qwen: <b>{qwen_count}</b>\n"
         f"💰 {balance_short()}\n\n"
         f"{db_usage_line(_db_size_cache)}\n\n"
-        "Выбери раздел:"
+        + (
+            "📱 Полноценная админка — приложение: кнопка "
+            "<b>«Открыть админку»</b> ниже или кнопка меню слева.\n\n"
+            if WEBAPP_URL
+            else ""
+        )
+        + "Выбери раздел:"
     )
 
 
 def admin_main_kb() -> InlineKeyboardMarkup:
-    return admin_kb(
+    rows = [
         [
+            InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats:t"),
+            InlineKeyboardButton(text="🖥 Дашборд", callback_data="adm:dash"),
+        ],
+        [
+            InlineKeyboardButton(text="🧠 Модель", callback_data="adm:model"),
+            InlineKeyboardButton(text="👥 Группы", callback_data="adm:groups:0"),
+        ],
+        [
+            InlineKeyboardButton(text="🚫 ЛС", callback_data="adm:bl:0"),
+            InlineKeyboardButton(text="📝 Запросы", callback_data="adm:req:0"),
+        ],
+        [
+            InlineKeyboardButton(text="🔑 DeepSeek", callback_data="adm:acc:deepseek:0"),
+            InlineKeyboardButton(text="🐳 Qwen", callback_data="adm:acc:qwen:0"),
+        ],
+        [
+            InlineKeyboardButton(text="💳 Балансы", callback_data="adm:bal"),
+            InlineKeyboardButton(text="📨 Сводка", callback_data="adm:summary"),
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set"),
+        ],
+    ]
+    if WEBAPP_URL:
+        rows.insert(
+            0,
             [
-                InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats:t"),
-                InlineKeyboardButton(text="🖥 Дашборд", callback_data="adm:dash"),
+                InlineKeyboardButton(
+                    text="📱 Открыть админку",
+                    web_app=WebAppInfo(url=WEBAPP_URL),
+                )
             ],
-            [
-                InlineKeyboardButton(text="🧠 Модель", callback_data="adm:model"),
-                InlineKeyboardButton(text="👥 Группы", callback_data="adm:groups:0"),
-            ],
-            [
-                InlineKeyboardButton(text="🚫 ЛС", callback_data="adm:bl:0"),
-                InlineKeyboardButton(text="📝 Запросы", callback_data="adm:req:0"),
-            ],
-            [
-                InlineKeyboardButton(text="🔑 DeepSeek", callback_data="adm:acc:deepseek:0"),
-                InlineKeyboardButton(text="🐳 Qwen", callback_data="adm:acc:qwen:0"),
-            ],
-            [
-                InlineKeyboardButton(text="💳 Балансы", callback_data="adm:bal"),
-                InlineKeyboardButton(text="📨 Сводка", callback_data="adm:summary"),
-            ],
-            [
-                InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set"),
-            ],
-        ]
-    )
+        )
+    return admin_kb(rows)
 
 
 def stats_text(stats: dict, period: str, flt: dict) -> str:
@@ -5923,6 +5967,423 @@ async def load_runtime_state() -> None:
     )
 
 
+async def webapp_overview_payload(request_limit: int = 30) -> dict:
+    """Данные для Mini App: статистика, модели, балансы, доступы, настройки."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=24)
+    data = await storage.stats(start, end)
+    settings = user_settings(OWNER_ID)
+    models = [
+        {
+            "model": m["model"],
+            "provider": m.get("provider") or "",
+            "calls": int(m.get("calls") or 0),
+            "tokens": int(m.get("total_tokens") or 0),
+        }
+        for m in merge_stats_models(data.get("models"), limit=8)
+    ]
+    available = []
+    for key, info in MODEL_REGISTRY.items():
+        blocked = _model_blocked.get(key)
+        available.append(
+            {
+                "key": key,
+                "label": info["label"],
+                "available": not blocked and model_available(OWNER_ID, key),
+                "reason": blocked or "",
+            }
+        )
+    balances = []
+    for key, name in (
+        ("deepseek", "aikeysforyou (DeepSeek)"),
+        ("qwen", "voidluv (Qwen)"),
+    ):
+        item = _balance.get(key) or {}
+        balances.append(
+            {
+                "key": key,
+                "name": name,
+                "amount": item.get("amount"),
+                "total": item.get("total"),
+                "error": item.get("error"),
+            }
+        )
+
+    today = msk_today()
+    try:
+        usage_today = await storage.usage_for_day(today)
+    except Exception as e:
+        logging.warning(f"webapp usage_for_day failed: {e}")
+        usage_today = {}
+    grants_list = []
+    for (user_id, provider), grant in sorted(
+        _grants.items(), key=lambda pair: (pair[0][1], pair[0][0])
+    ):
+        grants_list.append(
+            {
+                "user_id": user_id,
+                "provider": provider,
+                "username": grant.get("username") or "",
+                "full_name": grant.get("full_name") or "",
+                "used": int(usage_today.get((user_id, provider), 0)),
+                "limit": PROVIDER_LIMITS.get(provider, 0),
+            }
+        )
+
+    try:
+        requests_rows, _ = await storage.list_requests(limit=request_limit)
+    except Exception as e:
+        logging.warning(f"webapp list_requests failed: {e}")
+        requests_rows = []
+    requests_list = [
+        {
+            "id": row.get("id"),
+            "created_at": str(row.get("created_at") or ""),
+            "user_id": row.get("user_id"),
+            "model": canonical_model_name(row.get("model") or ""),
+            "status": row.get("status") or "",
+            "tokens": int(row.get("tokens") or 0),
+            "preview": (row.get("prompt_preview") or "")[:120],
+        }
+        for row in requests_rows
+    ]
+
+    groups_list = [
+        {"chat_id": chat_id, "title": item.get("title") or ""}
+        for chat_id, item in sorted(_groups_cache.items())
+    ]
+    blocked_list = [
+        {
+            "user_id": user_id,
+            "username": item.get("username") or "",
+            "reason": item.get("full_name") or "",
+        }
+        for user_id, item in sorted(_dm_blacklist.items())
+    ]
+
+    return {
+        "build": APP_BUILD,
+        "period": "24 часа",
+        "requests": int(data.get("requests") or 0),
+        "calls": int(data.get("calls") or 0),
+        "errors": int(data.get("request_errors") or 0)
+        + int(data.get("call_errors") or 0),
+        "credits": float(data.get("credits") or 0),
+        "avg_latency": float(data.get("avg_latency") or 0),
+        "contexts": len(data.get("contexts") or {}),
+        "models": models,
+        "top_users": data.get("top_users") or [],
+        "balances": balances,
+        "groups": len(_groups_cache),
+        "blocked": len(_dm_blacklist),
+        "grants": {
+            "deepseek": sum(1 for (_, p) in _grants if p == "deepseek"),
+            "qwen": sum(1 for (_, p) in _grants if p == "qwen"),
+        },
+        "settings": {
+            "model": settings.get("model", "groq"),
+            "rich": bool(settings.get("rich", True)),
+            "deepthink": settings.get("deepthink", "off"),
+            "search": settings.get("search", "auto"),
+        },
+        "models_available": available,
+        "grants_list": grants_list,
+        "requests_list": requests_list,
+        "groups_list": groups_list,
+        "blocked_list": blocked_list,
+    }
+
+
+def build_web_app():
+    """aiohttp-приложение: /health, страница Mini App /admin и её API."""
+    from aiohttp import web
+
+    def authorized(request) -> bool:
+        if not WEBAPP_MODULE or webapp_module is None:
+            return False
+        return webapp_module.verify_init_data(
+            request.headers.get("X-Init-Data", ""), BOT_TOKEN, OWNER_ID
+        )
+
+    def deny():
+        return web.json_response({"error": "Нет доступа"}, status=403)
+
+    def query_limit(request, default: int = 30) -> int:
+        try:
+            return max(1, min(200, int(request.query.get("requests", default))))
+        except (TypeError, ValueError):
+            return default
+
+    async def build_overview(limit: int = 30) -> dict:
+        return await webapp_overview_payload(limit)
+
+    async def admin_page(request):
+        if not WEBAPP_MODULE or webapp_module is None:
+            return web.Response(text="webapp.py не загружен", status=503)
+        return web.Response(
+            text=webapp_module.ADMIN_HTML,
+            content_type="text/html",
+            charset="utf-8",
+            headers={
+                # Telegram WebView кэширует агрессивно — всегда отдаём свежую версию.
+                "Cache-Control": "no-store, max-age=0",
+                "Pragma": "no-cache",
+            },
+        )
+
+    async def overview_api(request):
+        if not authorized(request):
+            return deny()
+        return web.json_response(await build_overview(query_limit(request)))
+
+    async def settings_api(request):
+        if not authorized(request):
+            return deny()
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Некорректный JSON"}, status=400)
+
+        field = str(body.get("field") or "")
+        value = body.get("value")
+        message = "Сохранено"
+        try:
+            if field == "model":
+                ok, message = await set_model_for_user(OWNER_ID, str(value))
+                if not ok:
+                    return web.json_response({"error": message}, status=400)
+            elif field == "rich":
+                current = bool(user_settings(OWNER_ID).get("rich", True))
+                new_value = (not current) if value == "toggle" else bool(value)
+                await save_toggle(OWNER_ID, "rich", new_value)
+                message = "Rich-ответы " + ("включены" if new_value else "выключены")
+            elif field == "deepthink":
+                if value not in ("off", "low", "medium", "high"):
+                    return web.json_response(
+                        {"error": "Недопустимое значение"}, status=400
+                    )
+                await save_toggle(OWNER_ID, "deepthink", value)
+                message = f"Deepthink: {value}"
+            elif field == "search":
+                if value not in ("auto", "always", "off"):
+                    return web.json_response(
+                        {"error": "Недопустимое значение"}, status=400
+                    )
+                await save_toggle(OWNER_ID, "search", value)
+                message = f"Поиск: {value}"
+            else:
+                return web.json_response({"error": "Неизвестное поле"}, status=400)
+        except Exception as e:
+            logging.exception("webapp settings error")
+            return web.json_response({"error": str(e)}, status=500)
+
+        return web.json_response(
+            {"message": message, "overview": await build_overview()}
+        )
+
+    async def summary_api(request):
+        if not authorized(request):
+            return deny()
+        try:
+            await send_daily_summary(mark=False)
+        except Exception as e:
+            logging.exception("webapp summary error")
+            return web.json_response({"error": str(e)}, status=500)
+        return web.json_response(
+            {"message": "Сводка отправлена в чат с ботом"}
+        )
+
+    async def read_body(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return None
+        return body if isinstance(body, dict) else None
+
+    async def grant_api(request):
+        """Выдача и отзыв доступа к платным моделям прямо из Mini App."""
+        if not authorized(request):
+            return deny()
+        body = await read_body(request)
+        if body is None:
+            return web.json_response({"error": "Некорректный JSON"}, status=400)
+
+        action = str(body.get("action") or "")
+        provider = str(body.get("provider") or "deepseek")
+        if provider not in PROVIDER_NAMES:
+            return web.json_response({"error": "Неизвестный провайдер"}, status=400)
+        try:
+            user_id = int(body.get("user_id") or 0)
+        except (TypeError, ValueError):
+            user_id = 0
+        if user_id <= 0:
+            return web.json_response({"error": "Нужен числовой ID"}, status=400)
+
+        provider_name = PROVIDER_NAMES[provider]
+        if action == "add":
+            if user_id == OWNER_ID:
+                return web.json_response(
+                    {"error": "У владельца доступ уже есть"}, status=400
+                )
+            await storage.add_grant(user_id, provider, "", "", OWNER_ID)
+            _grants[(user_id, provider)] = {
+                "user_id": user_id,
+                "provider": provider,
+                "username": "",
+                "full_name": "",
+                "granted_at": msk_now(),
+            }
+            await storage.add_admin_action(
+                OWNER_ID, "grant_add", f"{provider}:{user_id}"
+            )
+            try:
+                await refresh_user_commands(user_id)
+            except Exception:
+                logging.warning("refresh_user_commands failed")
+            limit = PROVIDER_LIMITS.get(provider, 0)
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"🔑 Тебе выдан доступ к {provider_name}.\n"
+                    "Открой /models в личке и выбери модель. "
+                    f"Лимит: {limit} сообщений в день.",
+                )
+            except Exception as e:
+                logging.warning(f"grant notify failed: {e}")
+            message = f"Доступ {provider_name} выдан {user_id}"
+        elif action == "remove":
+            await storage.remove_grant(user_id, provider)
+            _grants.pop((user_id, provider), None)
+            if provider_of(selected_model(user_id)) == provider:
+                await storage.save_user_settings(user_id, model="groq")
+            await storage.add_admin_action(
+                OWNER_ID, "grant_remove", f"{provider}:{user_id}"
+            )
+            try:
+                await refresh_user_commands(user_id)
+            except Exception:
+                logging.warning("refresh_user_commands failed")
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"🔒 Доступ к {provider_name} отозван. "
+                    "Модель переключена на Groq, контекст сохранён.",
+                )
+            except Exception:
+                pass
+            message = f"Доступ {provider_name} убран у {user_id}"
+        else:
+            return web.json_response({"error": "Неизвестное действие"}, status=400)
+
+        return web.json_response(
+            {"message": message, "overview": await build_overview()}
+        )
+
+    async def group_api(request):
+        """Белый список групп: добавить или убрать."""
+        if not authorized(request):
+            return deny()
+        body = await read_body(request)
+        if body is None:
+            return web.json_response({"error": "Некорректный JSON"}, status=400)
+
+        action = str(body.get("action") or "")
+        try:
+            chat_id = int(body.get("chat_id") or 0)
+        except (TypeError, ValueError):
+            chat_id = 0
+        if not chat_id:
+            return web.json_response({"error": "Нужен chat_id"}, status=400)
+
+        if action == "add":
+            title = str(body.get("title") or "").strip()[:120]
+            if not title:
+                try:
+                    chat = await bot.get_chat(chat_id)
+                    title = getattr(chat, "title", "") or ""
+                except Exception as e:
+                    logging.warning(f"get_chat failed: {e}")
+            title = title or f"Группа {chat_id}"
+            await storage.add_group(chat_id, title, OWNER_ID)
+            ALLOWED_GROUPS.add(chat_id)
+            _groups_cache[chat_id] = {
+                "chat_id": chat_id,
+                "title": title,
+                "added_at": msk_now(),
+            }
+            await storage.add_admin_action(OWNER_ID, "group_add", str(chat_id))
+            message = f"Группа «{title}» добавлена"
+        elif action == "remove":
+            await storage.remove_group(chat_id)
+            ALLOWED_GROUPS.discard(chat_id)
+            _groups_cache.pop(chat_id, None)
+            await storage.add_admin_action(OWNER_ID, "group_remove", str(chat_id))
+            message = f"Группа {chat_id} убрана"
+        else:
+            return web.json_response({"error": "Неизвестное действие"}, status=400)
+
+        return web.json_response(
+            {"message": message, "overview": await build_overview()}
+        )
+
+    async def block_api(request):
+        """Заблокированные в личке пользователи: добавить или снять блок."""
+        if not authorized(request):
+            return deny()
+        body = await read_body(request)
+        if body is None:
+            return web.json_response({"error": "Некорректный JSON"}, status=400)
+
+        action = str(body.get("action") or "")
+        try:
+            user_id = int(body.get("user_id") or 0)
+        except (TypeError, ValueError):
+            user_id = 0
+        if user_id <= 0:
+            return web.json_response({"error": "Нужен числовой ID"}, status=400)
+        if user_id == OWNER_ID:
+            return web.json_response({"error": "Себя блокировать нельзя"}, status=400)
+
+        if action == "add":
+            await storage.add_blacklist(user_id, "", "", OWNER_ID)
+            _dm_blacklist[user_id] = {
+                "user_id": user_id,
+                "username": "",
+                "full_name": "",
+                "added_at": msk_now(),
+            }
+            await storage.delete_context(user_id)
+            _history.pop(user_id, None)
+            await storage.add_admin_action(OWNER_ID, "blacklist_add", str(user_id))
+            message = f"{user_id} заблокирован в ЛС"
+        elif action == "remove":
+            await storage.remove_blacklist(user_id)
+            _dm_blacklist.pop(user_id, None)
+            await storage.add_admin_action(
+                OWNER_ID, "blacklist_remove", str(user_id)
+            )
+            message = f"{user_id} разблокирован"
+        else:
+            return web.json_response({"error": "Неизвестное действие"}, status=400)
+
+        return web.json_response(
+            {"message": message, "overview": await build_overview()}
+        )
+
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="ok"))
+    app.router.add_get("/health", lambda request: web.Response(text="ok"))
+    app.router.add_get("/admin", admin_page)
+    app.router.add_get("/admin/", admin_page)
+    app.router.add_get("/api/admin/overview", overview_api)
+    app.router.add_post("/api/admin/settings", settings_api)
+    app.router.add_post("/api/admin/summary", summary_api)
+    app.router.add_post("/api/admin/grant", grant_api)
+    app.router.add_post("/api/admin/group", group_api)
+    app.router.add_post("/api/admin/block", block_api)
+    return app
+
+
 async def health_server() -> None:
     try:
         from aiohttp import web
@@ -5931,15 +6392,16 @@ async def health_server() -> None:
         return
 
     try:
-        app = web.Application()
-        app.router.add_get("/", lambda request: web.Response(text="ok"))
-        app.router.add_get("/health", lambda request: web.Response(text="ok"))
+        app = build_web_app()
         runner = web.AppRunner(app)
         await runner.setup()
         port = int(os.environ.get("PORT", "8080"))
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        logging.info(f"Health server запущен на порту {port}")
+        logging.info(
+            f"Health server запущен на порту {port}; "
+            f"Mini App: {WEBAPP_URL or 'выключен (нет WEBAPP_URL)'}"
+        )
     except Exception as e:
         logging.error(f"Health server error: {e}")
 
@@ -5980,6 +6442,17 @@ async def main() -> None:
         await set_commands()
     except Exception:
         logging.exception("set_commands failed")
+    if WEBAPP_URL:
+        try:
+            await bot.set_chat_menu_button(
+                chat_id=OWNER_ID,
+                menu_button=MenuButtonWebApp(
+                    text="Админка", web_app=WebAppInfo(url=WEBAPP_URL)
+                ),
+            )
+            logging.info(f"Mini App админки: {WEBAPP_URL}")
+        except Exception:
+            logging.exception("set_chat_menu_button failed")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
