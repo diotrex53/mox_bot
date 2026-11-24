@@ -1,4 +1,4 @@
-aiogram>=3.29,<4.0
+aiogram>=3.33,<4.0
 openai>=1.40,<4.0
 httpx>=0.27,<1.0
 ddgs>=9.0

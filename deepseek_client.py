@@ -98,7 +98,7 @@ class DeepSeekClient:
         base_url: str,
         model: str,
         http_client: httpx.AsyncClient,
-        timeout: float = 120.0,
+        timeout: float | httpx.Timeout = 120.0,
         label: str = "API",
     ) -> None:
         self.api_key = api_key

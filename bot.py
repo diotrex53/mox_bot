@@ -24,20 +24,46 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     BufferedInputFile,
+    BusinessConnection,
     CallbackQuery,
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultArticle,
+    InputChecklist,
+    InputChecklistTask,
     InputRichMessage,
     InputTextMessageContent,
+    LinkPreviewOptions,
     Message,
 )
 from openai import AsyncOpenAI
 
 from deepseek_client import ChatResult, DeepSeekClient
+from prompts import CLASSIC_FORMAT, RICH_FORMAT, SYSTEM_PROMPT_BASE
 from storage import DB_LIMIT_BYTES, MSK, storage
+
+# widgets.py — новый файл. Если его забыли загрузить, бот продолжит работать,
+# а виджеты просто будут отдавать текстовый фолбэк вместо падения на старте.
+WIDGETS_MODULE = True
+try:
+    from widgets import WidgetError, render_checklist, render_dashboard, render_widget
+    from widgets import text_version as widget_text_version
+except Exception:  # pragma: no cover
+    WIDGETS_MODULE = False
+    logging.exception("widgets.py не загружен: виджеты отключены")
+
+    class WidgetError(ValueError):
+        pass
+
+    def _widgets_missing(*_args, **_kwargs):
+        raise WidgetError("модуль widgets.py не загружен на сервер")
+
+    render_checklist = render_dashboard = render_widget = _widgets_missing
+
+    def widget_text_version(_kind, _spec):
+        return "Виджеты временно недоступны."
 
 # ============================================================
 # НАСТРОЙКИ
@@ -84,11 +110,6 @@ MODEL_REGISTRY: dict[str, dict] = {
         "provider": "deepseek",
         "model": DEEPSEEK_MODEL,
     },
-    "deepseek-pro": {
-        "label": "deepseek-v4-pro",
-        "provider": "deepseek",
-        "model": "deepseek-v4-pro-0813",
-    },
     "qwen4-max": {"label": "qwen4-max", "provider": "qwen", "model": "qwen4-max"},
     "qwen3.8-max": {"label": "qwen3.8-max", "provider": "qwen", "model": "qwen3.8-max"},
     "qwen3.8-flash": {
@@ -104,7 +125,7 @@ PROVIDER_NAMES = {"deepseek": "DeepSeek", "qwen": "Qwen"}
 PROVIDER_VISION_MODEL = {"deepseek": "deepseek-v4.1-flash", "qwen": "qwen4-max"}
 
 PREMIUM_HISTORY_CHARS_LIMIT = 300000
-PREMIUM_MAX_TOKENS = 16000
+PREMIUM_MAX_TOKENS = 32000
 PREMIUM_MAX_TOKENS_CAP = 32000
 DEEPSEEK_PHOTO_LIMIT = 10
 
@@ -116,10 +137,15 @@ HISTORY_LIMIT = 50
 HISTORY_STORE_CHARS_LIMIT = 300000
 HISTORY_CHARS_LIMIT = 14000
 MAX_REPLY_LENGTH = 4000
-MAX_RICH_REPLY_LENGTH = 30000
-CHAT_MAX_TOKENS = 1200
+# Telegram сворачивает сообщения длиннее ~8000 символов под «Показать ещё».
+# Держим куски заметно ниже этого порога, чтобы ответ читался прямо в чате.
+MAX_RICH_REPLY_LENGTH = 7000
+CHAT_MAX_TOKENS = 4000
 COOLDOWN_SECONDS = 2
 AI_TIMEOUT = 180.0
+# Для DeepSeek/Qwen: быстро падаем, если хост недоступен, и не держим
+# пользователя в тишине минутами при обрыве соединения.
+PREMIUM_TIMEOUT = httpx.Timeout(90.0, connect=12.0, write=30.0, pool=12.0)
 TYPING_INTERVAL = 4.0
 FALLBACK_COOLDOWN = 600
 PHOTO_SESSION_DELAY = 2.0
@@ -156,8 +182,32 @@ logging.getLogger("duckduckgo_search").setLevel(logging.WARNING)
 # КЛИЕНТЫ
 # ============================================================
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode="HTML",
+        # Ссылки не должны разворачиваться в предпросмотр нигде.
+        link_preview=LinkPreviewOptions(is_disabled=True),
+    ),
+)
 dp = Dispatcher()
+
+# Rich Message API появился в свежих aiogram. Если на сервере старая версия,
+# честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
+RICH_SUPPORTED = hasattr(bot, "send_rich_message") and hasattr(
+    bot, "send_rich_message_draft"
+)
+WIDGET_SUPPORTED = WIDGETS_MODULE and hasattr(bot, "send_widget")
+CHECKLIST_SUPPORTED = hasattr(bot, "send_checklist")
+if not RICH_SUPPORTED:
+    logging.warning(
+        "Rich messages недоступны: нужен aiogram>=3.33. "
+        "Обновите зависимости и перезапустите сервис."
+    )
+if not WIDGET_SUPPORTED:
+    logging.warning(
+        "HTML-виджеты недоступны: нужен aiogram>=3.33 и файл widgets.py."
+    )
 
 http_client = httpx.AsyncClient(timeout=AI_TIMEOUT, proxy=PROXY_URL or None)
 
@@ -174,7 +224,7 @@ deepseek_client = DeepSeekClient(
     base_url=DEEPSEEK_BASE_URL,
     model=DEEPSEEK_MODEL,
     http_client=http_client,
-    timeout=AI_TIMEOUT,
+    timeout=PREMIUM_TIMEOUT,
     label="DeepSeek",
 )
 
@@ -183,7 +233,7 @@ qwen_client = DeepSeekClient(
     base_url=QWEN_BASE_URL,
     model="qwen4-max",
     http_client=http_client,
-    timeout=AI_TIMEOUT,
+    timeout=PREMIUM_TIMEOUT,
     label="Qwen",
 )
 
@@ -220,6 +270,8 @@ _block_reply_last: dict[int, float] = {}
 _balance: dict[str, dict] = {}
 _balance_alerted: set[str] = set()
 _model_blocked: dict[str, str] = {}
+# Чек-листы Telegram можно слать только через business-подключение.
+_business_connection_id: str | None = None
 
 # Состояние админ-панели
 _admin_input: dict[int, dict] = {}
@@ -309,12 +361,16 @@ async def with_retry(coro_fn, *args, retries=3, base_wait=2.0, **kwargs):
             return await coro_fn(*args, **kwargs)
         except asyncio.TimeoutError as e:
             last_err = e
+            if attempt + 1 >= retries:
+                break
             wait = base_wait * (attempt + 1)
             logging.warning(f"Timeout, retry {attempt + 1}/{retries} in {wait}s")
             await asyncio.sleep(wait)
         except Exception as e:
             last_err = e
             if is_retryable_error(e):
+                if attempt + 1 >= retries:
+                    raise
                 wait = base_wait * (attempt + 1)
                 # Groq в 429 обычно сам говорит, сколько ждать. Игнорировать
                 # это нельзя: 2-4 секунды недостаточно, и все ретраи сгорят.
@@ -568,6 +624,66 @@ def model_label(model_key: str) -> str:
     return info["label"] if info else str(model_key)
 
 
+# Один и тот же апстрим приходит под разными id: deepseek-v4.1-flash и
+# deepseek-v4.1-flash-1017, openai/gpt-oss-120b и gpt-oss-120b.
+MODEL_DISPLAY_ALIASES = {
+    "deepseek-v4.1-flash-1017": "deepseek-v4.1-flash",
+    "deepseek-v4.1-flash-1017-abliterated": "deepseek-v4.1-flash (abliterated)",
+    "deepseek-v4-flash-0731": "deepseek-v4-flash",
+    "deepseek-v4-flash-0731-abliterated": "deepseek-v4-flash (abliterated)",
+}
+
+
+def canonical_model_name(name: str) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    if raw in MODEL_DISPLAY_ALIASES:
+        return MODEL_DISPLAY_ALIASES[raw]
+    if "/" in raw:
+        raw = raw.rsplit("/", 1)[-1]
+    return MODEL_DISPLAY_ALIASES.get(raw, raw)
+
+
+def merge_stats_models(rows, limit: int = 8) -> list[dict]:
+    """Склеивает строки статистики по каноническому имени модели."""
+    merged: dict[str, dict] = {}
+    for row in rows or []:
+        name = canonical_model_name(row.get("model")) or "?"
+        item = merged.setdefault(
+            name,
+            {
+                "model": name,
+                "provider": row.get("provider") or "",
+                "calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "total_tokens": 0,
+                "credit": 0.0,
+            },
+        )
+        provider = row.get("provider") or ""
+        if provider and provider not in item["provider"].split("/"):
+            item["provider"] = (item["provider"] + "/" + provider).strip("/")
+        item["calls"] += int(row.get("calls") or 0)
+        for token_field in (
+            "prompt_tokens",
+            "completion_tokens",
+            "reasoning_tokens",
+            "cached_tokens",
+            "total_tokens",
+        ):
+            item[token_field] += int(row.get(token_field) or 0)
+        item["credit"] += float(row.get("credit") or 0)
+    return sorted(
+        merged.values(),
+        key=lambda r: (r["total_tokens"], r["calls"]),
+        reverse=True,
+    )[:limit]
+
+
 def is_blacklisted(user_id: int | None) -> bool:
     return user_id is not None and int(user_id) in _dm_blacklist
 
@@ -705,6 +821,16 @@ async def safe_typing(chat_id: int) -> None:
         await bot.send_chat_action(chat_id, ChatAction.TYPING)
     except Exception:
         pass
+
+
+async def keep_typing(chat_id: int) -> None:
+    """Держит «печатает…», пока модель отвечает, чтобы бот не выглядел зависшим."""
+    try:
+        while True:
+            await safe_typing(chat_id)
+            await asyncio.sleep(TYPING_INTERVAL)
+    except asyncio.CancelledError:
+        raise
 
 
 # ============================================================
@@ -969,44 +1095,7 @@ def media_placeholder(message: Message) -> str:
 # СИСТЕМНЫЙ ПРОМПТ
 # ============================================================
 
-SYSTEM_PROMPT_BASE = """Ты — Мудрый Мох, дружелюбный ассистент в Telegram. Отвечай по-русски, по делу, с лёгким юмором. Если пользователь просит написать текст на другом языке (письмо, код, задание) — напиши на нём.
-
-КОНТЕКСТ ЧАТА:
-- Ты видишь историю разговора. В группе каждое сообщение пользователя выглядит как «Имя (id): текст». Твои прошлые ответы — обычные сообщения ассистента. Не путай авторов и отвечай тому, кто обратился последним.
-- Запись вида «[в ответ на сообщение Имя (id): «...»]» — это сообщение, на которое ответил пользователь. Учитывай его смысл, но НЕ цитируй и не пересказывай в ответе.
-- Сообщения с пометкой «[фото]» или «[голосовое]» без описания означают, что в чате было медиа, но его содержимое неизвестно.
-- Пометки «(расшифровка голосового, возможны ошибки)» и описания фото сделаны другими моделями — доверяй им, но допускай неточности.
-
-ИНСТРУМЕНТЫ:
-- web_search — вызывай, когда для ответа нужны свежие данные из интернета: новости, погода, курсы, цены, версии, события, актуальные факты о людях и компаниях. НЕ вызывай для общих знаний, математики, объяснений, написания текста и кода.
-- generate_image — вызывай, когда просят нарисовать или сгенерировать визуальный объект. Код, текст, таблица, схема, график, план — это НЕ картинки, для них инструмент не используй. Если просят и картинку, и объяснение — сначала вызови generate_image, затем ответь на остальное.
-- В generate_image передай prompt_en (подробный промпт на английском) и prompt_ru (тот же промпт на русском для подписи).
-- После вызова generate_image картинка уже отправлена пользователю. Не описывай её повторно. Если добавить нечего — верни ровно OK.
-
-ПРАВИЛА:
-- Не здоровайся в каждом сообщении: приветствие уместно только в начале диалога или если пользователь сам поздоровался.
-- После web_search опирайся на найденные данные, а не на свои знания. Если данных нет — честно скажи об этом. В конце ответа добавь строку «Источники:» с 1–3 самыми полезными ссылками из результатов.
-- Не выводи служебные пометки, названия инструментов и технические маркеры."""
-
-CLASSIC_FORMAT = """ФОРМАТИРОВАНИЕ — СТРОГО:
-- Разрешены только теги Telegram: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">, <blockquote>, <tg-spoiler>.
-- Запрещены: <ul>, <ol>, <li>, <p>, <br>, <div>, <span>, <h1>-<h6>, <table>, <img>.
-- Списки — символами •, — или «1.», «2.» без тегов. Переносы строк — реальные.
-- Никакого Markdown (** и _). Максимум 1–2 <b> на ответ.
-- Символы <, >, & в обычном тексте экранируй как &lt;, &gt;, &amp;."""
-
-RICH_FORMAT = """ФОРМАТИРОВАНИЕ — Telegram Rich Message (HTML), как статья:
-- Структурируй ответ: <h1>, <h2>, <h3>, <p>, <ul><li>, <ol><li>, <blockquote>.
-- Таблицы: <table><tr><th>…</th><th>…</th></tr><tr><td>…</td></tr></table>.
-- Код: <pre><code>…</code></pre>. Акценты: <b>, <i>, <s>, <a href="...">, <mark>.
-- Раскрывающийся блок: <details><summary>Заголовок</summary><p>текст</p></details>.
-- Между блоками оставляй пустую строку. Не используй <br>, <div>, <span>, <img>.
-- Заголовки и таблицы уместны для ответов от 3–4 абзацев. Короткий ответ — просто <p> без заголовка.
-- Списки — когда перечисляешь 3+ пункта; не превращай каждый ответ в список.
-- Символы <, >, & в обычном тексте экранируй как &lt;, &gt;, &amp;. Никакого Markdown."""
-
-# Совместимость со старым именем.
-SYSTEM_PROMPT = SYSTEM_PROMPT_BASE
+# Промпты вынесены в prompts.py — их можно редактировать отдельно.
 
 
 def system_prompt(rich: bool = False) -> str:
@@ -1052,6 +1141,62 @@ TOOLS = [
                     "prompt_ru": {"type": "string", "description": "Тот же промпт на русском"},
                 },
                 "required": ["prompt_en", "prompt_ru"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "render_widget",
+            "description": (
+                "Показать интерактивную карточку-виджет в личном чате. Используй, когда "
+                "просят график, диаграмму, сравнительную таблицу, тест/квиз или трекер "
+                "прогресса. Не используй для обычного текста и простых ответов."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["chart", "table", "quiz", "progress"],
+                        "description": "Тип виджета",
+                    },
+                    "title": {"type": "string", "description": "Заголовок карточки"},
+                    "spec": {
+                        "type": "object",
+                        "description": (
+                            "chart: {labels:[...], series:[{name, values:[...]}], "
+                            "chart_type:'line'|'bar', unit}. "
+                            "table: {columns:[...], rows:[[...]]}. "
+                            "quiz: {question, options:[...], correct: индекс с нуля, "
+                            "explanation}. progress: {items:[{label, value, max}]}"
+                        ),
+                    },
+                },
+                "required": ["kind", "spec"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_checklist",
+            "description": (
+                "Отправить настоящий чек-лист Telegram с галочками. Используй для планов, "
+                "списков покупок, подготовки к экзамену, чек-листа деплоя и любых задач "
+                "из 3+ пунктов, которые пользователь будет отмечать."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Название чек-листа"},
+                    "tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Пункты чек-листа, максимум 30",
+                    },
+                },
+                "required": ["title", "tasks"],
             },
         },
     },
@@ -1255,6 +1400,7 @@ async def call_model(
     max_tokens: int | None = None,
     model: str | None = None,
     on_delta=None,
+    reset_cb=None,
 ) -> ChatResult:
     started = time.perf_counter()
     status = "ok"
@@ -1286,18 +1432,35 @@ async def call_model(
         else:
             if client is None or not client.configured:
                 raise RuntimeError(f"{PROVIDER_NAMES.get(provider, provider)} не настроен")
-            result = await with_retry(
-                lambda: client.chat(
+
+            def ask(stream: bool):
+                return client.chat(
                     messages,
                     model=model_name,
                     tools=tools,
                     tool_choice=tool_choice,
                     max_tokens=max_tokens or default_max,
                     effort=effort,
-                    on_delta=on_delta,
-                ),
-                retries=1 if on_delta is not None else 2,
-            )
+                    on_delta=on_delta if stream else None,
+                )
+
+            try:
+                result = await with_retry(
+                    lambda: ask(True),
+                    retries=1 if on_delta is not None else 2,
+                )
+            except Exception as e:
+                # Стрим мог оборваться на полуслове. Повторяем без стрима,
+                # предварительно очистив недописанный черновик.
+                if on_delta is None:
+                    raise
+                logging.warning(
+                    f"{PROVIDER_NAMES.get(provider, provider)}: стрим упал ({e}), "
+                    "повторяю без стриминга"
+                )
+                if reset_cb is not None:
+                    reset_cb()
+                result = await with_retry(lambda: ask(False), retries=1)
         return result
     except Exception as e:
         status = "error"
@@ -1961,9 +2124,86 @@ async def send_text(turn: Turn, text: str) -> None:
 
 RICH_ALLOWED_TAGS = (
     "h1|h2|h3|h4|h5|h6|p|ul|ol|li|blockquote|pre|code|b|i|u|s|a|mark|"
-    "details|summary|table|thead|tbody|tr|td|th|tg-spoiler"
+    "details|summary|table|thead|tbody|tr|td|th|tg-spoiler|"
+    "tg-math-block|tg-math"
 )
 RICH_DROP_TAGS = ("script", "style", "iframe", "svg", "object", "embed", "form", "video", "audio")
+
+# Участки, внутри которых нельзя трогать LaTeX.
+_MATH_PROTECTED_RE = re.compile(
+    r"<tg-math-block\b[^>]*>.*?</tg-math-block>"
+    r"|<tg-math\b[^>]*>.*?</tg-math>"
+    r"|<pre\b[^>]*>.*?</pre>"
+    r"|<code\b[^>]*>.*?</code>"
+    r"|\$\$.*?\$\$"
+    r"|\$[^$\n]{1,200}\$"
+    r"|\\\(.*?\\\)"
+    r"|\\\[.*?\\\]",
+    re.IGNORECASE | re.DOTALL,
+)
+_FRAC_RE = re.compile(r"\\(?:d)?frac\s*")
+
+
+def _balanced_group(text: str, start: int) -> int:
+    """Возвращает индекс сразу после парной закрывающей скобки или -1."""
+    if start >= len(text) or text[start] != "{":
+        return -1
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def _wrap_fracs(segment: str) -> str:
+    if "frac" not in segment:
+        return segment
+    out: list[str] = []
+    i = 0
+    while True:
+        match = _FRAC_RE.search(segment, i)
+        if not match:
+            out.append(segment[i:])
+            break
+        out.append(segment[i : match.start()])
+        pos = match.end()
+        while pos < len(segment) and segment[pos].isspace():
+            pos += 1
+        first_end = _balanced_group(segment, pos)
+        if first_end == -1:
+            out.append(segment[match.start() : match.end()])
+            i = match.end()
+            continue
+        pos = first_end
+        while pos < len(segment) and segment[pos].isspace():
+            pos += 1
+        second_end = _balanced_group(segment, pos)
+        if second_end == -1:
+            out.append(segment[match.start() : first_end])
+            i = first_end
+            continue
+        out.append(f"<tg-math>{segment[match.start():second_end]}</tg-math>")
+        i = second_end
+    return "".join(out)
+
+
+def autowrap_frac(text: str) -> str:
+    """Оборачивает голый \\frac{}{} в <tg-math>, чтобы дробь рисовалась чертой."""
+    if not text or "frac" not in text:
+        return text
+    parts: list[str] = []
+    last = 0
+    for match in _MATH_PROTECTED_RE.finditer(text):
+        parts.append(_wrap_fracs(text[last : match.start()]))
+        parts.append(match.group(0))
+        last = match.end()
+    parts.append(_wrap_fracs(text[last:]))
+    return "".join(parts)
 
 
 def sanitize_rich(text: str) -> str:
@@ -1977,6 +2217,22 @@ def sanitize_rich(text: str) -> str:
         )
         text = re.sub(rf"</?{tag}\b[^>]*>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<img\b[^>]*>", "", text, flags=re.IGNORECASE)
+    text = autowrap_frac(text)
+
+    # LaTeX внутри <tg-math> трогать нельзя: экранирование сломает формулу.
+    math_elements: dict[str, str] = {}
+
+    def _hide_math(match):
+        key = f"\x00MATH{len(math_elements)}\x00"
+        math_elements[key] = match.group(0)
+        return key
+
+    text = re.sub(
+        r"<tg-math-block\b[^>]*>.*?</tg-math-block>|<tg-math\b[^>]*>.*?</tg-math>",
+        _hide_math,
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
     allowed_pattern = re.compile(
         rf"</?(?:{RICH_ALLOWED_TAGS})(?:\s+[^>]*)?>", re.IGNORECASE
@@ -1995,27 +2251,129 @@ def sanitize_rich(text: str) -> str:
     text = text.replace("<", "&lt;").replace(">", "&gt;")
     for key, tag in placeholders.items():
         text = text.replace(key, tag)
+    for key, tag in math_elements.items():
+        text = text.replace(key, tag)
     return text
+
+
+TEX_SIMPLE = (
+    (r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)"),
+    (r"\\dfrac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)"),
+    (r"\\sqrt\s*\{([^{}]*)\}", r"√(\1)"),
+    (r"\\cdot", "·"),
+    (r"\\times", "×"),
+    (r"\\div", "÷"),
+    (r"\\pm", "±"),
+    (r"\\le", "≤"),
+    (r"\\ge", "≥"),
+    (r"\\neq", "≠"),
+    (r"\\approx", "≈"),
+    (r"\\infty", "∞"),
+    (r"\\alpha", "α"),
+    (r"\\beta", "β"),
+    (r"\\gamma", "γ"),
+    (r"\\pi", "π"),
+)
+
+
+def tex_to_plain(text: str) -> str:
+    """Упрощает LaTeX для режимов без поддержки формул."""
+    if not text:
+        return text
+    for pattern, repl in TEX_SIMPLE:
+        text = re.sub(pattern, repl, text)
+    text = text.replace("{", "").replace("}", "")
+    return text
+
+
+RICH_BLOCK_RE = re.compile(
+    r"(<details\b[^>]*>.*?</details>|<h[1-6]\b[^>]*>.*?</h[1-6]>|"
+    r"<p\b[^>]*>.*?</p>|<ul\b[^>]*>.*?</ul>|<ol\b[^>]*>.*?</ol>|"
+    r"<blockquote\b[^>]*>.*?</blockquote>|<pre\b[^>]*>.*?</pre>|"
+    r"<table\b[^>]*>.*?</table>|<tg-math-block\b[^>]*>.*?</tg-math-block>)",
+    re.IGNORECASE | re.DOTALL,
+)
+RICH_TAG_RE = re.compile(
+    rf"<(/?)({RICH_ALLOWED_TAGS})(?:\s[^>]*)?>", re.IGNORECASE
+)
+
+
+def _open_rich_tags(text: str) -> list[tuple[str, str]]:
+    stack: list[tuple[str, str]] = []
+    for match in RICH_TAG_RE.finditer(text):
+        closing, tag = match.group(1), match.group(2).lower()
+        if closing:
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index][0] == tag:
+                    del stack[index:]
+                    break
+        else:
+            stack.append((tag, match.group(0)))
+    return stack
+
+
+def _hard_split_rich(text: str, limit: int) -> list[str]:
+    """Режет слишком длинный блок, закрывая и заново открывая теги."""
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = max(
+            remaining.rfind("\n\n", 0, limit),
+            remaining.rfind("\n", 0, limit),
+            remaining.rfind(". ", 0, limit),
+        )
+        if cut < limit * 0.4:
+            cut = limit
+        # Не разрезаем HTML-тег посередине.
+        if remaining.rfind("<", 0, cut) > remaining.rfind(">", 0, cut):
+            cut = remaining.rfind("<", 0, cut)
+            if cut <= 0:
+                cut = remaining.find(">", limit) + 1 or limit
+        chunk = remaining[:cut].rstrip()
+        opened = _open_rich_tags(chunk)
+        if opened:
+            chunk += "".join(f"</{tag}>" for tag, _ in reversed(opened))
+        chunks.append(chunk)
+        reopen = "".join(raw for _, raw in opened)
+        remaining = (reopen + remaining[cut:]).strip()
+    if remaining.strip():
+        chunks.append(remaining.strip())
+    return chunks
 
 
 def split_rich(text: str, limit: int = MAX_RICH_REPLY_LENGTH) -> list[str]:
     if len(text) <= limit:
         return [text] if text.strip() else []
+    # Сначала режем по целым блокам (<p>, <h1>, <ul>, <details>...),
+    # чтобы не разрывать теги. Внутри слишком длинного блока — по предложениям.
+    blocks: list[str] = []
+    for part in RICH_BLOCK_RE.split(text):
+        if not part or not part.strip():
+            continue
+        stripped = part.strip()
+        if RICH_BLOCK_RE.fullmatch(stripped):
+            blocks.append(stripped)
+        else:
+            blocks.extend(p.strip() for p in re.split(r"\n{2,}", part) if p.strip())
     chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        cut = remaining.rfind("\n\n", 0, limit)
-        if cut < limit * 0.4:
-            cut = remaining.rfind("\n", 0, limit)
-        if cut < limit * 0.4:
-            cut = remaining.rfind(". ", 0, limit)
-        if cut < limit * 0.4:
-            cut = limit
-        chunks.append(remaining[:cut].strip())
-        remaining = remaining[cut:].strip()
-    if remaining:
-        chunks.append(remaining)
-    return [c for c in chunks if c]
+    current = ""
+    for block in blocks:
+        if len(block) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_hard_split_rich(block, limit))
+            continue
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > limit:
+            if current:
+                chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return [chunk for chunk in chunks if chunk.strip()]
 
 
 def plain_from_rich(text: str) -> str:
@@ -2027,7 +2385,33 @@ def plain_from_rich(text: str) -> str:
         r"</(?:p|div|h[1-6]|li|tr|blockquote)>", "\n", text, flags=re.IGNORECASE
     )
     text = re.sub(r"<[^>]+>", "", text)
-    return html.unescape(text).strip()
+    return tex_to_plain(html.unescape(text).strip())
+
+
+def classic_from_rich(text: str) -> str:
+    """Конвертирует Rich HTML в обычный Telegram HTML: заголовки → жирный."""
+    text = re.sub(
+        r"<details\b[^>]*>.*?</details>", "", text, flags=re.IGNORECASE | re.DOTALL
+    )
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"<h([1-6])\b[^>]*>(.*?)</h\1>",
+        r"\n<b>\2</b>\n",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r"<p\b[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<li\b[^>]*>", "• ", text, flags=re.IGNORECASE)
+    text = re.sub(r"</li>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"</?(?:ul|ol|div|span|table|thead|tbody|tr|td|th|mark|tg-math|tg-math-block)\b[^>]*>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return tex_to_plain(text).strip()
 
 
 class RichStreamer:
@@ -2050,17 +2434,19 @@ class RichStreamer:
         raw = "".join(self.reasoning).strip()
         if not raw:
             return ""
-        body = sanitize_rich(raw[:20000])
+        body = sanitize_rich(raw[:6000])
         return f"<details><summary>🧠 Размышления</summary>\n<p>{body}</p>\n</details>"
 
     def build_html(self) -> str:
+        # Сначала ответ, потом мысли: даже если сообщение свернётся,
+        # пользователь увидит начало ответа, а не один блок размышлений.
         parts: list[str] = []
-        thoughts = self._thoughts_html()
-        if thoughts:
-            parts.append(thoughts)
         body = sanitize_rich("".join(self.content))
         if body:
             parts.append(body)
+        thoughts = self._thoughts_html()
+        if thoughts:
+            parts.append(thoughts)
         return "\n\n".join(parts)
 
     async def on_delta(self, kind: str, piece: str) -> None:
@@ -2093,6 +2479,24 @@ class RichStreamer:
             logging.info(f"rich draft disabled: {e}")
             self.draft_ok = False
 
+    async def _deliver(self, html_text: str) -> None:
+        if not html_text.strip():
+            return
+        try:
+            await bot.send_rich_message(
+                chat_id=self.turn.chat_id,
+                rich_message=InputRichMessage(html=html_text),
+            )
+        except Exception as e:
+            logging.warning(f"send_rich_message failed: {e}; fallback to text")
+            classic = classic_from_rich(html_text)
+            if classic:
+                await send_text(self.turn, classic)
+                return
+            plain = plain_from_rich(html_text)
+            if plain:
+                await send_text(self.turn, plain)
+
     async def finish(self, answer: str = "") -> None:
         if self.finished:
             return
@@ -2103,24 +2507,13 @@ class RichStreamer:
         if not raw:
             return
         chunks = split_rich(raw)
-        for index, chunk in enumerate(chunks):
-            html_text = sanitize_rich(chunk)
-            if index == 0:
-                thoughts = self._thoughts_html()
-                if thoughts:
-                    html_text = thoughts + "\n\n" + html_text
-            if not html_text.strip():
-                continue
-            try:
-                await bot.send_rich_message(
-                    chat_id=self.turn.chat_id,
-                    rich_message=InputRichMessage(html=html_text),
-                )
-            except Exception as e:
-                logging.warning(f"send_rich_message failed: {e}; fallback to text")
-                plain = plain_from_rich(html_text)
-                if plain:
-                    await send_text(self.turn, plain)
+        for chunk in chunks:
+            await self._deliver(sanitize_rich(chunk))
+        # Размышления — отдельным сообщением после ответа, чтобы не
+        # прятать сам ответ под «Показать ещё».
+        thoughts = self._thoughts_html()
+        if thoughts:
+            await self._deliver(thoughts)
 
 
 async def send_photo(turn: Turn, data: bytes, caption: str) -> bool:
@@ -2287,6 +2680,66 @@ def is_trivial(text: str) -> bool:
     return cleaned in {"", "ok", "ок", "готово", "done"}
 
 
+async def send_widget_card(turn: Turn, html_text: str, caption: str = "") -> bool:
+    """Отправляет HTML-виджет (только ЛС: ограничение Bot API)."""
+    if not WIDGET_SUPPORTED or not turn.is_private:
+        return False
+    kwargs = {"chat_id": turn.chat_id, "html": html_text}
+    if caption:
+        kwargs["caption"] = caption
+    try:
+        await bot.send_widget(**kwargs)
+        return True
+    except Exception as e:
+        logging.warning(f"send_widget failed: {e}")
+        return False
+
+
+async def send_checklist_card(turn: Turn, title: str, tasks: list[str]) -> bool:
+    """Чек-лист: нативный (через business), иначе интерактивный виджет, иначе текст.
+
+    Bot API разрешает sendChecklist только для подключённого business-аккаунта,
+    поэтому в обычной личке рисуем интерактивный HTML-чек-лист: галочки
+    переключаются на клиенте.
+    """
+    title = title[:120]
+    clean = [str(task).strip()[:100] for task in tasks if str(task or "").strip()][:30]
+    if not clean:
+        return False
+
+    if CHECKLIST_SUPPORTED and _business_connection_id:
+        try:
+            checklist = InputChecklist(
+                title=title,
+                tasks=[
+                    InputChecklistTask(id=index + 1, text=text)
+                    for index, text in enumerate(clean)
+                ],
+                others_can_add_tasks=False,
+                others_can_mark_tasks_as_done=True,
+            )
+            await bot.send_checklist(
+                business_connection_id=_business_connection_id,
+                chat_id=turn.chat_id,
+                checklist=checklist,
+            )
+            return True
+        except Exception as e:
+            logging.warning(f"send_checklist failed: {e}; using widget")
+
+    if WIDGET_SUPPORTED and turn.is_private:
+        try:
+            html_text, caption = render_checklist(title, clean)
+            if await send_widget_card(turn, html_text, caption):
+                return True
+        except Exception as e:
+            logging.warning(f"checklist widget failed: {e}")
+
+    lines = [f"<b>{esc(title)}</b>"] + [f"☐ {esc(text)}" for text in clean]
+    await send_text(turn, "\n".join(lines))
+    return False
+
+
 async def execute_tool(turn: Turn, name: str, args: dict) -> str:
     started = time.perf_counter()
     status = "ok"
@@ -2327,6 +2780,43 @@ async def execute_tool(turn: Turn, name: str, args: dict) -> str:
                 turn.image_error = str(e)
                 logging.exception("Image generation error")
                 return f"Ошибка генерации изображения: {e}"
+
+        if name == "render_widget":
+            kind = (args.get("kind") or "").strip().lower()
+            spec = args.get("spec") if isinstance(args.get("spec"), dict) else {}
+            title = (args.get("title") or "").strip()
+            if title and "title" not in spec:
+                spec = dict(spec, title=title)
+            try:
+                html_text, caption = render_widget(kind, spec)
+            except WidgetError as e:
+                return f"Виджет не отправлен: {e}"
+            except Exception as e:
+                logging.exception("Widget render error")
+                return f"Ошибка виджета: {e}"
+
+            await turn.status.show("🧩 Собираю виджет…")
+            logging.info(f"[{turn.chat_id}] TOOL render_widget: {kind}")
+            if not turn.is_private:
+                await send_text(turn, widget_text_version(kind, spec))
+                return "В группах виджеты недоступны. Отправил текстовую версию."
+            if await send_widget_card(turn, html_text, caption):
+                return "Виджет отправлен пользователю."
+            await send_text(turn, widget_text_version(kind, spec))
+            return "Клиент не поддержал виджет. Отправил текстовую версию."
+
+        if name == "make_checklist":
+            title = (args.get("title") or "Чек-лист").strip()[:120]
+            raw_tasks = args.get("tasks") or []
+            tasks = [str(task).strip() for task in raw_tasks if str(task).strip()][:30]
+            if not tasks:
+                return "Ошибка: пустой список пунктов."
+            await turn.status.show("📋 Собираю чек-лист…")
+            logging.info(f"[{turn.chat_id}] TOOL make_checklist: {len(tasks)} пунктов")
+            ok = await send_checklist_card(turn, title, tasks)
+            if ok:
+                return "Чек-лист отправлен пользователю."
+            return "Клиент не поддержал чек-лист. Отправил текстом."
 
         return "Неизвестный инструмент."
     except Exception as e:
@@ -2374,6 +2864,7 @@ async def run_tools(
                 max_tokens=max_tokens,
                 model=model,
                 on_delta=on_delta,
+                reset_cb=reset_cb,
             )
         except Exception:
             if choice != "auto":
@@ -2457,12 +2948,16 @@ async def run_ai(turn: Turn) -> None:
     user = turn.message.from_user
     user_id = user.id if user else None
     settings_active = turn.is_private and user_id is not None
-    rich = bool(turn.rich_allowed and settings_active and user_rich(user_id))
+    rich = bool(
+        RICH_SUPPORTED and turn.rich_allowed and settings_active and user_rich(user_id)
+    )
     streamer = RichStreamer(turn) if rich else None
     status = "ok"
     error_text = ""
+    typing_task: asyncio.Task | None = None
     try:
         await safe_typing(turn.chat_id)
+        typing_task = asyncio.create_task(keep_typing(turn.chat_id))
         messages = [{"role": "system", "content": system_prompt(rich)}]
         messages += [dict(m) for m in history_for_model(turn.chat_id, model_key)]
 
@@ -2489,18 +2984,47 @@ async def run_ai(turn: Turn) -> None:
         async def executor(name, args):
             return await execute_tool(turn, name, args)
 
-        answer = await run_tools(
-            messages,
-            tools,
-            executor,
-            forced,
-            provider=provider,
-            track=turn.track,
-            effort=effort,
-            model=model_id,
-            on_delta=streamer.on_delta if streamer else None,
-            reset_cb=streamer.reset if streamer else None,
-        )
+        answer = ""
+        fallback_notice = ""
+        try:
+            answer = await run_tools(
+                messages,
+                tools,
+                executor,
+                forced,
+                provider=provider,
+                track=turn.track,
+                effort=effort,
+                model=model_id,
+                on_delta=streamer.on_delta if streamer else None,
+                reset_cb=streamer.reset if streamer else None,
+            )
+        except Exception as e:
+            if provider not in ("deepseek", "qwen"):
+                raise
+            # Провайдер недоступен (обрыв, таймаут, 5xx). Не молчим:
+            # отвечаем через Groq, оставляя выбранную модель в настройках.
+            logging.warning(
+                f"{provider}: недоступен ({e}), отвечаю через Groq"
+            )
+            if streamer is not None:
+                streamer.reset()
+            fallback_notice = (
+                f"⚠️ {PROVIDER_NAMES.get(provider, provider)} временно недоступен — "
+                "ответила Groq. Модель в настройках не менялась."
+            )
+            answer = await run_tools(
+                messages,
+                tools,
+                executor,
+                forced,
+                provider="groq",
+                track=turn.track,
+                effort="off",
+                model=CHAT_MODEL,
+                on_delta=streamer.on_delta if streamer else None,
+                reset_cb=streamer.reset if streamer else None,
+            )
 
         if turn.explicit_draw and not turn.image_sent and not turn.image_error:
             await fallback_draw(turn)
@@ -2533,6 +3057,9 @@ async def run_ai(turn: Turn) -> None:
                 await send_text(turn, fallback_text)
             await add_to_history(turn.chat_id, "assistant", fallback_text)
 
+        if fallback_notice:
+            await send_text(turn, fallback_notice)
+
         _stats[turn.chat_id] = _stats.get(turn.chat_id, 0) + 1
         logging.info(
             f"[{turn.chat_id}] AI готов | model={model_key} | rich={rich} | "
@@ -2550,6 +3077,12 @@ async def run_ai(turn: Turn) -> None:
         else:
             await send_text(turn, f"⚠️ Ошибка: <code>{esc(friendly_ai_error(e))}</code>")
     finally:
+        if typing_task is not None:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
         await finish_track(
             turn.track,
             status=status,
@@ -2579,6 +3112,18 @@ async def reply_any(message: Message, text: str) -> None:
             await message.reply(text)
     except Exception as e:
         logging.error(f"reply_any error: {e}")
+
+
+@dp.business_connection()
+async def on_business_connection(connection: BusinessConnection):
+    """Запоминаем business-подключение: оно нужно для нативных чек-листов."""
+    global _business_connection_id
+    if connection.is_enabled:
+        _business_connection_id = connection.id
+        logging.info(f"Business connection enabled: {connection.id}")
+    elif _business_connection_id == connection.id:
+        _business_connection_id = None
+        logging.info(f"Business connection disabled: {connection.id}")
 
 
 @dp.message(CommandStart())
@@ -2615,6 +3160,8 @@ async def cmd_help(message: Message):
         "• Отвечаю на вопросы и помню контекст\n"
         "• Понимаю фото и голосовые\n"
         "• Рисую: <code>нарисуй кота</code>\n"
+        "• Строю графики и таблицы: <code>построй график</code>\n"
+        "• Делаю тесты и чек-листы: <code>составь чек-лист деплоя</code>\n"
         "• Ищу в интернете, когда нужно\n"
         "• Отвечаю в inline-режиме\n\n"
         "<b>Команды:</b>\n"
@@ -2832,8 +3379,11 @@ async def models_panel_view(user_id: int, tab: str = "models") -> tuple[str, Inl
     blocked_notes = []
     if int(user_id) == OWNER_ID:
         for key, reason in _model_blocked.items():
+            info = MODEL_REGISTRY.get(key)
+            if not info:
+                continue
             blocked_notes.append(
-                f"⚠️ {esc(MODEL_REGISTRY[key]['label'])}: {esc(reason)}"
+                f"⚠️ {esc(info['label'])}: {esc(reason)}"
             )
         for key, info in MODEL_REGISTRY.items():
             provider = info["provider"]
@@ -3235,21 +3785,24 @@ def admin_main_kb() -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats:t"),
-                InlineKeyboardButton(text="🧠 Модель", callback_data="adm:model"),
+                InlineKeyboardButton(text="🖥 Дашборд", callback_data="adm:dash"),
             ],
             [
+                InlineKeyboardButton(text="🧠 Модель", callback_data="adm:model"),
                 InlineKeyboardButton(text="👥 Группы", callback_data="adm:groups:0"),
+            ],
+            [
                 InlineKeyboardButton(text="🚫 ЛС", callback_data="adm:bl:0"),
+                InlineKeyboardButton(text="📝 Запросы", callback_data="adm:req:0"),
             ],
             [
                 InlineKeyboardButton(text="🔑 DeepSeek", callback_data="adm:acc:deepseek:0"),
                 InlineKeyboardButton(text="🐳 Qwen", callback_data="adm:acc:qwen:0"),
             ],
             [
-                InlineKeyboardButton(text="📝 Запросы", callback_data="adm:req:0"),
                 InlineKeyboardButton(text="💳 Балансы", callback_data="adm:bal"),
+                InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set"),
             ],
-            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set")],
         ]
     )
 
@@ -3261,7 +3814,7 @@ def stats_text(stats: dict, period: str, flt: dict) -> str:
         f"вызовов моделей: <b>{fmt_int(stats['calls'])}</b>"
     )
     lines.append("<b>B.</b> Токены по моделям:")
-    models = stats.get("models") or []
+    models = merge_stats_models(stats.get("models"), limit=8)
     if not models:
         lines.append("• пока нет данных")
     for m in models[:8]:
@@ -3590,11 +4143,10 @@ def filter_view(flt: dict) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text=mark("deepseek", flt.get("model"), "deepseek-v4.1-flash"), callback_data="adm:fmodel:deepseek"),
         ],
         [
-            InlineKeyboardButton(text=mark("deepseek-pro", flt.get("model"), "deepseek-v4-pro"), callback_data="adm:fmodel:deepseek-pro"),
             InlineKeyboardButton(text=mark("qwen4-max", flt.get("model"), "qwen4-max"), callback_data="adm:fmodel:qwen4-max"),
+            InlineKeyboardButton(text=mark("qwen3.8-max", flt.get("model"), "qwen3.8-max"), callback_data="adm:fmodel:qwen3.8-max"),
         ],
         [
-            InlineKeyboardButton(text=mark("qwen3.8-max", flt.get("model"), "qwen3.8-max"), callback_data="adm:fmodel:qwen3.8-max"),
             InlineKeyboardButton(text=mark("qwen3.8-flash", flt.get("model"), "qwen3.8-flash"), callback_data="adm:fmodel:qwen3.8-flash"),
         ],
         [
@@ -3961,6 +4513,25 @@ async def on_admin_callback(callback: CallbackQuery):
             await edit_admin(callback, text, kb)
             await callback.answer()
             return
+        if action == "dash":
+            end = datetime.now(timezone.utc)
+            start = end - timedelta(hours=24)
+            data = await storage.stats(start, end)
+            data = dict(data)
+            data["models"] = merge_stats_models(data.get("models"), limit=6)
+            try:
+                html_text, caption = render_dashboard(data, "24 часа")
+                await bot.send_widget(
+                    chat_id=OWNER_ID, html=html_text, caption=caption
+                )
+                await callback.answer("Дашборд отправлен.")
+            except Exception as e:
+                logging.warning(f"admin dashboard failed: {e}")
+                await callback.answer(
+                    plain_text(f"Не удалось собрать дашборд: {e}")[:180],
+                    show_alert=True,
+                )
+            return
         if action == "model":
             text, kb = await admin_section("model")
             await edit_admin(callback, text, kb)
@@ -4245,7 +4816,7 @@ async def send_daily_summary() -> None:
         f"Вызовов моделей: <b>{fmt_int(data['calls'])}</b>",
         f"Ошибок: <b>{fmt_int(data['request_errors'] + data['call_errors'])}</b>",
     ]
-    for m in (data.get("models") or [])[:6]:
+    for m in merge_stats_models(data.get("models"), limit=6):
         lines.append(
             f"• <code>{esc(m['model'])}</code>: {fmt_int(m['total_tokens'])} ток."
         )
@@ -4410,7 +4981,8 @@ async def on_inline(query: InlineQuery):
                     title="Напиши запрос после @M0XAIBOT",
                     description="Например: @M0XAIBOT расскажи про Python",
                     input_message_content=InputTextMessageContent(
-                        message_text="Пример: @M0XAIBOT расскажи про Python"
+                        message_text="Пример: @M0XAIBOT расскажи про Python",
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
                     ),
                 )
             ],
@@ -4462,7 +5034,8 @@ async def on_inline(query: InlineQuery):
                     title=f"Мох: {prompt[:55]}",
                     description=plain_answer[:120].replace("\n", " "),
                     input_message_content=InputTextMessageContent(
-                        message_text=truncate_utf16(plain_answer, 4000)
+                        message_text=truncate_utf16(plain_answer, 4000),
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
                     ),
                 )
             ],
@@ -4711,7 +5284,7 @@ async def process_premium_photos(
     solve_model = vision_model or info["model"]
     user = first.from_user
     user_id = user.id if user else None
-    rich = bool(private and user_rich(user_id))
+    rich = bool(RICH_SUPPORTED and private and user_rich(user_id))
     turn = Turn(
         message=first,
         chat_id=chat_id,
