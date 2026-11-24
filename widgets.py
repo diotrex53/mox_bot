@@ -560,7 +560,7 @@ def render_dashboard(data: dict, period_label: str = "24 часа") -> tuple[str
         model_rows.append('<div class="sub">Пока нет вызовов моделей.</div>')
 
     user_rows = "".join(
-        f'<div class="row"><div class="top"><b>{_esc(u.get("user_id") or "?")}</b>'
+        f'<div class="row"><div class="top"><b>{_esc(u.get("label") or u.get("user_id") or "?")}</b>'
         f'<span class="muted">{_esc(_fmt(_num(u.get("requests"))))} запр.</span></div></div>'
         for u in users[:5]
     ) or '<div class="sub">Пока нет пользователей.</div>'
@@ -608,9 +608,9 @@ def dashboard_text(data: dict, period_label: str = "24 часа") -> str:
 
     lines.extend(["", "<b>Топ пользователей</b>"])
     for user in users[:5]:
+        label = user.get("label") or user.get("user_id") or "?"
         lines.append(
-            f"• <code>{_esc(user.get('user_id') or '?')}</code> — "
-            f"{_esc(_fmt(_num(user.get('requests'))))}"
+            f"• {_esc(label)} — {_esc(_fmt(_num(user.get('requests'))))}"
         )
     if not users:
         lines.append("Пока нет пользователей.")

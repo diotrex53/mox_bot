@@ -360,8 +360,7 @@ function render(data) {
   // ---- Люди: выданные доступы
   const grants = data.grants_list || [];
   $('grants-list').innerHTML = grants.length ? grants.map(g =>
-    '<div class="list"><span><b>' + esc(g.username || g.user_id) + '</b>' +
-    (g.username ? ' <code>' + esc(g.user_id) + '</code>' : '') +
+    '<div class="list"><span><b>' + esc(g.label || g.user_id) + '</b>' +
     ' <span class="pill">' + esc(g.provider) + '</span>' +
     '<div class="small muted">сегодня: ' + esc(fmt(g.used)) +
     (g.limit ? ' / ' + esc(fmt(g.limit)) : '') + '</div></span>' +
@@ -370,7 +369,7 @@ function render(data) {
   ).join('') : '<div class="empty">Доступы никому не выданы.</div>';
 
   $('top-users').innerHTML = (data.top_users || []).length ? data.top_users.map(u =>
-    '<div class="list"><span><code>' + esc(u.user_id) + '</code></span>' +
+    '<div class="list"><span>' + esc(u.label || u.user_id) + '</span>' +
     '<span class="muted">' + esc(fmt(u.requests)) + ' запр.</span></div>'
   ).join('') : '<div class="empty">Пока нет пользователей.</div>';
 
@@ -395,7 +394,7 @@ function render(data) {
           : r.status === 'running' ? '<span class="warn">идёт</span>'
           : '<span class="bad">' + esc(r.status || 'err') + '</span>';
         const tokens = Number(r.tokens || 0);
-        return '<div class="req"><div class="meta"><span><b>' + esc(r.user_id || '—') + '</b> ' +
+        return '<div class="req"><div class="meta"><span><b>' + esc(r.label || r.user_id || '—') + '</b> ' +
           esc(r.model || '') + ' ' + status + '</span><span class="muted">' +
           esc(clock(r.created_at)) + (tokens ? ' · ' + esc(fmt(tokens)) + ' ток.' : '') +
           '</span></div><div class="preview">' + esc(r.preview || '') + '</div></div>';
@@ -413,7 +412,7 @@ function render(data) {
 
   $('blocked-list').innerHTML = (data.blocked_list || []).length
     ? data.blocked_list.map(b =>
-        '<div class="list"><span><code>' + esc(b.user_id) + '</code>' +
+        '<div class="list"><span>' + esc(b.label || b.user_id) +
         (b.reason ? '<div class="small muted">' + esc(b.reason) + '</div>' : '') +
         '</span><button class="btn danger mini" data-unblock="' + esc(b.user_id) + '">Разблокировать</button></div>'
       ).join('')

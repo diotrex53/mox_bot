@@ -229,7 +229,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
-APP_BUILD = "2026-11-24 mini-app-admin"
+APP_BUILD = "2026-11-24 thoughts-first-names"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -486,6 +486,112 @@ def esc(text) -> str:
 def plain_text(text) -> str:
     """Убирает HTML-теги: callback-ответы Telegram показываются без разметки."""
     return html.unescape(re.sub(r"<[^>]+>", "", str(text or ""))).strip()
+
+
+# ============================================================
+# ИМЕНА ПОЛЬЗОВАТЕЛЕЙ
+# ============================================================
+
+# В статистике мало одного ID: владельцу нужно видеть, кто это.
+# Кэш заполняется из входящих сообщений, а для старых записей — через get_chat.
+_user_names: dict[int, dict] = {}
+
+
+def remember_user(user) -> None:
+    """Запоминает имя и ник из входящего сообщения."""
+    if user is None:
+        return
+    uid = getattr(user, "id", None)
+    if not uid:
+        return
+    full_name = " ".join(
+        part
+        for part in (
+            getattr(user, "first_name", "") or "",
+            getattr(user, "last_name", "") or "",
+        )
+        if part
+    ).strip()
+    _user_names[int(uid)] = {
+        "username": getattr(user, "username", "") or "",
+        "full_name": full_name or getattr(user, "full_name", "") or "",
+    }
+
+
+def cached_user_name(user_id) -> tuple[str, str]:
+    item = _user_names.get(int(user_id)) or {}
+    return item.get("username") or "", item.get("full_name") or ""
+
+
+async def resolve_user_name(user_id) -> tuple[str, str]:
+    """Достаёт ник и имя через Telegram, если их ещё нет в кэше."""
+    uid = int(user_id)
+    if uid in _user_names:
+        item = _user_names[uid]
+        return item.get("username") or "", item.get("full_name") or ""
+    username = full_name = ""
+    try:
+        chat = await bot.get_chat(uid)
+        username = getattr(chat, "username", "") or ""
+        full_name = " ".join(
+            part
+            for part in (
+                getattr(chat, "first_name", "") or "",
+                getattr(chat, "last_name", "") or "",
+            )
+            if part
+        ).strip()
+        if not full_name:
+            full_name = getattr(chat, "title", "") or ""
+    except Exception as e:
+        logging.info(f"get_chat({uid}) skipped: {e}")
+    _user_names[uid] = {"username": username, "full_name": full_name}
+    return username, full_name
+
+
+async def resolve_user_names(user_ids) -> None:
+    """Подтягивает имена для списка ID, не больше 30 за раз."""
+    missing = [
+        int(uid)
+        for uid in dict.fromkeys(user_ids)
+        if uid and int(uid) not in _user_names
+    ]
+    if not missing:
+        return
+    await asyncio.gather(
+        *(resolve_user_name(uid) for uid in missing[:30]),
+        return_exceptions=True,
+    )
+
+
+def user_tag(user_id, username: str = "", full_name: str = "") -> str:
+    """HTML-подпись «Имя @ник · id» — чтобы в статистике было понятно, кто это."""
+    cached_username, cached_full_name = cached_user_name(user_id)
+    username = (username or cached_username or "").strip()
+    full_name = (full_name or cached_full_name or "").strip()
+    parts: list[str] = []
+    if full_name:
+        parts.append(f"<b>{esc(full_name)}</b>")
+    if username:
+        parts.append(f"@{esc(username)}")
+    label = " ".join(parts)
+    if label:
+        return f"{label} · <code>{user_id}</code>"
+    return f"<code>{user_id}</code>"
+
+
+def user_plain(user_id, username: str = "", full_name: str = "") -> str:
+    """Текстовая подпись для виджетов и Mini App."""
+    cached_username, cached_full_name = cached_user_name(user_id)
+    username = (username or cached_username or "").strip()
+    full_name = (full_name or cached_full_name or "").strip()
+    parts: list[str] = []
+    if full_name:
+        parts.append(full_name)
+    if username:
+        parts.append(f"@{username}")
+    label = " ".join(parts)
+    return f"{label} · {user_id}" if label else str(user_id)
 
 
 # ============================================================
@@ -2477,15 +2583,14 @@ class RichStreamer:
         return f"<details><summary>🧠 Размышления</summary>\n<p>{body}</p>\n</details>"
 
     def build_html(self) -> str:
-        # Сначала ответ, потом мысли: даже если сообщение свернётся,
-        # пользователь увидит начало ответа, а не один блок размышлений.
+        # Сначала размышления, потом ответ — как было раньше.
         parts: list[str] = []
-        body = sanitize_rich("".join(self.content))
-        if body:
-            parts.append(body)
         thoughts = self._thoughts_html()
         if thoughts:
             parts.append(thoughts)
+        body = sanitize_rich("".join(self.content))
+        if body:
+            parts.append(body)
         return "\n\n".join(parts)
 
     async def on_delta(self, kind: str, piece: str) -> None:
@@ -2540,6 +2645,10 @@ class RichStreamer:
         if self.finished:
             return
         self.finished = True
+        # Размышления уходят первым сообщением, ответ — следом.
+        thoughts = self._thoughts_html()
+        if thoughts:
+            await self._deliver(thoughts)
         raw = "".join(self.content).strip()
         if not raw:
             raw = (answer or "").strip()
@@ -2548,11 +2657,6 @@ class RichStreamer:
         chunks = split_rich(raw)
         for chunk in chunks:
             await self._deliver(sanitize_rich(chunk))
-        # Размышления — отдельным сообщением после ответа, чтобы не
-        # прятать сам ответ под «Показать ещё».
-        thoughts = self._thoughts_html()
-        if thoughts:
-            await self._deliver(thoughts)
 
 
 async def send_photo(turn: Turn, data: bytes, caption: str) -> bool:
@@ -2745,10 +2849,29 @@ async def send_widget_card(turn: Turn, html_text: str, caption: str = "") -> boo
         return False
 
 
+async def enrich_dashboard_users(data: dict) -> dict:
+    """Добавляет к топ-пользователям читаемую подпись вместо одного ID."""
+    users = data.get("top_users") or []
+    if not users:
+        return data
+    await resolve_user_names([u.get("user_id") for u in users])
+    enriched = []
+    for user in users:
+        item = dict(user)
+        item["label"] = user_plain(
+            user.get("user_id"), user.get("username", ""), user.get("full_name", "")
+        )
+        enriched.append(item)
+    data = dict(data)
+    data["top_users"] = enriched
+    return data
+
+
 async def send_dashboard_message(
     chat_id: int, data: dict, period_label: str = "24 часа"
 ) -> str:
     """Дашборд виджетом, а если Telegram запрещает виджеты — обычным текстом."""
+    data = await enrich_dashboard_users(data)
     if WIDGET_SUPPORTED:
         try:
             html_text, caption = render_dashboard(data, period_label)
@@ -3896,7 +4019,7 @@ def admin_main_kb() -> InlineKeyboardMarkup:
     return admin_kb(rows)
 
 
-def stats_text(stats: dict, period: str, flt: dict) -> str:
+async def stats_text(stats: dict, period: str, flt: dict) -> str:
     lines = [f"📊 <b>Статистика</b> · {admin_period_label(flt)}", ""]
     lines.append(
         f"<b>A.</b> Запросов: <b>{fmt_int(stats['requests'])}</b> · "
@@ -3917,16 +4040,23 @@ def stats_text(stats: dict, period: str, flt: dict) -> str:
         )
     lines.append("")
     lines.append("<b>C.</b> Топ пользователей:")
-    if stats.get("top_users"):
-        for u in stats["top_users"]:
-            uname = f" @{esc(u['username'])}" if u.get("username") else ""
-            lines.append(f"• <code>{u['user_id']}</code>{uname} — {fmt_int(u['requests'])}")
+    top_users = stats.get("top_users") or []
+    await resolve_user_names([u.get("user_id") for u in top_users])
+    if top_users:
+        for u in top_users:
+            lines.append(
+                f"• {user_tag(u['user_id'], u.get('username', ''))} — "
+                f"{fmt_int(u['requests'])}"
+            )
     else:
         lines.append("• пока нет")
     lines.append("Топ чатов:")
     if stats.get("top_chats"):
         for c in stats["top_chats"]:
-            lines.append(f"• <code>{c['chat_id']}</code> ({esc(c['chat_type'])}) — {fmt_int(c['requests'])}")
+            chat_id = c["chat_id"]
+            title = (_groups_cache.get(int(chat_id)) or {}).get("title") or ""
+            name = f"<b>{esc(title)}</b> · <code>{chat_id}</code>" if title else f"<code>{chat_id}</code>"
+            lines.append(f"• {name} ({esc(c['chat_type'])}) — {fmt_int(c['requests'])}")
     else:
         lines.append("• пока нет")
     ctx = stats.get("contexts") or {}
@@ -4163,6 +4293,7 @@ async def requests_view_async(page: int, flt: dict) -> tuple[str, InlineKeyboard
     ]
     if not rows:
         lines.append("Ничего не найдено.")
+    await resolve_user_names([r.get("user_id") for r in rows if r.get("user_id")])
     for r in rows:
         created = r.get("created_at")
         if isinstance(created, datetime):
@@ -4176,12 +4307,16 @@ async def requests_view_async(page: int, flt: dict) -> tuple[str, InlineKeyboard
             icon = "⏳"
         else:
             icon = "❌"
-        uname = f" @{r.get('username')}" if r.get("username") else ""
+        who = (
+            user_tag(r.get("user_id"), r.get("username") or "")
+            if r.get("user_id")
+            else "—"
+        )
         prompt = (r.get("prompt_preview") or "").replace("\n", " ")[:100]
         lines.append(
             f"{icon} <b>#{r.get('id')}</b> {created} · {esc(r.get('kind') or '?')} · "
             f"{esc(r.get('model') or '—')}\n"
-            f"  <code>{r.get('user_id') or '—'}</code>{esc(uname)} · "
+            f"  {who} · "
             f"чат <code>{r.get('chat_id') or '—'}</code> · "
             f"{fmt_int(r.get('tokens') or 0)} ток."
             + (f" · {fmt_int(r.get('latency_ms') or 0)} мс" if r.get("latency_ms") else "")
@@ -4305,7 +4440,7 @@ async def admin_section(
             flt["date_from"] = None
         start, end = admin_period_bounds(flt)
         data = await storage.stats(start, end)
-        return stats_text(data, flt.get("period", "7"), flt), stats_kb(flt.get("period", "7"))
+        return await stats_text(data, flt.get("period", "7"), flt), stats_kb(flt.get("period", "7"))
     return admin_main_text(), admin_main_kb()
 
 
@@ -4916,8 +5051,13 @@ async def send_daily_summary(mark: bool = True) -> None:
         )
     if data.get("top_users"):
         lines.append("\nТоп пользователей:")
-        for u in data["top_users"][:5]:
-            lines.append(f"• <code>{u['user_id']}</code> — {fmt_int(u['requests'])}")
+        top_users = data["top_users"][:5]
+        await resolve_user_names([u.get("user_id") for u in top_users])
+        for u in top_users:
+            lines.append(
+                f"• {user_tag(u['user_id'], u.get('username', ''))} — "
+                f"{fmt_int(u['requests'])}"
+            )
     lines.append(f"\nКредиты: <b>{data['credits']:.4f}</b>")
     try:
         await bot.send_message(OWNER_ID, "\n".join(lines))
@@ -4969,6 +5109,9 @@ async def daily_summary_loop() -> None:
 
 class DMBlacklistMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and event.from_user:
+            # Запоминаем имя, чтобы в статистике были не только ID.
+            remember_user(event.from_user)
         if (
             isinstance(event, Message)
             and event.chat.type == ChatType.PRIVATE
@@ -6056,10 +6199,35 @@ async def webapp_overview_payload(request_limit: int = 30) -> dict:
         {
             "user_id": user_id,
             "username": item.get("username") or "",
-            "reason": item.get("full_name") or "",
+            "reason": "",
         }
         for user_id, item in sorted(_dm_blacklist.items())
     ]
+
+    # Подтягиваем имена один раз на все списки: в приложении нужны люди, а не ID.
+    top_users = [dict(u) for u in (data.get("top_users") or [])]
+    await resolve_user_names(
+        [u.get("user_id") for u in top_users]
+        + [g["user_id"] for g in grants_list]
+        + [b["user_id"] for b in blocked_list]
+        + [r["user_id"] for r in requests_list]
+    )
+    for user in top_users:
+        user["label"] = user_plain(
+            user.get("user_id"), user.get("username", ""), user.get("full_name", "")
+        )
+    for grant in grants_list:
+        grant["label"] = user_plain(
+            grant["user_id"], grant.get("username", ""), grant.get("full_name", "")
+        )
+    for blocked_user in blocked_list:
+        blocked_user["label"] = user_plain(
+            blocked_user["user_id"], blocked_user.get("username", "")
+        )
+    for row in requests_list:
+        row["label"] = (
+            user_plain(row.get("user_id")) if row.get("user_id") else "—"
+        )
 
     return {
         "build": APP_BUILD,
@@ -6072,7 +6240,7 @@ async def webapp_overview_payload(request_limit: int = 30) -> dict:
         "avg_latency": float(data.get("avg_latency") or 0),
         "contexts": len(data.get("contexts") or {}),
         "models": models,
-        "top_users": data.get("top_users") or [],
+        "top_users": top_users,
         "balances": balances,
         "groups": len(_groups_cache),
         "blocked": len(_dm_blacklist),
@@ -6225,12 +6393,15 @@ def build_web_app():
                 return web.json_response(
                     {"error": "У владельца доступ уже есть"}, status=400
                 )
-            await storage.add_grant(user_id, provider, "", "", OWNER_ID)
+            username, full_name = await resolve_user_name(user_id)
+            await storage.add_grant(
+                user_id, provider, username, full_name, OWNER_ID
+            )
             _grants[(user_id, provider)] = {
                 "user_id": user_id,
                 "provider": provider,
-                "username": "",
-                "full_name": "",
+                "username": username,
+                "full_name": full_name,
                 "granted_at": msk_now(),
             }
             await storage.add_admin_action(
@@ -6345,17 +6516,18 @@ def build_web_app():
             return web.json_response({"error": "Себя блокировать нельзя"}, status=400)
 
         if action == "add":
-            await storage.add_blacklist(user_id, "", "", OWNER_ID)
+            username, full_name = await resolve_user_name(user_id)
+            await storage.add_blacklist(user_id, username, full_name, OWNER_ID)
             _dm_blacklist[user_id] = {
                 "user_id": user_id,
-                "username": "",
-                "full_name": "",
+                "username": username,
+                "full_name": full_name,
                 "added_at": msk_now(),
             }
             await storage.delete_context(user_id)
             _history.pop(user_id, None)
             await storage.add_admin_action(OWNER_ID, "blacklist_add", str(user_id))
-            message = f"{user_id} заблокирован в ЛС"
+            message = f"{user_plain(user_id, username, full_name)} заблокирован в ЛС"
         elif action == "remove":
             await storage.remove_blacklist(user_id)
             _dm_blacklist.pop(user_id, None)
