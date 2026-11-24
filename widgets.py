@@ -55,6 +55,15 @@ def _fmt(number) -> str:
     return f"{number:.2f}".rstrip("0").rstrip(".")
 
 
+def _bar(value, maximum, width: int = 10) -> str:
+    """Текстовая полоса для фолбэка, когда виджеты недоступны."""
+    if maximum <= 0:
+        return "░" * width
+    ratio = max(0.0, min(1.0, _num(value) / _num(maximum)))
+    filled = int(round(ratio * width))
+    return "█" * filled + "░" * (width - filled)
+
+
 def _js(value) -> str:
     return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
 
@@ -433,26 +442,59 @@ def text_version(kind: str, spec: dict) -> str:
     kind = (kind or "").lower()
     if kind == "chart":
         labels = _label_list(spec.get("labels"), limit=20, max_len=16)
+        series: list[dict] = []
         for item in (spec.get("series") or [])[:3]:
             if not isinstance(item, dict):
                 continue
-            name = _clip(item.get("name") or "Ряд", 24)
             values = [_num(v) for v in (item.get("values") or [])][:20]
-            pairs = [
-                f"{_esc(labels[i] if i < len(labels) else i + 1)}: {_esc(_fmt(v))}"
-                for i, v in enumerate(values)
-            ]
-            lines.append(f"• <b>{_esc(name)}</b> — " + ", ".join(pairs))
+            if values:
+                series.append(
+                    {
+                        "name": _clip(item.get("name") or "Ряд", 24),
+                        "values": values,
+                    }
+                )
+        if len(series) == 1:
+            values = series[0]["values"]
+            peak = max((abs(v) for v in values), default=0) or 1
+            for i, value in enumerate(values):
+                label = labels[i] if i < len(labels) else str(i + 1)
+                lines.append(
+                    f"{_esc(_clip(label, 12))} {_bar(abs(value), peak)} {_esc(_fmt(value))}"
+                )
+        else:
+            count = max((len(item["values"]) for item in series), default=0)
+            for i in range(count):
+                label = labels[i] if i < len(labels) else str(i + 1)
+                parts = [
+                    f"{_esc(item['name'])} {_esc(_fmt(item['values'][i]))}"
+                    for item in series
+                    if i < len(item["values"])
+                ]
+                lines.append(f"{_esc(_clip(label, 12))}: " + ", ".join(parts))
     elif kind == "table":
-        columns = _label_list(spec.get("columns"), limit=6, max_len=18)
-        rows = spec.get("rows") or []
-        if columns:
-            lines.append("<b>" + " | ".join(_esc(c) for c in columns) + "</b>")
-        for row in rows[:10]:
+        columns = _label_list(spec.get("columns"), limit=5, max_len=24)
+        raw_rows = spec.get("rows") or []
+        clean_rows: list[list[str]] = []
+        for row in raw_rows[:10]:
             if isinstance(row, dict):
                 row = list(row.values())
             if isinstance(row, (list, tuple)):
-                lines.append(" | ".join(_esc(_clip(c, 40)) for c in row))
+                clean_rows.append([_clip(cell, 24) for cell in row][: len(columns) or 5])
+        if clean_rows and not columns:
+            columns = [str(i + 1) for i in range(len(clean_rows[0]))]
+        if columns:
+            widths = [len(str(c)) for c in columns]
+            for row in clean_rows:
+                for i, cell in enumerate(row[: len(widths)]):
+                    widths[i] = max(widths[i], len(str(cell)))
+
+            def fmt_row(cells: list[str]) -> str:
+                padded = [str(c).ljust(widths[i]) for i, c in enumerate(cells[: len(widths)])]
+                return " | ".join(padded).rstrip()
+
+            table_lines = [fmt_row(columns)] + [fmt_row(row) for row in clean_rows]
+            lines.append("<pre>" + _esc("\n".join(table_lines)) + "</pre>")
     elif kind == "quiz":
         lines.append(_esc(_clip(spec.get("question") or "", 200)))
         for i, option in enumerate(_label_list(spec.get("options"), limit=6, max_len=80)):
@@ -470,7 +512,8 @@ def text_version(kind: str, spec: dict) -> str:
             value = _num(item.get("value"))
             maximum = _num(item.get("max"), 100) or 100
             lines.append(
-                f"• {_esc(label)}: {_esc(_fmt(value))} / {_esc(_fmt(maximum))}"
+                f"• {_esc(label)}: {_bar(value, maximum)} "
+                f"{_esc(_fmt(value))} / {_esc(_fmt(maximum))}"
             )
     elif kind == "checklist":
         for task in (spec.get("tasks") or [])[:30]:
@@ -532,3 +575,43 @@ def render_dashboard(data: dict, period_label: str = "24 часа") -> tuple[str
         + user_rows
     )
     return _finalize(html_text, f"Дашборд · {period_label}")
+
+
+def dashboard_text(data: dict, period_label: str = "24 часа") -> str:
+    """Текстовый дашборд для случая, когда Telegram запрещает виджеты."""
+    models = data.get("models") or []
+    users = data.get("top_users") or []
+    requests = int(data.get("requests") or 0)
+    calls = int(data.get("calls") or 0)
+    errors = int(data.get("request_errors") or 0) + int(data.get("call_errors") or 0)
+    credits = _num(data.get("credits"))
+
+    lines = [
+        f"🖥 <b>Дашборд · {_esc(period_label)}</b>",
+        "",
+        f"Запросы: <b>{_esc(_fmt(requests))}</b>",
+        f"Вызовы моделей: <b>{_esc(_fmt(calls))}</b>",
+        f"Ошибки: <b>{_esc(_fmt(errors))}</b>",
+        f"Кредиты: <b>{_esc(_fmt(credits))}</b>",
+        "",
+        "<b>Токены по моделям</b>",
+    ]
+    peak = max((int(m.get("total_tokens") or 0) for m in models[:6]), default=0) or 1
+    for item in models[:6]:
+        name = _clip(item.get("model") or "?", 28)
+        tokens = int(item.get("total_tokens") or 0)
+        lines.append(
+            f"{_esc(name)} {_bar(tokens, peak)} {_esc(_fmt(tokens))}"
+        )
+    if not models:
+        lines.append("Пока нет вызовов моделей.")
+
+    lines.extend(["", "<b>Топ пользователей</b>"])
+    for user in users[:5]:
+        lines.append(
+            f"• <code>{_esc(user.get('user_id') or '?')}</code> — "
+            f"{_esc(_fmt(_num(user.get('requests'))))}"
+        )
+    if not users:
+        lines.append("Пока нет пользователей.")
+    return "\n".join(lines)

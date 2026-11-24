@@ -48,7 +48,13 @@ from storage import DB_LIMIT_BYTES, MSK, storage
 # а виджеты просто будут отдавать текстовый фолбэк вместо падения на старте.
 WIDGETS_MODULE = True
 try:
-    from widgets import WidgetError, render_checklist, render_dashboard, render_widget
+    from widgets import (
+        WidgetError,
+        dashboard_text,
+        render_checklist,
+        render_dashboard,
+        render_widget,
+    )
     from widgets import text_version as widget_text_version
 except Exception:  # pragma: no cover
     WIDGETS_MODULE = False
@@ -61,6 +67,7 @@ except Exception:  # pragma: no cover
         raise WidgetError("модуль widgets.py не загружен на сервер")
 
     render_checklist = render_dashboard = render_widget = _widgets_missing
+    dashboard_text = _widgets_missing
 
     def widget_text_version(_kind, _spec):
         return "Виджеты временно недоступны."
@@ -191,6 +198,9 @@ bot = Bot(
     ),
 )
 dp = Dispatcher()
+
+# Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
+APP_BUILD = "2026-11-24 widgets-text-fallback"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -2691,8 +2701,40 @@ async def send_widget_card(turn: Turn, html_text: str, caption: str = "") -> boo
         await bot.send_widget(**kwargs)
         return True
     except Exception as e:
-        logging.warning(f"send_widget failed: {e}")
+        text = str(e)
+        if "WIDGET_NOT_ALLOWED" in text:
+            # Telegram ограничил sendWidget обычным ботам (с 13.11.2026).
+            # Больше не тратим запросы: работаем текстовыми версиями.
+            globals()["WIDGET_SUPPORTED"] = False
+            logging.warning(
+                "sendWidget запрещён Telegram для этого бота "
+                "(INPUT_MEDIA_WIDGET_NOT_ALLOWED). Виджеты отключены до "
+                "перезапуска, включён текстовый фолбэк."
+            )
+        else:
+            logging.warning(f"send_widget failed: {e}")
         return False
+
+
+async def send_dashboard_message(
+    chat_id: int, data: dict, period_label: str = "24 часа"
+) -> str:
+    """Дашборд виджетом, а если Telegram запрещает виджеты — обычным текстом."""
+    if WIDGET_SUPPORTED:
+        try:
+            html_text, caption = render_dashboard(data, period_label)
+            await bot.send_widget(chat_id=chat_id, html=html_text, caption=caption)
+            return "widget"
+        except Exception as e:
+            if "WIDGET_NOT_ALLOWED" in str(e):
+                globals()["WIDGET_SUPPORTED"] = False
+                logging.warning(
+                    "sendWidget запрещён Telegram; дашборд отправляю текстом."
+                )
+            else:
+                logging.warning(f"dashboard widget failed: {e}")
+    await bot.send_message(chat_id, dashboard_text(data, period_label))
+    return "text"
 
 
 async def send_checklist_card(turn: Turn, title: str, tasks: list[str]) -> bool:
@@ -3801,6 +3843,9 @@ def admin_main_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="💳 Балансы", callback_data="adm:bal"),
+                InlineKeyboardButton(text="📨 Сводка", callback_data="adm:summary"),
+            ],
+            [
                 InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set"),
             ],
         ]
@@ -4520,17 +4565,22 @@ async def on_admin_callback(callback: CallbackQuery):
             data = dict(data)
             data["models"] = merge_stats_models(data.get("models"), limit=6)
             try:
-                html_text, caption = render_dashboard(data, "24 часа")
-                await bot.send_widget(
-                    chat_id=OWNER_ID, html=html_text, caption=caption
+                mode = await send_dashboard_message(OWNER_ID, data, "24 часа")
+                await callback.answer(
+                    "Дашборд отправлен."
+                    if mode == "widget"
+                    else "Виджеты недоступны — отправил текстом."
                 )
-                await callback.answer("Дашборд отправлен.")
             except Exception as e:
                 logging.warning(f"admin dashboard failed: {e}")
                 await callback.answer(
                     plain_text(f"Не удалось собрать дашборд: {e}")[:180],
                     show_alert=True,
                 )
+            return
+        if action == "summary":
+            await send_daily_summary(mark=False)
+            await callback.answer("Сводка отправлена.")
             return
         if action == "model":
             text, kb = await admin_section("model")
@@ -4805,7 +4855,7 @@ async def on_admin_callback(callback: CallbackQuery):
         await callback.answer(plain_text(f"Ошибка: {e}")[:180], show_alert=True)
 
 
-async def send_daily_summary() -> None:
+async def send_daily_summary(mark: bool = True) -> None:
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=24)
     data = await storage.stats(start, end)
@@ -4829,7 +4879,8 @@ async def send_daily_summary() -> None:
         await bot.send_message(OWNER_ID, "\n".join(lines))
     except Exception as e:
         logging.warning(f"Daily summary send failed: {e}")
-    await storage.set_setting("last_daily_summary", msk_now().isoformat())
+    if mark:
+        await storage.set_setting("last_daily_summary", msk_now().isoformat())
 
 
 async def daily_summary_loop() -> None:
@@ -5905,6 +5956,7 @@ async def main() -> None:
     BOT_ID = me.id
     BOT_USERNAME = me.username or ""
     logging.info(f"Бот запущен: @{BOT_USERNAME} (id={BOT_ID})")
+    logging.info(f"Build: {APP_BUILD}")
     logging.info(f"Chat: {CHAT_MODEL} (Groq), fast: {FAST_MODEL}")
     logging.info(
         f"DeepSeek: {DEEPSEEK_MODEL} "
