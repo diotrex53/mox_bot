@@ -36,6 +36,7 @@ from aiogram.types import (
     InputRichMessage,
     InputTextMessageContent,
     LinkPreviewOptions,
+    MenuButtonCommands,
     Message,
 )
 from openai import AsyncOpenAI
@@ -102,115 +103,97 @@ GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
 TAVILY_API_KEY = os.environ.get("TAVIL_API", "")
 
 # ---- Универсальный шлюз ------------------------------------------------
-# Один ключ на 66 моделей: DeepSeek, Qwen, GPT, Claude, Gemini, Kimi,
-# GLM, Grok, MiniMax и Mistral. Ключ живёт только в env Render.
+# Один ключ на весь каталог aikeysforyou: DeepSeek, Qwen, GPT, Claude,
+# Kimi, GLM, Grok, Nemotron, MiniMax, Hunyuan, MiMo. Ключ живёт в env Render.
 GATEWAY_API_KEY = os.environ.get("GATEWAY_API", "")
 GATEWAY_BASE_URL = os.environ.get(
-    "GATEWAY_BASE_URL", "https://213-171-27-156.sslip.io/v1"
+    "GATEWAY_BASE_URL", "https://api.aikeysforyou.com/v1"
 ).rstrip("/")
+# JSON-эндпоинт баланса: {"object":"balance","token_balance":123456}
 GATEWAY_BALANCE_URL = os.environ.get(
-    "GATEWAY_BALANCE_URL",
-    "https://213-171-27-156.sslip.io/u/13cb3864-4069-4501-94d7-ad3c46d94231",
+    "GATEWAY_BALANCE_URL", "https://api.aikeysforyou.com/v1/balance"
 )
-DEFAULT_GATEWAY_MODEL = "deepseek-v4.1-flash"
+DEFAULT_GATEWAY_MODEL = "deepseek-v4.1-flash-1017"
 
-# 10 семейств — ровно 66 моделей шлюза. Порядок в меню — как здесь.
+# 12 семейств — ровно 37 моделей нового шлюза aikeysforyou.
+# Порядок в меню — как здесь. В каталоге шлюза есть и другие id (алиасы),
+# но эти перечислены в /v1/models и снабжены метаданными.
 MODEL_FAMILIES: list[tuple[str, str, list[str]]] = [
     (
-        "gateway",
+        "deepseek",
         "DeepSeek",
-        ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "deepseek-v4-pro"],
-    ),
-    (
-        "qwen",
-        "Qwen",
         [
-            "qwen4-max",
-            "qwen3.8-max",
-            "qwen3.8-flash",
-            "qwen3.7-max",
-            "qwen3.7-plus",
-            "qwen3.6-plus",
+            "deepseek-v4.1-flash-1017",
+            "deepseek-v4.1-flash-1017-abliterated",
+            "deepseek-v4-flash-0731",
+            "deepseek-v4-pro-0813",
         ],
     ),
     (
         "gpt",
         "GPT",
         [
-            "gpt-6.2-sol",
             "gpt-6.2-astra",
+            "gpt-6.2-sol",
+            "gpt-6-astra",
             "gpt-6.1-sol",
             "gpt-6.1-terra",
             "gpt-6-sol",
             "gpt-6-luna",
-            "gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4-mini",
         ],
     ),
     (
         "claude",
         "Claude",
-        [
-            "claude-opus-5-5",
-            "claude-opus-5",
-            "claude-sonnet-5-5",
-            "claude-sonnet-5",
-            "claude-haiku-5-5",
-            "claude-fable-5-2",
-            "claude-fable-5-1",
-            "claude-opus-4-8",
-            "claude-opus-4-7",
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5",
-        ],
-    ),
-    (
-        "gemini",
-        "Gemini",
-        [
-            "gemini-4-neon",
-            "gemini-4-carbon",
-            "gemini-4-argon",
-            "gemini-4-hydrogen",
-            "gemini-3.8-flash",
-            "gemini-3.7-flash",
-            "gemini-3.6-flash",
-            "gemini-3.5-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-pro",
-            "gemini-3.1-flash-lite",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-        ],
-    ),
-    (
-        "kimi",
-        "Kimi",
-        [
-            "kimi-k3.1-pro",
-            "kimi-k3.1-pro-highspeed",
-            "kimi-k3",
-            "kimi-k2.7-code",
-            "kimi-k2.6",
-            "kimi-k2.5",
-        ],
+        ["claude-fable-5-2", "claude-fable-5-1", "claude-fable-5"],
     ),
     (
         "glm",
         "GLM",
-        ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1"],
+        ["glm-5.4", "glm-5.3", "glm-5.3-flash"],
     ),
-    ("grok", "Grok", ["grok-4.7", "grok-4.6", "grok-4.5", "grok-4.3"]),
-    ("minimax", "MiniMax", ["minimax-m3.1", "minimax-m3", "minimax-m2.7"]),
     (
-        "mistral",
-        "Mistral",
-        ["mistral-large-4", "mistral-large-latest", "mistral-small-latest"],
+        "grok",
+        "Grok",
+        ["grok-4.7", "grok-4.6", "grok-4.5", "composer-2.5-fast"],
+    ),
+    (
+        "qwen",
+        "Qwen",
+        ["qwen3.8-max", "qwen3.8-flash"],
+    ),
+    (
+        "kimi",
+        "Kimi",
+        ["kimi-k3.1-pro", "kimi-k3", "kimi-k2.8-preview"],
+    ),
+    (
+        "nemotron",
+        "Nemotron",
+        ["nemotron-3-ultra", "nemotron-3.5-lightning", "nemotron-3.5-super-vl"],
+    ),
+    (
+        "minimax",
+        "MiniMax",
+        ["minimax-m3.1-flash"],
+    ),
+    (
+        "hunyuan",
+        "Hunyuan",
+        ["hy4flash"],
+    ),
+    (
+        "mimo",
+        "MiMo",
+        ["mimo-v2.6-pro", "mimo-v2.6-flash"],
+    ),
+    (
+        "muse",
+        "Muse",
+        ["muse-ember"],
     ),
 ]
 
@@ -232,8 +215,15 @@ MODEL_REGISTRY["groq"] = {
     "family": "groq",
 }
 
-# Ключи из старых сохранённых настроек.
-MODEL_ALIASES = {"deepseek": "deepseek-v4.1-flash", "qwen": "qwen4-max"}
+# Ключи из старых сохранённых настроек (в базе могли остаться старые id).
+MODEL_ALIASES = {
+    "deepseek": "deepseek-v4.1-flash-1017",
+    "qwen": "qwen3.8-max",
+    "qwen4-max": "qwen3.8-max",
+    "qwen3.8-flash": "qwen3.8-flash",
+    "gpt-6.1-sol": "gpt-6.1-sol",
+    "claude-opus-5-5": "claude-fable-5-2",
+}
 GATEWAY_MODELS = [
     name for _key, _label, names in MODEL_FAMILIES for name in names
 ]
@@ -243,20 +233,9 @@ PROVIDER_NAMES = {"gateway": "Премиум", "groq": "Groq"}
 
 # Думают, но не показывают мысли текстом — честно предупреждаем.
 SILENT_REASONING_MODELS = {
-    "qwen3.6-plus",
-    "glm-5.1",
-    "glm-5.2",
-    "gpt-6.2-astra",
-    "gpt-5.6-luna",
-    "gemini-4-neon",
-    "gemini-4-carbon",
-    "gemini-4-argon",
-    "claude-haiku-5-5",
-    "claude-haiku-4-5",
-    "claude-fable-5-1",
-    "claude-fable-5-2",
-    "claude-opus-5-5",
-    "grok-4.3",
+    # Каталог помечает обе модели как «без reasoning»: они отвечают сразу.
+    "composer-2.5-fast",
+    "deepseek-v4-flash-0731",
 }
 # Эта модель думает всегда — переключатель размышлений ей не нужен.
 ALWAYS_REASONING_MODELS = {"qwen3.8-flash"}
@@ -288,6 +267,9 @@ MAX_REPLY_LENGTH = 4000
 # Telegram сворачивает сообщения длиннее ~8000 символов под «Показать ещё».
 # Держим куски заметно ниже этого порога, чтобы ответ читался прямо в чате.
 MAX_RICH_REPLY_LENGTH = 7000
+# Сколько символов размышлений показываем в раскрытом блоке. Мысли идут в
+# одном сообщении с ответом, поэтому их надо держать заметно короче лимита.
+REASONING_PREVIEW_CHARS = 1200
 CHAT_MAX_TOKENS = 4000
 COOLDOWN_SECONDS = 2
 AI_TIMEOUT = 180.0
@@ -341,7 +323,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
-APP_BUILD = "2026-11-25 gateway-66-rich-admin-footer-text-tools"
+APP_BUILD = "2026-11-25 aikeys-37-tables-menu-clear"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -2647,8 +2629,10 @@ def plain_from_rich(text: str) -> str:
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
+    text = re.sub(r"</t[dh]>\s*", " · ", text, flags=re.IGNORECASE)
+    text = re.sub(r"</tr>\s*", "\n", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"</(?:p|div|h[1-6]|li|tr|blockquote)>", "\n", text, flags=re.IGNORECASE
+        r"</(?:p|div|h[1-6]|li|blockquote)>", "\n", text, flags=re.IGNORECASE
     )
     text = re.sub(r"<[^>]+>", "", text)
     return tex_to_plain(html.unescape(text).strip())
@@ -2676,6 +2660,8 @@ def classic_from_rich(text: str) -> str:
     text = re.sub(r"</p>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<li\b[^>]*>", "• ", text, flags=re.IGNORECASE)
     text = re.sub(r"</li>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</t[dh]>\s*", " · ", text, flags=re.IGNORECASE)
+    text = re.sub(r"</tr>\s*", "\n", text, flags=re.IGNORECASE)
     text = re.sub(
         r"</?(?:ul|ol|div|span|table|thead|tbody|tr|td|th|mark|tg-math|tg-math-block)\b[^>]*>",
         "",
@@ -2698,6 +2684,47 @@ def usage_footer(turn: Turn, rich: bool) -> str:
     return f"\n\n<i>{label} · {tokens} ток.</i>"
 
 
+def silent_reasoning_note(streamer: "RichStreamer | None", effort: str) -> str:
+    """Честная пометка: модель думала, но текст мыслей не прислала."""
+    if streamer is None or effort == "off":
+        return ""
+    if streamer._thoughts_html():
+        return ""
+    return (
+        "<p><i>🧠 Модель оставила рассуждения внутренними — "
+        "текст мыслей она не прислала.</i></p>"
+    )
+
+
+def reasoning_to_html(raw: str) -> str:
+    """Размышления модели → аккуратные абзацы Rich Message.
+
+    Модели шлют мысли либо обычным текстом, либо слипшимися жирными
+    тезисами вида `**Сравниваю таблицы****Проверяю исключения**`.
+    Приводим это к <p> и <b>, чтобы не показывать сырой Markdown.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    # Слипшиеся тезисы: **A****B** → **A** **B** (пары разбираются по очереди).
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = text.replace("**", "")
+    text = text.replace("</b><b>", "</b> <b>")
+    text = re.sub(r"^\s*#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-•]\s+", "• ", text, flags=re.MULTILINE)
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    body = sanitize_rich(text)
+    paragraphs = [chunk.strip() for chunk in re.split(r"\n{2,}", body) if chunk.strip()]
+    split: list[str] = []
+    for chunk in paragraphs:
+        lines = [line.strip() for line in chunk.split("\n") if line.strip()]
+        if len(lines) > 1 and all(len(line) <= 300 for line in lines):
+            split.extend(lines)
+        else:
+            split.append(chunk)
+    return "\n".join(f"<p>{chunk}</p>" for chunk in split[:40])
+
+
 class RichStreamer:
     """Draft-стриминг Rich Message: мысли в <details>, текст — как статья."""
 
@@ -2711,6 +2738,12 @@ class RichStreamer:
         self.last_update = 0.0
 
     def reset(self) -> None:
+        # Между раундами инструментов сбрасываем только текст ответа:
+        # размышления уже показаны пользователю и не должны исчезать.
+        self.content.clear()
+
+    def restart(self) -> None:
+        # Повтор после сбоя модели: мысли неудачной попытки тоже убираем.
         self.content.clear()
         self.reasoning.clear()
 
@@ -2718,10 +2751,25 @@ class RichStreamer:
         raw = strip_text_tool_calls("".join(self.reasoning)).strip()
         if not raw:
             return ""
-        body = sanitize_rich(raw[:6000])
+        # Мысли идут в том же сообщении, что и начало ответа. Если модель
+        # вывалила простыню, показываем только начало: иначе <details>
+        # вытеснит сам ответ в следующее сообщение.
+        cut = raw[:REASONING_PREVIEW_CHARS]
+        if len(raw) > REASONING_PREVIEW_CHARS:
+            cut = cut.rstrip()
+            stop = max(
+                cut.rfind(". "), cut.rfind("! "), cut.rfind("? "), cut.rfind("\n")
+            )
+            if stop > 300:
+                cut = cut[: stop + 1]
+            else:
+                cut = cut[: REASONING_PREVIEW_CHARS - 1].rstrip() + "…"
+        body = reasoning_to_html(cut)
+        if not body:
+            return ""
         return (
             "<details open><summary>🧠 Размышления</summary>\n"
-            f"<p>{body}</p>\n</details>"
+            f"{body}\n</details>"
         )
 
     def build_html(self) -> str:
@@ -3472,14 +3520,58 @@ async def send_switch_button(turn: Turn, error_text: str) -> None:
         await send_text(turn, text)
 
 
+def _is_transient(error: Exception) -> bool:
+    """Временный сбой шлюза (сеть/перегрузка), а не отказ модели."""
+    status = getattr(error, "status_code", None)
+    if status is not None:
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            code = 0
+        if code in (408, 425, 429, 500, 502, 503, 504):
+            return True
+        if 400 <= code < 500:
+            return False
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "сетевая ошибка",
+            "connection",
+            "timeout",
+            "timed out",
+            "temporarily",
+            "unavailable",
+            "try again",
+        )
+    )
+
+
 def _is_model_not_found(error: Exception) -> bool:
     text = str(error).lower()
     return (
         "model_not_found" in text
         or "model not found" in text
         or "unknown model" in text
+        or "model_not_allowed" in text
+        or "not enabled for the api key" in text
         or getattr(error, "status_code", None) == 404
     )
+
+
+def _is_image_rejected(error: Exception) -> bool:
+    """Шлюз отверг именно вложение-картинку, а не модель и не запрос."""
+    text = (str(error) + " " + str(getattr(error, "body", "") or "")).lower()
+    if "model_not_allowed" in text or "unknown model" in text:
+        return False
+    if "image" in text or "photo" in text or "vision" in text:
+        return True
+    status = getattr(error, "status_code", None)
+    try:
+        code = int(status) if status is not None else 0
+    except (TypeError, ValueError):
+        code = 0
+    return code in (400, 413, 415, 422) and "invalid_request" in text
 
 
 async def run_ai(turn: Turn) -> None:
@@ -3549,12 +3641,34 @@ async def run_ai(turn: Turn) -> None:
         except Exception as e:
             if _is_model_not_found(e):
                 _model_blocked[model_key] = "модель недоступна в шлюзе"
-            logging.warning(f"model {model_key}: сбой ({e}); один повтор")
             if streamer is not None:
-                streamer.reset()
-            # Ровно один повтор. Если и он не удался — честно говорим,
-            # что модель недоступна, и предлагаем переключиться.
-            answer = await run_tools(messages, tools, executor, forced, **attempt_args)
+                streamer.restart()
+            if _is_transient(e) and not _is_model_not_found(e):
+                # Сетевые сбои шлюза обычно кратковременные: два повтора с
+                # паузой. Иначе пользователь зря видит «модель недоступна».
+                for wait in (2.0, 5.0):
+                    logging.warning(
+                        f"model {model_key}: временный сбой ({e}); "
+                        f"повтор через {wait:.0f}с"
+                    )
+                    await asyncio.sleep(wait)
+                    try:
+                        answer = await run_tools(
+                            messages, tools, executor, forced, **attempt_args
+                        )
+                        break
+                    except Exception as again:
+                        e = again
+                        if streamer is not None:
+                            streamer.restart()
+                else:
+                    raise
+            else:
+                # Отказ модели: ровно один повтор, потом честный переход.
+                logging.warning(f"model {model_key}: сбой ({e}); один повтор")
+                answer = await run_tools(
+                    messages, tools, executor, forced, **attempt_args
+                )
 
         if turn.explicit_draw and not turn.image_sent and not turn.image_error:
             await fallback_draw(turn)
@@ -3575,8 +3689,16 @@ async def run_ai(turn: Turn) -> None:
         footer = usage_footer(turn, rich)
         if answer:
             answer = strip_text_tool_calls(answer)
+        note = silent_reasoning_note(streamer, effort)
+        if answer and note:
+            footer = note + ("\n\n" + footer if footer else "")
         if answer:
-            if not (turn.image_sent and is_trivial(answer)):
+            if turn.image_sent and is_trivial(answer):
+                # Картинка уже отправлена. Вместо «ОК» показываем расход.
+                token_note = usage_footer(turn, False).strip()
+                if token_note:
+                    await send_text(turn, token_note)
+            else:
                 if streamer is not None:
                     await streamer.finish(answer, footer=footer)
                 else:
@@ -3809,11 +3931,17 @@ def _models_list_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         "Выбери семейство:",
     ]
     rows: list[list[InlineKeyboardButton]] = [_tab_row("models")]
+    current_family = ""
+    for key, _label, names in MODEL_FAMILIES:
+        if current in names:
+            current_family = key
+            break
     for key, label, names in MODEL_FAMILIES:
+        mark = "✅ " if key == current_family else ""
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{label} · {len(names)}",
+                    text=f"{mark}{label} · {len(names)}",
                     callback_data=f"models:fam:{key}",
                 )
             ]
@@ -3842,7 +3970,7 @@ def _models_family_view(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=model_label(key),
+                    text=("✅ " if key == current else "") + model_label(key),
                     callback_data=f"model:set:{key}",
                 )
             ]
@@ -3865,6 +3993,7 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     length = user_length(user_id)
     search_on = user_search_on(user_id)
 
+    history_len = get_history_size(int(user_id))
     lines = [
         "⚙️ <b>Режимы</b>",
         "",
@@ -3879,6 +4008,7 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         f"Размышления: <b>{EFFORT_LABELS.get(level, 'Не думать')}</b>",
         f"Длина: <b>{LENGTH_LABELS.get(length, 'Обычно')}</b>",
         f"Поиск: <b>{'включён' if search_on else 'выключен'}</b>",
+        f"Контекст: <b>{history_len} сообщений</b> из {HISTORY_LIMIT}",
     ]
     if not RICH_SUPPORTED:
         lines.append("\n⚠️ Rich-статьи недоступны на этой версии aiogram.")
@@ -3949,6 +4079,13 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         ]
     )
     rows.append(
+        [
+            InlineKeyboardButton(
+                text="🧹 Очистить контекст", callback_data="models:clear"
+            )
+        ]
+    )
+    rows.append(
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="models:tab:modes")]
     )
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
@@ -4007,7 +4144,8 @@ async def cmd_models(message: Message):
 
 @dp.callback_query(F.data.startswith("model:locked"))
 async def on_model_locked(callback: CallbackQuery):
-    key = (callback.data or "").split(":")[-1]
+    # Старые клавиатуры могли сохранить прежний id модели — приводим к каталогу.
+    key = normalize_model_key((callback.data or "").split(":")[-1])
     reason = _model_blocked.get(key)
     if reason:
         await callback.answer(f"Модель недоступна: {reason}.", show_alert=True)
@@ -4059,6 +4197,10 @@ async def on_models_callback(callback: CallbackQuery):
         state = parts[2] if len(parts) > 2 else "on"
         await save_toggle(user_id, "search", "off" if state == "off" else "on")
         tab = "modes"
+    elif action == "clear":
+        # В личке chat_id совпадает с user_id — чистим историю этого диалога.
+        await clear_chat_context(int(user_id))
+        tab = "modes"
     text, kb = await models_panel_view(user_id, tab, family)
     try:
         await callback.message.edit_text(text, reply_markup=kb)
@@ -4068,7 +4210,10 @@ async def on_models_callback(callback: CallbackQuery):
                 await callback.message.answer(text, reply_markup=kb)
             except Exception:
                 pass
-    await callback.answer()
+    if action == "clear":
+        await callback.answer("🧹 Контекст очищен")
+    else:
+        await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("model:set:"))
@@ -4255,17 +4400,41 @@ async def refresh_balance(provider: str = "gateway") -> dict:
     }
     prev = _balance.get("gateway") or {}
     try:
+        headers: dict[str, str] = {}
+        client = PROVIDER_CLIENTS.get("gateway")
+        api_key = getattr(client, "api_key", "") if client else ""
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         response = await http_client.get(
-            GATEWAY_BALANCE_URL, timeout=30, follow_redirects=True
+            GATEWAY_BALANCE_URL,
+            timeout=30,
+            follow_redirects=True,
+            headers=headers,
         )
         response.raise_for_status()
-        spent = _page_stat(response.text, "Потрачено")
-        total = _page_stat(response.text, "Лимит")
-        left = _page_stat(response.text, "Осталось")
-        if left is None and total is not None and spent is not None:
-            left = max(0, total - spent)
+        left = None
+        total = None
+        spent = None
+        # Новый шлюз отдаёт JSON: {"object":"balance","token_balance":N}.
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            for field_name in ("token_balance", "balance", "credits"):
+                value = data.get(field_name)
+                if value is not None:
+                    left = float(value)
+                    break
         if left is None:
-            raise RuntimeError("не удалось разобрать страницу баланса")
+            # Запасной путь: старая HTML-страница «Потрачено/Лимит/Осталось».
+            spent = _page_stat(response.text, "Потрачено")
+            total = _page_stat(response.text, "Лимит")
+            left = _page_stat(response.text, "Осталось")
+            if left is None and total is not None and spent is not None:
+                left = max(0, total - spent)
+        if left is None:
+            raise RuntimeError("не удалось разобрать ответ баланса")
         item["amount"] = float(left)
         item["total"] = float(total) if total else None
         item["spent"] = float(spent) if spent is not None else None
@@ -4379,66 +4548,108 @@ async def stats_text(stats: dict, period: str, flt: dict) -> str:
 
     lines = [f"📊 <b>Статистика</b> · {admin_period_label(flt)}", ""]
     lines.append(
-        f"<b>Запросы:</b> {fmt_int(stats['requests'])} · "
-        f"вызовов: {fmt_int(stats['calls'])} · "
-        f"ошибок: <b>{fmt_int(errors)}</b>"
+        "<table><thead><tr>"
+        "<th>Запросы</th><th>Вызовы</th><th>Ошибки</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{fmt_int(stats['requests'])}</td>"
+        f"<td>{fmt_int(stats['calls'])}</td>"
+        f"<td>{fmt_int(errors)}</td>"
+        "</tr></tbody></table>"
     )
     lines.append(
-        f"<b>Токены:</b> {fmt_int(total_tokens)} · "
-        f"кредиты: <b>{stats['credits']:.4f}</b> · "
-        f"задержка: <b>{fmt_int(stats['avg_latency'])} мс</b>"
+        "<table><thead><tr>"
+        "<th>Токены</th><th>Кредиты</th><th>Задержка</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{fmt_int(total_tokens)}</td>"
+        f"<td>{stats['credits']:.4f}</td>"
+        f"<td>{fmt_int(stats['avg_latency'])} мс</td>"
+        "</tr></tbody></table>"
     )
     lines.append(
-        f"<b>Сегодня:</b> {fmt_int(today_total)} запросов у "
-        f"{fmt_int(today_users)} чел. · лимит {limit}/день"
+        "<table><thead><tr>"
+        "<th>Сегодня</th><th>Люди</th><th>Лимит</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{fmt_int(today_total)}</td>"
+        f"<td>{fmt_int(today_users)}</td>"
+        f"<td>{limit}/день</td>"
+        "</tr></tbody></table>"
     )
     lines.append("")
 
-    lines.append("<b>Модели:</b>")
+    lines.append("<b>Модели</b>")
     if models:
+        rows = []
         for m in models:
-            lines.append(
-                f"• <code>{esc(m['model'])}</code> — "
-                f"{fmt_int(m['calls'])} выз., {fmt_int(m['total_tokens'])} ток."
+            rows.append(
+                "<tr>"
+                f"<td>{esc(m['model'])}</td>"
+                f"<td>{fmt_int(m['calls'])}</td>"
+                f"<td>{fmt_int(m['total_tokens'])}</td>"
+                "</tr>"
             )
+        lines.append(
+            "<table><thead><tr>"
+            "<th>Модель</th><th>Вызовы</th><th>Токены</th>"
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+        )
     else:
-        lines.append("• пока нет данных")
+        lines.append("<p>Пока нет данных.</p>")
     lines.append("")
 
-    lines.append("<b>Люди:</b>")
+    lines.append("<b>Люди</b>")
     top_users = (stats.get("top_users") or [])[:7]
     await resolve_user_names([u.get("user_id") for u in top_users])
     if top_users:
+        rows = []
         for u in top_users:
-            lines.append(
-                f"• {user_tag(u['user_id'], u.get('username', ''))} — "
-                f"{fmt_int(u['requests'])}"
+            rows.append(
+                "<tr>"
+                f"<td>{user_tag(u['user_id'], u.get('username', ''))}</td>"
+                f"<td>{fmt_int(u['requests'])}</td>"
+                "</tr>"
             )
+        lines.append(
+            "<table><thead><tr>"
+            "<th>Кто</th><th>Запросы</th>"
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+        )
     else:
-        lines.append("• пока нет")
+        lines.append("<p>Пока нет данных.</p>")
     lines.append("")
 
-    lines.append("<b>Чаты:</b>")
+    lines.append("<b>Чаты</b>")
     if stats.get("top_chats"):
+        rows = []
         for c in (stats.get("top_chats") or [])[:7]:
             chat_id = c["chat_id"]
             title = (_groups_cache.get(int(chat_id)) or {}).get("title") or ""
-            name = (
-                f"<b>{esc(title)}</b> · <code>{chat_id}</code>"
-                if title
-                else f"<code>{chat_id}</code>"
+            name = esc(title) if title else f"<code>{chat_id}</code>"
+            rows.append(
+                "<tr>"
+                f"<td>{name} · {esc(c['chat_type'])}</td>"
+                f"<td>{fmt_int(c['requests'])}</td>"
+                "</tr>"
             )
-            lines.append(f"• {name} ({esc(c['chat_type'])}) — {fmt_int(c['requests'])}")
+        lines.append(
+            "<table><thead><tr>"
+            "<th>Чат</th><th>Запросы</th>"
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+        )
     else:
-        lines.append("• пока нет")
+        lines.append("<p>Пока нет данных.</p>")
     lines.append("")
 
     ctx = stats.get("contexts") or {}
+    lines.append("<b>Контекст</b>")
     lines.append(
-        f"<b>Контекст:</b> {fmt_int(ctx.get('chats', 0))} чатов, "
-        f"{fmt_int(ctx.get('messages', 0))} сообщений"
+        "<table><thead><tr>"
+        "<th>Чатов</th><th>Сообщений</th><th>В группах</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{fmt_int(ctx.get('chats', 0))}</td>"
+        f"<td>{fmt_int(ctx.get('messages', 0))}</td>"
+        f"<td>{fmt_int(stats['group_messages'])}</td>"
+        "</tr></tbody></table>"
     )
-    lines.append(f"<b>Группы:</b> {fmt_int(stats['group_messages'])} сообщений")
     lines.append("")
     lines.append(balance_block())
     lines.append(
@@ -4857,8 +5068,10 @@ async def send_admin_article(
             logging.warning(f"admin rich send failed: {e}; fallback to text")
     if sent is None:
         try:
+            # В обычном сообщении <table> недопустим: переводим статью в текст.
+            plain = classic_from_rich(text) or plain_from_rich(text) or text
             sent = await bot.send_message(
-                chat_id, text, reply_markup=kb, disable_web_page_preview=True
+                chat_id, plain, reply_markup=kb, disable_web_page_preview=True
             )
         except Exception as e:
             logging.warning(f"admin text send failed: {e}")
@@ -5884,7 +6097,12 @@ async def process_gateway_photos(
     started: float,
     model_key: str,
 ) -> None:
-    """Все 66 моделей шлюза видят фото сами — без двухшагового описания."""
+    """Модели шлюза сами видят фото — без двухшагового описания.
+
+    Не все модели каталога принимают картинки: если шлюз ответил
+    invalid_request на изображение, ниже сработает запасной путь через
+    описание Gemini (см. процесс фото в on_photo).
+    """
     first = messages[0]
     chat_id = first.chat.id
     private = is_private(first)
@@ -5960,19 +6178,55 @@ async def process_gateway_photos(
         async def executor(name, args):
             return await execute_tool(turn, name, args)
 
-        answer = await run_tools(
-            model_messages,
-            tools,
-            executor,
-            forced,
-            provider="gateway",
-            track=track,
-            effort=effort,
-            model=MODEL_REGISTRY[model_key]["model"],
-            on_delta=streamer.on_delta if streamer else None,
-            reset_cb=streamer.reset if streamer else None,
-            max_tokens=max_tokens,
-        )
+        async def ask_with(payload_messages: list[dict]) -> str:
+            return await run_tools(
+                payload_messages,
+                tools,
+                executor,
+                forced,
+                provider="gateway",
+                track=track,
+                effort=effort,
+                model=MODEL_REGISTRY[model_key]["model"],
+                on_delta=streamer.on_delta if streamer else None,
+                reset_cb=streamer.reset if streamer else None,
+                max_tokens=max_tokens,
+            )
+
+        try:
+            answer = await ask_with(model_messages)
+        except Exception as e:
+            if not _is_image_rejected(e):
+                raise
+            # Некоторые модели каталога не принимают картинки: описываем их
+            # через Gemini и повторяем запрос уже текстом.
+            logging.warning(
+                f"Gateway rejected photos ({type(e).__name__}: {e}); "
+                f"перехожу на описание"
+            )
+            if streamer is not None:
+                streamer.reset()
+            await turn.status.show("🧩 Описываю фото…")
+            descriptions: list[tuple[int, str]] = []
+            for index, (mime, data) in enumerate(images, 1):
+                try:
+                    desc = await describe_image(data, mime, track=track)
+                except Exception as exc:
+                    logging.warning(f"Photo {index} describe failed: {exc}")
+                    desc = ""
+                if desc:
+                    descriptions.append((index, desc.strip()))
+            if not descriptions:
+                raise
+            text_parts = [prompt_text]
+            for index, desc in descriptions:
+                text_parts.append(f"Описание фото {index}:\n{desc}")
+            text_messages = [
+                {"role": "system", "content": system_prompt(rich, length)}
+            ] + [
+                dict(m) for m in history_for_model(chat_id, model_key)
+            ] + [{"role": "user", "content": "\n\n".join(text_parts)}]
+            answer = await ask_with(text_messages)
 
         photo_label = "фото" if len(images) == 1 else f"фото ({len(images)})"
         history_entry = (
@@ -6008,8 +6262,15 @@ async def process_gateway_photos(
         footer = usage_footer(turn, rich)
         if answer:
             answer = strip_text_tool_calls(answer)
+        note = silent_reasoning_note(streamer, effort)
+        if answer and note:
+            footer = note + ("\n\n" + footer if footer else "")
         if answer:
-            if not (turn.image_sent and is_trivial(answer)):
+            if turn.image_sent and is_trivial(answer):
+                token_note = usage_footer(turn, False).strip()
+                if token_note:
+                    await send_text(turn, token_note)
+            else:
                 if streamer is not None:
                     await streamer.finish(answer, footer=footer)
                 else:
@@ -6528,6 +6789,13 @@ async def main() -> None:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         logging.exception("delete_webhook failed")
+    try:
+        # Раньше тут висела кнопка «Админка» (Mini App). Возвращаем обычное
+        # меню команд — иначе Telegram продолжает показывать кнопку.
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logging.info("Menu button reset to commands")
+    except Exception:
+        logging.exception("set_chat_menu_button failed")
 
     tasks.append(asyncio.create_task(daily_summary_loop()))
     tasks.append(asyncio.create_task(balances_loop()))
