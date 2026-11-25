@@ -1,4 +1,4 @@
-"""Клиент для OpenAI-совместимых API (DeepSeek через aikeysforyou, Qwen через voidluv).
+"""Клиент для OpenAI-совместимого шлюза (66 моделей).
 
 Умеет обычные ответы и SSE-стриминг с накоплением текста, мыслей и tool-call'ов.
 """
@@ -128,11 +128,10 @@ class DeepSeekClient:
             "messages": messages,
             "max_tokens": int(max_tokens),
         }
-        if effort and effort != "off":
-            payload["thinking"] = {"type": "enabled"}
+        if effort in ("medium", "high"):
+            # Уровень «off» вообще не отправляем: шлюз отвечает 500 на
+            # reasoning_effort = "off". Без параметра модель думает по умолчанию.
             payload["reasoning_effort"] = effort
-        else:
-            payload["thinking"] = {"type": "disabled"}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
@@ -155,7 +154,7 @@ class DeepSeekClient:
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
         max_tokens: int = 4000,
-        effort: str = "low",
+        effort: str = "medium",
         model: str | None = None,
         on_delta=None,
     ) -> ChatResult:

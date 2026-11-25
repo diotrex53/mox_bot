@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     rich BOOLEAN NOT NULL DEFAULT TRUE,
     deepthink TEXT NOT NULL DEFAULT 'off',
     search TEXT NOT NULL DEFAULT 'auto',
+    length TEXT NOT NULL DEFAULT 'normal',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -168,6 +169,8 @@ CREATE TABLE IF NOT EXISTS admin_actions (
 # Миграция старых данных DeepSeek в общие таблицы. После успешного копирования
 # старые строки удаляются, чтобы отозванные гранты не возвращались при рестарте.
 MIGRATIONS = """
+ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS length TEXT NOT NULL DEFAULT 'normal';
+
 INSERT INTO provider_grants (user_id, provider, username, full_name, granted_by, granted_at)
 SELECT user_id, 'deepseek', username, full_name, granted_by, granted_at
 FROM deepseek_grants
@@ -582,14 +585,16 @@ class Storage:
         try:
             if self.available:
                 rows = await self.pool.fetch(
-                    "SELECT user_id, model, rich, deepthink, search FROM user_settings"
+                    "SELECT user_id, model, rich, deepthink, search, length "
+                    "FROM user_settings"
                 )
                 self._user_settings = {
                     int(r["user_id"]): {
                         "model": r["model"] or "groq",
                         "rich": bool(r["rich"]),
                         "deepthink": r["deepthink"] or "off",
-                        "search": r["search"] or "auto",
+                        "search": r["search"] or "on",
+                        "length": r["length"] or "normal",
                     }
                     for r in rows
                 }
@@ -599,13 +604,19 @@ class Storage:
             return dict(self._user_settings)
 
     async def save_user_settings(self, user_id: int, **fields) -> None:
-        allowed = {"model", "rich", "deepthink", "search"}
+        allowed = {"model", "rich", "deepthink", "search", "length"}
         values = {k: v for k, v in fields.items() if k in allowed}
         if not values:
             return
         current = self._user_settings.setdefault(
             int(user_id),
-            {"model": "groq", "rich": True, "deepthink": "off", "search": "auto"},
+            {
+                "model": "groq",
+                "rich": True,
+                "deepthink": "off",
+                "search": "on",
+                "length": "normal",
+            },
         )
         current.update(values)
         try:
