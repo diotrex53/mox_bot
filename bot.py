@@ -103,8 +103,10 @@ GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
 TAVILY_API_KEY = os.environ.get("TAVIL_API", "")
 
 # ---- Универсальный шлюз ------------------------------------------------
-# Один ключ на весь каталог aikeysforyou: DeepSeek, Qwen, GPT, Claude,
-# Kimi, GLM, Grok, Nemotron, MiniMax, Hunyuan, MiMo. Ключ живёт в env Render.
+# Ключ aikeysforyou открывает не весь каталог: в /v1/models у провайдера 37
+# моделей, но ключ разрешает только DeepSeek-flash (остальные отдают
+# 403 model_not_allowed). В меню держим только то, что реально работает,
+# чтобы не показывать заведомо нерабочие кнопки. Ключ живёт в env Render.
 GATEWAY_API_KEY = os.environ.get("GATEWAY_API", "")
 GATEWAY_BASE_URL = os.environ.get(
     "GATEWAY_BASE_URL", "https://api.aikeysforyou.com/v1"
@@ -115,85 +117,18 @@ GATEWAY_BALANCE_URL = os.environ.get(
 )
 DEFAULT_GATEWAY_MODEL = "deepseek-v4.1-flash-1017"
 
-# 12 семейств — ровно 37 моделей нового шлюза aikeysforyou.
-# Порядок в меню — как здесь. В каталоге шлюза есть и другие id (алиасы),
-# но эти перечислены в /v1/models и снабжены метаданными.
+# Только модели, которые этот ключ реально принимает и которые отвечают
+# прямо сейчас (проверено живыми запросами 26.11.2026).
+# deepseek-v4-flash-0731 временно отдаёт 503 capacity_unavailable — вернём,
+# когда шлюз его оживит. Новые рабочие модели добавляй сюда же.
 MODEL_FAMILIES: list[tuple[str, str, list[str]]] = [
     (
         "deepseek",
         "DeepSeek",
         [
             "deepseek-v4.1-flash-1017",
-            "deepseek-v4.1-flash-1017-abliterated",
-            "deepseek-v4-flash-0731",
-            "deepseek-v4-pro-0813",
+            "deepseek-v4.1-flash",
         ],
-    ),
-    (
-        "gpt",
-        "GPT",
-        [
-            "gpt-6.2-astra",
-            "gpt-6.2-sol",
-            "gpt-6-astra",
-            "gpt-6.1-sol",
-            "gpt-6.1-terra",
-            "gpt-6-sol",
-            "gpt-6-luna",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-        ],
-    ),
-    (
-        "claude",
-        "Claude",
-        ["claude-fable-5-2", "claude-fable-5-1", "claude-fable-5"],
-    ),
-    (
-        "glm",
-        "GLM",
-        ["glm-5.4", "glm-5.3", "glm-5.3-flash"],
-    ),
-    (
-        "grok",
-        "Grok",
-        ["grok-4.7", "grok-4.6", "grok-4.5", "composer-2.5-fast"],
-    ),
-    (
-        "qwen",
-        "Qwen",
-        ["qwen3.8-max", "qwen3.8-flash"],
-    ),
-    (
-        "kimi",
-        "Kimi",
-        ["kimi-k3.1-pro", "kimi-k3", "kimi-k2.8-preview"],
-    ),
-    (
-        "nemotron",
-        "Nemotron",
-        ["nemotron-3-ultra", "nemotron-3.5-lightning", "nemotron-3.5-super-vl"],
-    ),
-    (
-        "minimax",
-        "MiniMax",
-        ["minimax-m3.1-flash"],
-    ),
-    (
-        "hunyuan",
-        "Hunyuan",
-        ["hy4flash"],
-    ),
-    (
-        "mimo",
-        "MiMo",
-        ["mimo-v2.6-pro", "mimo-v2.6-flash"],
-    ),
-    (
-        "muse",
-        "Muse",
-        ["muse-ember"],
     ),
 ]
 
@@ -215,15 +150,9 @@ MODEL_REGISTRY["groq"] = {
     "family": "groq",
 }
 
-# Ключи из старых сохранённых настроек (в базе могли остаться старые id).
-MODEL_ALIASES = {
-    "deepseek": "deepseek-v4.1-flash-1017",
-    "qwen": "qwen3.8-max",
-    "qwen4-max": "qwen3.8-max",
-    "qwen3.8-flash": "qwen3.8-flash",
-    "gpt-6.1-sol": "gpt-6.1-sol",
-    "claude-opus-5-5": "claude-fable-5-2",
-}
+# Короткие имена из старых настроек. Остальные устаревшие id вылечивает
+# user_settings(): неизвестная модель заменяется на рабочую по умолчанию.
+MODEL_ALIASES = {"deepseek": DEFAULT_GATEWAY_MODEL}
 GATEWAY_MODELS = [
     name for _key, _label, names in MODEL_FAMILIES for name in names
 ]
@@ -232,13 +161,11 @@ PROVIDER_LIMITS = {"gateway": 25}
 PROVIDER_NAMES = {"gateway": "Премиум", "groq": "Groq"}
 
 # Думают, но не показывают мысли текстом — честно предупреждаем.
-SILENT_REASONING_MODELS = {
-    # Каталог помечает обе модели как «без reasoning»: они отвечают сразу.
-    "composer-2.5-fast",
-    "deepseek-v4-flash-0731",
-}
-# Эта модель думает всегда — переключатель размышлений ей не нужен.
-ALWAYS_REASONING_MODELS = {"qwen3.8-flash"}
+# Среди двух рабочих моделей таких нет, механизм оставлен на будущее.
+SILENT_REASONING_MODELS: set[str] = set()
+# Модели, которые думают всегда: переключатель размышлений им не нужен.
+# Сейчас таких в каталоге нет, но механизм оставлен на будущее.
+ALWAYS_REASONING_MODELS: set[str] = set()
 
 PREMIUM_HISTORY_CHARS_LIMIT = 60000
 PREMIUM_MAX_TOKENS = 32000
@@ -255,6 +182,16 @@ LENGTH_ORDER = ["short", "normal", "long", "max"]
 LENGTH_TOKENS = {"short": 600, "normal": 2000, "long": 6000, "max": 32000}
 EFFORT_LABELS = {"off": "Не думать", "medium": "Думать", "high": "Думать долго"}
 EFFORT_ORDER = ["off", "medium", "high"]
+
+
+def plural_ru(count: int, one: str, few: str, many: str) -> str:
+    """Русское склонение по числу: 1 модель, 2 модели, 5 моделей."""
+    count = abs(int(count))
+    if count % 10 == 1 and count % 100 != 11:
+        return one
+    if 2 <= count % 10 <= 4 and count % 100 not in (12, 13, 14):
+        return few
+    return many
 
 OWNER_ID = 6101597477
 OWNER_USERNAME = "Diotrex"
@@ -323,7 +260,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
-APP_BUILD = "2026-11-25 aikeys-37-tables-menu-clear"
+APP_BUILD = "2026-11-26 aikeys-2-live-models-admin-tables"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -821,6 +758,10 @@ def user_settings(user_id: int | None) -> dict:
     settings = _user_settings.setdefault(int(user_id), dict(DEFAULT_SETTINGS))
     # Мягко переносим настройки из старых версий.
     model = normalize_model_key(settings.get("model"))
+    if model not in MODEL_REGISTRY:
+        # Модель исчезла из каталога шлюза — не роняем человека на Groq,
+        # а возвращаем рабочую модель по умолчанию.
+        model = DEFAULT_GATEWAY_MODEL
     if model and settings.get("model") != model:
         settings["model"] = model
     if settings.get("deepthink") == "low":
@@ -882,14 +823,11 @@ def model_label(model_key: str) -> str:
     return info["label"] if info else str(model_key)
 
 
-# Один и тот же апстрим приходит под разными id: deepseek-v4.1-flash и
-# deepseek-v4.1-flash-1017, openai/gpt-oss-120b и gpt-oss-120b.
-MODEL_DISPLAY_ALIASES = {
-    "deepseek-v4.1-flash-1017": "deepseek-v4.1-flash",
-    "deepseek-v4.1-flash-1017-abliterated": "deepseek-v4.1-flash (abliterated)",
-    "deepseek-v4-flash-0731": "deepseek-v4-flash",
-    "deepseek-v4-flash-0731-abliterated": "deepseek-v4-flash (abliterated)",
-}
+# Раньше один апстрим приходил под разными id и статистика их склеивала.
+# Теперь id в каталоге различаются, поэтому склейка пустая: в статистике
+# видно ровно ту модель, что выбрана. Префикс «provider/» по-прежнему
+# отрезается в canonical_model_name().
+MODEL_DISPLAY_ALIASES: dict[str, str] = {}
 
 
 def canonical_model_name(name: str) -> str:
@@ -3853,10 +3791,14 @@ async def cmd_about(message: Message):
     await reply_any(
         message,
         "🌿 <b>Мудрый Мох — информация</b>\n\n"
-        f"<b>🧩 Модели:</b> {len(GATEWAY_MODELS)} в {len(MODEL_FAMILIES)} семействах\n"
+        f"<b>🧩 Модели:</b> {len(GATEWAY_MODELS)} "
+        f"{plural_ru(len(GATEWAY_MODELS), 'модель', 'модели', 'моделей')} "
+        f"в {len(MODEL_FAMILIES)} "
+        f"{plural_ru(len(MODEL_FAMILIES), 'семействе', 'семействах', 'семействах')}\n"
         f"{family_lines}\n{current_line}\n\n"
         "<b>👁 Фото:</b>\n"
-        "• Все модели шлюза видят фото сами\n"
+        "• Модели DeepSeek видят фото сами\n"
+        "• Если модель не принимает картинку — опишем через Gemini и ответим текстом\n"
         f"• На ветке Groq — <code>{VISION_MODEL}</code> (Gemini), "
         f"резерв <code>{GROQ_VISION_MODEL}</code>\n\n"
         "<b>🎙 Голос:</b>\n"
@@ -3922,30 +3864,52 @@ def _family_models(family: str) -> list[str]:
 
 def _models_list_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     current = selected_model(user_id)
+    models_n = len(GATEWAY_MODELS)
+    families_n = len(MODEL_FAMILIES)
+    models_word = plural_ru(models_n, "модель", "модели", "моделей")
     lines = [
         "🧩 <b>Модели</b>",
         "",
         f"Сейчас: <b>{esc(model_label(current))}</b>",
         "",
-        f"{len(GATEWAY_MODELS)} моделей в {len(MODEL_FAMILIES)} семействах. "
-        "Выбери семейство:",
     ]
     rows: list[list[InlineKeyboardButton]] = [_tab_row("models")]
-    current_family = ""
-    for key, _label, names in MODEL_FAMILIES:
-        if current in names:
-            current_family = key
-            break
-    for key, label, names in MODEL_FAMILIES:
-        mark = "✅ " if key == current_family else ""
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{mark}{label} · {len(names)}",
-                    callback_data=f"models:fam:{key}",
-                )
-            ]
+    if families_n == 1:
+        # Одно семейство — незачем открывать его отдельным шагом.
+        _key, _label, names = MODEL_FAMILIES[0]
+        lines.append(f"{models_n} {models_word} на твоём ключе. Выбери:")
+        for key in names:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=("✅ " if key == current else "") + model_label(key),
+                        callback_data=f"model:set:{key}",
+                    )
+                ]
+            )
+    else:
+        families_word = plural_ru(
+            families_n, "семействе", "семействах", "семействах"
         )
+        lines.append(
+            f"{models_n} {models_word} в {families_n} {families_word}. "
+            "Выбери семейство:"
+        )
+        current_family = ""
+        for key, _label, names in MODEL_FAMILIES:
+            if current in names:
+                current_family = key
+                break
+        for key, label, names in MODEL_FAMILIES:
+            mark = "✅ " if key == current_family else ""
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{mark}{label} · {len(names)}",
+                        callback_data=f"models:fam:{key}",
+                    )
+                ]
+            )
     rows.append(
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="models:tab:models")]
     )
@@ -3957,6 +3921,9 @@ def _models_family_view(
 ) -> tuple[str, InlineKeyboardMarkup]:
     label = FAMILY_LABELS.get(family, family)
     models = _family_models(family)
+    if not models:
+        # Старая клавиатура могла ссылаться на семейство, которого больше нет.
+        return _models_list_view(user_id)
     current = selected_model(user_id)
     lines = [
         f"🧩 <b>{esc(label)}</b>",
@@ -4101,7 +4068,7 @@ async def _models_access_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     lines = [
         "🔑 <b>Доступ</b>",
         "",
-        "Все модели шлюза доступны каждому: 25 запросов в день суммарно.",
+        "Доступные на ключе модели открыты каждому: 25 запросов в день суммарно.",
         f"👑 Владелец: <a href=\"https://t.me/{OWNER_USERNAME}\">@{OWNER_USERNAME}</a> — безлимит",
         "",
         f"Моделей: <b>{len(GATEWAY_MODELS)}</b>",
@@ -4500,14 +4467,22 @@ def admin_main_text() -> str:
     today_users = len({uid for (uid, _prov) in usage})
     return (
         "🛠 <b>Админ-панель Мудрого Мха</b>\n\n"
-        f"Модель в твоей ЛС: <b>{esc(model_label(current))}</b>\n"
-        f"Шлюз: <b>{'настроен' if configured else 'нет GATEWAY_API'}</b> · "
-        f"{len(GATEWAY_MODELS)} моделей\n"
-        f"Сегодня: <b>{fmt_int(today_total)}</b> запросов у "
-        f"<b>{fmt_int(today_users)}</b> чел. "
-        f"(лимит {PROVIDER_LIMITS.get('gateway', 25)}/день)\n"
-        f"Групп в белом списке: <b>{len(_groups_cache)}</b>\n"
-        f"Заблокировано ЛС: <b>{len(_dm_blacklist)}</b>\n"
+        f"Модель в твоей ЛС: <b>{esc(model_label(current))}</b>\n\n"
+        "<table><thead><tr>"
+        "<th>Шлюз</th><th>Модели</th><th>Лимит</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{'настроен' if configured else 'нет ключа'}</td>"
+        f"<td>{len(GATEWAY_MODELS)}</td>"
+        f"<td>{PROVIDER_LIMITS.get('gateway', 25)}/день</td>"
+        "</tr></tbody></table>\n\n"
+        "<table><thead><tr>"
+        "<th>Сегодня</th><th>Люди</th><th>Групп</th><th>Блок</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{fmt_int(today_total)}</td>"
+        f"<td>{fmt_int(today_users)}</td>"
+        f"<td>{len(_groups_cache)}</td>"
+        f"<td>{len(_dm_blacklist)}</td>"
+        "</tr></tbody></table>\n\n"
         f"💰 {balance_short()}\n\n"
         f"{db_usage_line(_db_size_cache)}\n\n"
         "Выбери раздел:"
@@ -4686,22 +4661,32 @@ def model_text() -> str:
         "",
         f"Сейчас: <b>{esc(model_label(current))}</b>",
         "",
-        "Выбери семейство:",
+        "Выбери модель:" if len(MODEL_FAMILIES) == 1 else "Выбери семейство:",
     ]
     return "\n".join(lines)
 
 
 def model_kb() -> InlineKeyboardMarkup:
     rows = []
-    for key, label, names in MODEL_FAMILIES:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{label} · {len(names)}",
-                    callback_data=f"adm:fam:{key}",
-                )
-            ]
-        )
+    if len(MODEL_FAMILIES) == 1:
+        for key in _family_models(MODEL_FAMILIES[0][0]):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=model_label(key), callback_data=f"adm:mset:{key}"
+                    )
+                ]
+            )
+    else:
+        for key, label, names in MODEL_FAMILIES:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{label} · {len(names)}",
+                        callback_data=f"adm:fam:{key}",
+                    )
+                ]
+            )
     rows.append([InlineKeyboardButton(text="🌿 Groq", callback_data="adm:mset:groq")])
     rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main")])
     return admin_kb(rows)
@@ -4758,11 +4743,25 @@ def paginator_kb(prefix: str, page: int, total: int, back: str = "adm:main") -> 
 def groups_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
     groups = sorted(_groups_cache.values(), key=lambda g: (g.get("title") or "").lower())
     page_items, page, total = paginate(groups, page)
-    lines = [f"👥 <b>Белый список групп</b> · всего {len(groups)}", ""]
-    if not groups:
-        lines.append("Список пуст.")
-    for g in page_items:
-        lines.append(f"• <b>{esc(g.get('title') or 'без названия')}</b>\n  <code>{g['chat_id']}</code>")
+    lines = [
+        f"👥 <b>Белый список групп</b> · всего {len(groups)}",
+        "",
+    ]
+    if page_items:
+        table_rows = "".join(
+            "<tr>"
+            f"<td>{esc(g.get('title') or 'без названия')}</td>"
+            f"<td><code>{g['chat_id']}</code></td>"
+            "</tr>"
+            for g in page_items
+        )
+        lines.append(
+            "<table><thead><tr><th>Группа</th><th>ID</th></tr></thead><tbody>"
+            + table_rows
+            + "</tbody></table>"
+        )
+    else:
+        lines.append("<p>Список пуст.</p>")
     rows = [
         [InlineKeyboardButton(text="➕ Добавить группу", callback_data="adm:gadd")]
     ]
@@ -4781,12 +4780,25 @@ def blacklist_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
         key=lambda x: x.get("added_at") or datetime.min.replace(tzinfo=timezone.utc),
     )
     page_items, page, total = paginate(items, page)
-    lines = [f"🚫 <b>Чёрный список ЛС</b> · всего {len(items)}", ""]
-    if not items:
-        lines.append("Список пуст.")
-    for u in page_items:
-        name = u.get("full_name") or u.get("username") or "без имени"
-        lines.append(f"• <b>{esc(name)}</b>\n  <code>{u['user_id']}</code>")
+    lines = [
+        f"🚫 <b>Чёрный список ЛС</b> · всего {len(items)}",
+        "",
+    ]
+    if page_items:
+        table_rows = "".join(
+            "<tr>"
+            f"<td>{esc(u.get('full_name') or u.get('username') or 'без имени')}</td>"
+            f"<td><code>{u['user_id']}</code></td>"
+            "</tr>"
+            for u in page_items
+        )
+        lines.append(
+            "<table><thead><tr><th>Кто</th><th>ID</th></tr></thead><tbody>"
+            + table_rows
+            + "</tbody></table>"
+        )
+    else:
+        lines.append("<p>Список пуст.</p>")
     rows = [[InlineKeyboardButton(text="➕ Заблокировать", callback_data="adm:bladd")]]
     for u in page_items:
         name = (u.get("full_name") or u.get("username") or str(u["user_id"]))[:25]
@@ -4815,18 +4827,33 @@ async def access_view(provider: str = "gateway", page: int = 0) -> tuple[str, In
     lines = [
         "🔑 <b>Доступ к шлюзу</b>",
         "",
-        "Все модели открыты каждому: 25 запросов в день суммарно.",
+        "Доступные модели открыты каждому: 25 запросов в день суммарно.",
         f"👑 Владелец: <code>{OWNER_ID}</code> — безлимит",
-        f"Сегодня израсходовано: <b>{fmt_int(total_today)}</b> у "
-        f"<b>{fmt_int(len(items))}</b> чел.",
+        "",
+        "<table><thead><tr>"
+        "<th>Сегодня</th><th>Люди</th><th>Лимит</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{fmt_int(total_today)}</td>"
+        f"<td>{fmt_int(len(items))}</td>"
+        f"<td>{limit}/день</td>"
+        "</tr></tbody></table>",
         "",
     ]
-    if not items:
-        lines.append("Сегодня ещё никто не пользовался.")
-    for u in page_items:
-        lines.append(
-            f"• {user_tag(u['user_id'])} — {u['requests']}/{limit}"
+    if page_items:
+        table_rows = "".join(
+            "<tr>"
+            f"<td>{user_tag(u['user_id'])}</td>"
+            f"<td>{u['requests']}/{limit}</td>"
+            "</tr>"
+            for u in page_items
         )
+        lines.append(
+            "<table><thead><tr><th>Кто</th><th>Израсходовано</th></tr></thead><tbody>"
+            + table_rows
+            + "</tbody></table>"
+        )
+    else:
+        lines.append("<p>Сегодня ещё никто не пользовался.</p>")
     rows: list[list[InlineKeyboardButton]] = []
     if items:
         rows.append(paginator_kb("adm:acc:gateway", page, total))
@@ -4862,46 +4889,77 @@ async def requests_view_async(page: int, flt: dict) -> tuple[str, InlineKeyboard
 
     lines = [
         f"📝 <b>Последние запросы</b> · {admin_period_label(flt)}",
-        f"Фильтры: пользователь <code>{flt.get('user_id') or 'все'}</code>, "
-        f"модель <code>{flt.get('model') or 'все'}</code>",
-        f"Всего: <b>{fmt_int(total)}</b>",
+        "",
+        "<table><thead><tr>"
+        "<th>Всего</th><th>Страница</th><th>Модель</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{fmt_int(total)}</td>"
+        f"<td>{page + 1} из {total_pages}</td>"
+        f"<td>{esc(flt.get('model') or 'все')}</td>"
+        "</tr></tbody></table>",
         "",
     ]
     if not rows:
-        lines.append("Ничего не найдено.")
+        lines.append("<p>Ничего не найдено.</p>")
     await resolve_user_names([r.get("user_id") for r in rows if r.get("user_id")])
-    for r in rows:
-        created = r.get("created_at")
-        if isinstance(created, datetime):
-            created = created.astimezone(MSK).strftime("%d.%m %H:%M")
-        status = r.get("status") or "?"
-        if status == "logged":
-            icon = "📝"
-        elif status == "ok":
-            icon = "✅"
-        elif status == "running":
-            icon = "⏳"
-        else:
-            icon = "❌"
-        who = (
-            user_tag(r.get("user_id"), r.get("username") or "")
-            if r.get("user_id")
-            else "—"
-        )
-        prompt = (r.get("prompt_preview") or "").replace("\n", " ")[:100]
+    if rows:
+        table_rows: list[str] = []
+        details: list[str] = []
+        for r in rows:
+            created = r.get("created_at")
+            if isinstance(created, datetime):
+                created = created.astimezone(MSK).strftime("%d.%m %H:%M")
+            elif not created:
+                created = "—"
+            status = r.get("status") or "?"
+            if status == "logged":
+                icon = "📝"
+            elif status == "ok":
+                icon = "✅"
+            elif status == "running":
+                icon = "⏳"
+            else:
+                icon = "❌"
+            who = (
+                user_tag(r.get("user_id"), r.get("username") or "")
+                if r.get("user_id")
+                else "—"
+            )
+            model_name = (r.get("model") or "—")[:28]
+            table_rows.append(
+                "<tr>"
+                f"<td>{icon} {created}</td>"
+                f"<td>{who}</td>"
+                f"<td>{esc(model_name)}</td>"
+                f"<td>{fmt_int(r.get('tokens') or 0)}</td>"
+                "</tr>"
+            )
+            prompt = (r.get("prompt_preview") or "").replace("\n", " ")[:120]
+            extra = []
+            if r.get("kind"):
+                extra.append(esc(r.get("kind")))
+            if r.get("latency_ms"):
+                extra.append(f"{fmt_int(r.get('latency_ms'))} мс")
+            if r.get("tools"):
+                extra.append("🛠 " + esc(r["tools"])[:60])
+            tail = (" · " + " · ".join(extra)) if extra else ""
+            detail = f"<p><b>#{r.get('id')}</b>{tail}"
+            if prompt:
+                detail += " · " + esc(prompt)
+            details.append(detail + "</p>")
+            if r.get("error"):
+                details.append(
+                    "<p>⚠️ " + esc((r.get("error") or "")[:120]) + "</p>"
+                )
         lines.append(
-            f"{icon} <b>#{r.get('id')}</b> {created} · {esc(r.get('kind') or '?')} · "
-            f"{esc(r.get('model') or '—')}\n"
-            f"  {who} · "
-            f"чат <code>{r.get('chat_id') or '—'}</code> · "
-            f"{fmt_int(r.get('tokens') or 0)} ток."
-            + (f" · {fmt_int(r.get('latency_ms') or 0)} мс" if r.get("latency_ms") else "")
-            + f"\n  {esc(prompt)}"
+            "<table><thead><tr>"
+            "<th>Когда</th><th>Кто</th><th>Модель</th><th>Токены</th>"
+            "</tr></thead><tbody>" + "".join(table_rows) + "</tbody></table>"
         )
-        if r.get("tools"):
-            lines.append(f"  🛠 {esc(r['tools'])}")
-        if r.get("error"):
-            lines.append(f"  ⚠️ {esc((r.get('error') or '')[:120])}")
+        lines.append("")
+        lines.append("<b>Детали</b>")
+        lines.append("")
+        lines.extend(details)
     rows_kb = [
         [
             InlineKeyboardButton(text="🔎 Фильтры", callback_data="adm:filter"),
@@ -4913,16 +4971,22 @@ async def requests_view_async(page: int, flt: dict) -> tuple[str, InlineKeyboard
         ],
         paginator_kb("adm:req", page, total_pages),
     ]
-    return "\n".join(lines)[:4000], admin_kb(rows_kb)
+    return "\n".join(lines), admin_kb(rows_kb)
 
 
 def filter_view(flt: dict) -> tuple[str, InlineKeyboardMarkup]:
-    text = (
-        "🔎 <b>Фильтры запросов</b>\n\n"
-        f"Период: <b>{admin_period_label(flt)}</b>\n"
-        f"Пользователь: <code>{flt.get('user_id') or 'все'}</code>\n"
-        f"Модель: <code>{flt.get('model') or 'все'}</code>"
-    )
+    rows_html = [
+        "<table><thead><tr><th>Фильтр</th><th>Значение</th></tr></thead><tbody>",
+        f"<tr><td>Период</td><td>{admin_period_label(flt)}</td></tr>",
+        f"<tr><td>Пользователь</td><td>{esc(flt.get('user_id') or 'все')}</td></tr>",
+        f"<tr><td>Модель</td><td>{esc(flt.get('model') or 'все')}</td></tr>",
+    ]
+    if flt.get("date_from"):
+        rows_html.append(
+            f"<tr><td>Дата</td><td>{esc(flt['date_from'])}</td></tr>"
+        )
+    rows_html.append("</tbody></table>")
+    text = "🔎 <b>Фильтры запросов</b>\n\n" + "".join(rows_html)
 
     def mark(value, current, label):
         return ("✅ " if value == current else "") + label
@@ -4941,13 +5005,18 @@ def filter_view(flt: dict) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text=mark(None, flt.get("model"), "Все модели"), callback_data="adm:fmodel:all"),
             InlineKeyboardButton(text=mark("groq", flt.get("model"), "Groq"), callback_data="adm:fmodel:groq"),
         ],
-        [
-            InlineKeyboardButton(text=mark("deepseek-v4.1-flash", flt.get("model"), "deepseek-v4.1-flash"), callback_data="adm:fmodel:deepseek-v4.1-flash"),
-            InlineKeyboardButton(text=mark("qwen4-max", flt.get("model"), "qwen4-max"), callback_data="adm:fmodel:qwen4-max"),
-        ],
-        [
-            InlineKeyboardButton(text=mark("gpt-6.2-sol", flt.get("model"), "gpt-6.2-sol"), callback_data="adm:fmodel:gpt-6.2-sol"),
-            InlineKeyboardButton(text=mark("gemini-4-neon", flt.get("model"), "gemini-4-neon"), callback_data="adm:fmodel:gemini-4-neon"),
+        *[
+            [
+                InlineKeyboardButton(
+                    text=mark(key, flt.get("model"), model_label(key)),
+                    callback_data=f"adm:fmodel:{key}",
+                )
+                for key in pair
+            ]
+            for pair in (
+                GATEWAY_MODELS[i : i + 2]
+                for i in range(0, len(GATEWAY_MODELS), 2)
+            )
         ],
         [
             InlineKeyboardButton(text="🗑 Сбросить", callback_data="adm:fclear"),
@@ -4965,17 +5034,21 @@ async def settings_view() -> tuple[str, InlineKeyboardMarkup]:
     gateway_ok = bool(client and client.configured)
     text = (
         "⚙️ <b>Настройки</b>\n\n"
-        f"Хранилище: <b>{mode}</b>\n"
+        "<table><thead><tr><th>Параметр</th><th>Значение</th></tr></thead><tbody>"
+        f"<tr><td>Хранилище</td><td>{mode}</td></tr>"
+        f"<tr><td>Контекст</td><td>{fmt_int(ctx['chats'])} чатов · "
+        f"{fmt_int(ctx['messages'])} сообщений</td></tr>"
+        "<tr><td>Логи</td><td>хранятся вечно</td></tr>"
+        "<tr><td>Сводка</td><td>каждый день в 04:00 МСК</td></tr>"
+        f"<tr><td>Шлюз</td><td>{'настроен' if gateway_ok else 'нет GATEWAY_API'} · "
+        f"{len(GATEWAY_MODELS)} "
+        f"{plural_ru(len(GATEWAY_MODELS), 'модель', 'модели', 'моделей')}</td></tr>"
+        f"<tr><td>Лимит</td><td>{PROVIDER_LIMITS.get('gateway', 25)} запросов/день, "
+        "владелец — безлимит</td></tr>"
+        f"<tr><td>История</td><td>{fmt_int(PREMIUM_HISTORY_CHARS_LIMIT)} символов · "
+        f"ответ до {fmt_int(PREMIUM_MAX_TOKENS)} токенов</td></tr>"
+        "</tbody></table>\n\n"
         f"{db_usage_line(size)}\n\n"
-        f"Контекст: {fmt_int(ctx['chats'])} чатов, {fmt_int(ctx['messages'])} сообщений\n"
-        f"Логи: <b>хранятся вечно</b> (ручная очистка ниже)\n"
-        f"Сводка: <b>каждый день в 04:00 МСК</b>\n"
-        f"Шлюз: <b>{'настроен' if gateway_ok else 'нет GATEWAY_API'}</b> · "
-        f"{len(GATEWAY_MODELS)} моделей\n"
-        f"Лимит: <b>{PROVIDER_LIMITS.get('gateway', 25)}</b> запросов/день, "
-        "владелец — безлимит\n"
-        f"История: {fmt_int(PREMIUM_HISTORY_CHARS_LIMIT)} символов, "
-        f"ответ до {fmt_int(PREMIUM_MAX_TOKENS)} токенов\n\n"
         f"{balance_block()}\n\n"
         "Очистка удаляет запросы, вызовы моделей и инструментов старше указанного срока. "
         "Контексты и списки не трогает."
@@ -5004,6 +5077,8 @@ async def admin_section(
         return model_text(), model_kb()
     if section == "fam":
         family = provider or MODEL_FAMILIES[0][0]
+        if not _family_models(family):
+            return model_text(), model_kb()
         return family_text(family), family_kb(family)
     if section == "groups":
         return groups_view(page)
@@ -6769,7 +6844,8 @@ async def main() -> None:
     logging.info(f"Build: {APP_BUILD}")
     logging.info(f"Chat: {CHAT_MODEL} (Groq), fast: {FAST_MODEL}")
     logging.info(
-        f"Шлюз: {len(GATEWAY_MODELS)} моделей, "
+        f"Шлюз: {len(GATEWAY_MODELS)} "
+        f"{plural_ru(len(GATEWAY_MODELS), 'модель', 'модели', 'моделей')}, "
         f"{'настроен' if gateway_client.configured else 'нет GATEWAY_API'}"
     )
     logging.info(f"Vision: {VISION_MODEL} (Gemini), fallback: {GROQ_VISION_MODEL} (Groq)")
