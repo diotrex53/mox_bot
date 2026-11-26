@@ -43,6 +43,7 @@ from openai import AsyncOpenAI
 
 from deepseek_client import ChatResult, DeepSeekClient
 from prompts import (
+    AGENT_INSTRUCTIONS,
     CLASSIC_FORMAT,
     LENGTH_INSTRUCTIONS,
     RICH_FORMAT,
@@ -260,7 +261,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
-APP_BUILD = "2026-11-26 aikeys-2-live-models-admin-tables"
+APP_BUILD = "2026-11-26 aikeys-3-agent-mode-admin-cleanup"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -743,6 +744,7 @@ DEFAULT_SETTINGS = {
     "deepthink": "off",
     "search": "on",
     "length": "normal",
+    "agent": False,
 }
 
 
@@ -1007,6 +1009,10 @@ def user_search_on(user_id: int | None) -> bool:
 def user_length(user_id: int | None) -> str:
     length = user_settings(user_id).get("length", "normal")
     return length if length in LENGTH_ORDER else "normal"
+
+
+def user_agent(user_id: int | None) -> bool:
+    return bool(user_settings(user_id).get("agent", False))
 
 
 async def safe_typing(chat_id: int) -> None:
@@ -1299,17 +1305,18 @@ def media_placeholder(message: Message) -> str:
 # Промпты вынесены в prompts.py — их можно редактировать отдельно.
 
 
-def system_prompt(rich: bool = False, length: str = "normal") -> str:
+def system_prompt(
+    rich: bool = False, length: str = "normal", agent: bool = False
+) -> str:
     fmt = RICH_FORMAT if rich else CLASSIC_FORMAT
     length_block = LENGTH_INSTRUCTIONS.get(length) or LENGTH_INSTRUCTIONS["normal"]
-    return (
-        SYSTEM_PROMPT_BASE
-        + "\n\n"
-        + fmt
-        + "\n\n"
-        + length_block
-        + f"\n\nСегодня: {date.today().isoformat()}."
-    )
+    parts = [SYSTEM_PROMPT_BASE]
+    if agent:
+        parts.append(AGENT_INSTRUCTIONS)
+    parts.append(fmt)
+    parts.append(length_block)
+    parts.append(f"Сегодня: {date.today().isoformat()}.")
+    return "\n\n".join(parts)
 
 
 TOOLS = [
@@ -3347,12 +3354,13 @@ async def run_tools(
     on_delta=None,
     reset_cb=None,
     max_tokens: int | None = None,
+    max_steps: int = 4,
 ) -> str:
     choice = forced or "auto"
     limit = max_tokens or (
         CHAT_MAX_TOKENS if provider == "groq" else PREMIUM_MAX_TOKENS
     )
-    for _ in range(4):
+    for _ in range(max(1, max_steps)):
         try:
             result = await call_model(
                 provider,
@@ -3403,7 +3411,28 @@ async def run_tools(
                 {"role": "tool", "tool_call_id": tc.get("id"), "content": str(output)[:6000]}
             )
         choice = "auto"
-    return ""
+
+    # Шаги кончились: просим итог без новых вызовов инструментов.
+    if reset_cb is not None:
+        reset_cb()
+    try:
+        final = await call_model(
+            provider,
+            messages,
+            tools=tools,
+            tool_choice="auto" if provider == "groq" else "none",
+            track=track,
+            effort=effort,
+            max_tokens=limit,
+            model=model,
+            on_delta=on_delta,
+            reset_cb=reset_cb,
+        )
+    except Exception:
+        return ""
+    content = (final.content or "").strip()
+    clean, _text_calls = extract_text_tool_calls(content)
+    return clean or content
 
 
 async def fallback_draw(turn: Turn) -> None:
@@ -3535,31 +3564,48 @@ async def run_ai(turn: Turn) -> None:
         await safe_typing(turn.chat_id)
         typing_task = asyncio.create_task(keep_typing(turn.chat_id))
         length = user_length(user_id) if settings_active else "normal"
-        messages = [{"role": "system", "content": system_prompt(rich, length)}]
+        agent = settings_active and user_agent(user_id)
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt(rich, length, agent=agent),
+            }
+        ]
         messages += [dict(m) for m in history_for_model(turn.chat_id, model_key)]
 
         search_on = user_search_on(user_id) if settings_active else True
         tools = TOOLS
-        if not search_on:
+        if agent:
+            # Агент сам решает, когда искать: поиск не должен быть выключен.
+            search_on = True
+        elif not search_on:
             tools = [
                 t
                 for t in TOOLS
                 if (t.get("function") or {}).get("name") != "web_search"
             ]
 
-        if turn.explicit_draw:
+        if agent:
+            # В агентском режиме модель сама выбирает инструменты на каждом шаге.
+            forced = None
+        elif turn.explicit_draw:
             forced = {"type": "function", "function": {"name": "generate_image"}}
         elif search_on and has_search_verb(turn.user_text):
             forced = {"type": "function", "function": {"name": "web_search"}}
         else:
             forced = None
 
-        effort = user_effort(user_id) if settings_active else "off"
+        effort = (
+            "high" if agent else (user_effort(user_id) if settings_active else "off")
+        )
+        max_steps = 8 if agent else 4
         max_tokens = (
             CHAT_MAX_TOKENS
             if provider == "groq"
             else LENGTH_TOKENS.get(length, LENGTH_TOKENS["normal"])
         )
+        if agent:
+            max_tokens = max(int(max_tokens or 0), 2000)
 
         async def executor(name, args):
             return await execute_tool(turn, name, args)
@@ -3572,6 +3618,7 @@ async def run_ai(turn: Turn) -> None:
             on_delta=streamer.on_delta if streamer else None,
             reset_cb=streamer.reset if streamer else None,
             max_tokens=max_tokens,
+            max_steps=max_steps,
         )
 
         try:
@@ -3658,7 +3705,8 @@ async def run_ai(turn: Turn) -> None:
         logging.info(
             f"[{turn.chat_id}] AI готов | model={model_key} | rich={rich} | "
             f"draw={turn.image_sent} | поиск={search_on} | длина={length} | "
-            f"effort={effort} | токенов={turn.track.total_tokens if turn.track else 0}"
+            f"agent={agent} | effort={effort} | "
+            f"токенов={turn.track.total_tokens if turn.track else 0}"
         )
     except asyncio.CancelledError:
         status = "cancelled"
@@ -3758,6 +3806,7 @@ async def cmd_help(message: Message):
         "• Строю графики и таблицы: <code>построй график</code>\n"
         "• Делаю тесты и чек-листы: <code>составь чек-лист деплоя</code>\n"
         "• Ищу в интернете, когда нужно\n"
+        "• Режим агента: до 8 шагов — в /models → «Режимы»\n"
         "• Отвечаю в inline-режиме\n\n"
         "<b>Команды:</b>\n"
         "/start — приветствие\n"
@@ -3784,18 +3833,30 @@ async def cmd_about(message: Message):
         if is_private(message)
         else "В группах: 🌿 Groq"
     )
-    family_lines = "\n".join(
-        f"• {esc(label)} — {len(names)}"
-        for _key, label, names in MODEL_FAMILIES
+    agent_on = bool(
+        is_private(message)
+        and message.from_user
+        and user_agent(message.from_user.id)
     )
+    agent_line = (
+        "\n🤖 Режим агента: <b>"
+        + ("включён" if agent_on else "выключен")
+        + "</b> (до 8 шагов)"
+        if is_private(message)
+        else ""
+    )
+    model_lines = "\n".join(f"• {esc(model_label(key))}" for key in GATEWAY_MODELS)
     await reply_any(
         message,
         "🌿 <b>Мудрый Мох — информация</b>\n\n"
         f"<b>🧩 Модели:</b> {len(GATEWAY_MODELS)} "
-        f"{plural_ru(len(GATEWAY_MODELS), 'модель', 'модели', 'моделей')} "
-        f"в {len(MODEL_FAMILIES)} "
-        f"{plural_ru(len(MODEL_FAMILIES), 'семействе', 'семействах', 'семействах')}\n"
-        f"{family_lines}\n{current_line}\n\n"
+        f"{plural_ru(len(GATEWAY_MODELS), 'модель', 'модели', 'моделей')}\n"
+        f"{model_lines}\n{current_line}{agent_line}\n\n"
+        "<b>🤖 Агент:</b>\n"
+        "• Включается в /models → «Режимы»\n"
+        "• Сам планирует, ищет и вызывает инструменты — до 8 шагов\n"
+        "• Всегда думает максимально глубоко\n"
+        "• Работает только в личке\n\n"
         "<b>👁 Фото:</b>\n"
         "• Модели DeepSeek видят фото сами\n"
         "• Если модель не принимает картинку — опишем через Gemini и ответим текстом\n"
@@ -3806,14 +3867,15 @@ async def cmd_about(message: Message):
         "<b>🎨 Рисование:</b>\n"
         "• Pollinations.ai\n\n"
         "<b>🔍 Поиск:</b>\n"
-        "• Tavily (+ запасной DuckDuckGo), включается в «Режимах»\n\n"
+        "• Tavily (+ запасной DuckDuckGo), включается в «Режимах»\n"
+        "• В режиме агента доступен всегда\n\n"
         "<b>🧠 Размышления и длина:</b>\n"
         "• Не думать / Думать / Думать долго\n"
         "• Кратко / Обычно / Подробно / Максимально\n\n"
         "<b>🔑 Доступ:</b>\n"
         f"• Все модели, {PROVIDER_LIMITS.get('gateway', 25)} запросов в день\n"
-        f"• Владельцу — безлимит\n\n"
-        f"<b>📊 Статистика чата:</b>\n"
+        "• Владельцу — безлимит\n\n"
+        "<b>📊 Статистика чата:</b>\n"
         f"• Время работы: <b>{format_uptime()}</b>\n"
         f"• Запросов в этом чате: <b>{_stats.get(chat_id, 0)}</b>\n"
         f"• В контексте: <b>{get_history_size(chat_id)}</b> из {HISTORY_LIMIT}\n\n"
@@ -3844,7 +3906,6 @@ def _tab_row(active: str) -> list[InlineKeyboardButton]:
     for tab, label in (
         ("models", "🧩 Модели"),
         ("modes", "⚙️ Режимы"),
-        ("access", "🔑 Доступ"),
     ):
         row.append(
             InlineKeyboardButton(
@@ -3959,6 +4020,7 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     level = user_effort(user_id)
     length = user_length(user_id)
     search_on = user_search_on(user_id)
+    agent_on = user_agent(user_id)
 
     history_len = get_history_size(int(user_id))
     lines = [
@@ -3970,11 +4032,14 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         "Мысли показываются над ответом в раскрытом блоке.",
         "📏 <b>Длина ответа</b> — от короткой выжимки до максимума.",
         "🔍 <b>Поиск</b> — разрешить модели искать в интернете.",
+        "🤖 <b>Агент</b> — сам планирует, ищет и вызывает инструменты "
+        "до 8 шагов. Думает долго, отвечает по факту.",
         "",
         f"Rich: <b>{'включён' if rich_on else 'выключен'}</b>",
         f"Размышления: <b>{EFFORT_LABELS.get(level, 'Не думать')}</b>",
         f"Длина: <b>{LENGTH_LABELS.get(length, 'Обычно')}</b>",
         f"Поиск: <b>{'включён' if search_on else 'выключен'}</b>",
+        f"Агент: <b>{'включён' if agent_on else 'выключен'}</b>",
         f"Контекст: <b>{history_len} сообщений</b> из {HISTORY_LIMIT}",
     ]
     if not RICH_SUPPORTED:
@@ -3989,6 +4054,11 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             f"\n🧠 <b>{esc(model_label(model_key))}</b> размышляет, "
             "но не показывает мысли текстом."
         )
+    if agent_on:
+        lines.append(
+            "\n🤖 В агентском режиме размышления всегда максимальные, "
+            "а поиск доступен всегда."
+        )
 
     rows: list[list[InlineKeyboardButton]] = [_tab_row("modes")]
     rows.append(
@@ -3999,7 +4069,15 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             )
         ]
     )
-    if model_key not in ALWAYS_REASONING_MODELS:
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=f"{'✅' if agent_on else '⬜️'} 🤖 Режим агента",
+                callback_data="models:toggle:agent:modes",
+            )
+        ]
+    )
+    if model_key not in ALWAYS_REASONING_MODELS and not agent_on:
         rows.append(
             [
                 InlineKeyboardButton(
@@ -4037,14 +4115,15 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             )
         ]
     )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text=f"{'✅' if search_on else '⬜️'} Поиск в интернете",
-                callback_data=f"models:search:{'off' if search_on else 'on'}:modes",
-            )
-        ]
-    )
+    if not agent_on:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{'✅' if search_on else '⬜️'} Поиск в интернете",
+                    callback_data=f"models:search:{'off' if search_on else 'on'}:modes",
+                )
+            ]
+        )
     rows.append(
         [
             InlineKeyboardButton(
@@ -4058,37 +4137,6 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _models_access_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    today = msk_today()
-    limit = PROVIDER_LIMITS.get("gateway", 25)
-    usage = await storage.usage_for_day(today, "gateway")
-    used = usage.get((int(user_id), "gateway"), 0) if user_id else 0
-    client = PROVIDER_CLIENTS.get("gateway")
-    configured = bool(client and client.configured)
-    lines = [
-        "🔑 <b>Доступ</b>",
-        "",
-        "Доступные на ключе модели открыты каждому: 25 запросов в день суммарно.",
-        f"👑 Владелец: <a href=\"https://t.me/{OWNER_USERNAME}\">@{OWNER_USERNAME}</a> — безлимит",
-        "",
-        f"Моделей: <b>{len(GATEWAY_MODELS)}</b>",
-        (
-            "Шлюз: <b>настроен</b>"
-            if configured
-            else "Шлюз: <b>не настроен</b> (нет API-ключа GATEWAY_API на сервере)"
-        ),
-    ]
-    if int(user_id) == OWNER_ID:
-        lines.append("Твой лимит: <b>безлимит</b>")
-    else:
-        lines.append(f"Сегодня: <b>{used}</b> из {limit}")
-    rows: list[list[InlineKeyboardButton]] = [
-        _tab_row("access"),
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="models:tab:access")],
-    ]
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 async def models_panel_view(
     user_id: int, tab: str = "models", family: str | None = None
 ) -> tuple[str, InlineKeyboardMarkup]:
@@ -4096,8 +4144,6 @@ async def models_panel_view(
         return _models_family_view(user_id, family or MODEL_FAMILIES[0][0])
     if tab == "modes":
         return _models_modes_view(user_id)
-    if tab == "access":
-        return await _models_access_view(user_id)
     return _models_list_view(user_id)
 
 
@@ -4149,6 +4195,15 @@ async def on_models_callback(callback: CallbackQuery):
         field = parts[2] if len(parts) > 2 else "rich"
         if field == "rich":
             await save_toggle(user_id, "rich", not user_rich(user_id))
+        elif field == "agent":
+            await save_toggle(user_id, "agent", not user_agent(user_id))
+            if user_agent(user_id):
+                await callback.answer(
+                    "🤖 Агент включён: до 8 шагов, максимальная глубина.",
+                    show_alert=True,
+                )
+            else:
+                await callback.answer("🤖 Агент выключен")
         tab = "modes"
     elif action == "effort":
         level = parts[2] if len(parts) > 2 else "off"
@@ -4179,6 +4234,8 @@ async def on_models_callback(callback: CallbackQuery):
                 pass
     if action == "clear":
         await callback.answer("🧹 Контекст очищен")
+    elif action == "toggle" and (parts[2] if len(parts) > 2 else "") == "agent":
+        pass
     else:
         await callback.answer()
 
@@ -4459,7 +4516,6 @@ async def balances_loop() -> None:
 
 
 def admin_main_text() -> str:
-    current = selected_model(OWNER_ID)
     gateway_client_info = PROVIDER_CLIENTS.get("gateway")
     configured = bool(gateway_client_info and gateway_client_info.configured)
     usage = _today_usage_cache
@@ -4467,7 +4523,6 @@ def admin_main_text() -> str:
     today_users = len({uid for (uid, _prov) in usage})
     return (
         "🛠 <b>Админ-панель Мудрого Мха</b>\n\n"
-        f"Модель в твоей ЛС: <b>{esc(model_label(current))}</b>\n\n"
         "<table><thead><tr>"
         "<th>Шлюз</th><th>Модели</th><th>Лимит</th>"
         "</tr></thead><tbody><tr>"
@@ -4496,15 +4551,14 @@ def admin_main_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📝 Запросы", callback_data="adm:req:0"),
         ],
         [
-            InlineKeyboardButton(text="🧠 Модель", callback_data="adm:model"),
             InlineKeyboardButton(text="👥 Группы", callback_data="adm:groups:0"),
-        ],
-        [
             InlineKeyboardButton(text="🚫 ЛС", callback_data="adm:bl:0"),
-            InlineKeyboardButton(text="🔑 Доступ", callback_data="adm:acc:gateway:0"),
         ],
         [
+            InlineKeyboardButton(text="🔑 Доступ", callback_data="adm:acc:gateway:0"),
             InlineKeyboardButton(text="📨 Сводка", callback_data="adm:summary"),
+        ],
+        [
             InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set"),
         ],
     ]
@@ -4533,19 +4587,19 @@ async def stats_text(stats: dict, period: str, flt: dict) -> str:
     )
     lines.append(
         "<table><thead><tr>"
-        "<th>Токены</th><th>Кредиты</th><th>Задержка</th>"
+        "<th>Токены</th><th>Задержка</th><th>Сегодня</th>"
         "</tr></thead><tbody><tr>"
         f"<td>{fmt_int(total_tokens)}</td>"
-        f"<td>{stats['credits']:.4f}</td>"
         f"<td>{fmt_int(stats['avg_latency'])} мс</td>"
+        f"<td>{fmt_int(today_total)}</td>"
         "</tr></tbody></table>"
     )
     lines.append(
         "<table><thead><tr>"
-        "<th>Сегодня</th><th>Люди</th><th>Лимит</th>"
+        "<th>Люди</th><th>Чаты</th><th>Лимит</th>"
         "</tr></thead><tbody><tr>"
-        f"<td>{fmt_int(today_total)}</td>"
         f"<td>{fmt_int(today_users)}</td>"
+        f"<td>{fmt_int(stats.get('chats_total') or 0)}</td>"
         f"<td>{limit}/день</td>"
         "</tr></tbody></table>"
     )
@@ -4571,43 +4625,38 @@ async def stats_text(stats: dict, period: str, flt: dict) -> str:
         lines.append("<p>Пока нет данных.</p>")
     lines.append("")
 
-    lines.append("<b>Люди</b>")
-    top_users = (stats.get("top_users") or [])[:7]
+    lines.append("<b>Люди и чаты</b>")
+    top_users = (stats.get("top_users") or [])[:5]
     await resolve_user_names([u.get("user_id") for u in top_users])
-    if top_users:
-        rows = []
-        for u in top_users:
-            rows.append(
-                "<tr>"
-                f"<td>{user_tag(u['user_id'], u.get('username', ''))}</td>"
-                f"<td>{fmt_int(u['requests'])}</td>"
-                "</tr>"
-            )
-        lines.append(
-            "<table><thead><tr>"
-            "<th>Кто</th><th>Запросы</th>"
-            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+    merged: list[tuple[str, str, int]] = []
+    for u in top_users:
+        chats_n = int(u.get("chats") or 0)
+        where = "👤 личка" if chats_n <= 1 else f"👤 {chats_n} чата"
+        merged.append(
+            (user_tag(u["user_id"], u.get("username", "")), where, int(u["requests"]))
         )
-    else:
-        lines.append("<p>Пока нет данных.</p>")
-    lines.append("")
-
-    lines.append("<b>Чаты</b>")
-    if stats.get("top_chats"):
-        rows = []
-        for c in (stats.get("top_chats") or [])[:7]:
-            chat_id = c["chat_id"]
-            title = (_groups_cache.get(int(chat_id)) or {}).get("title") or ""
-            name = esc(title) if title else f"<code>{chat_id}</code>"
-            rows.append(
-                "<tr>"
-                f"<td>{name} · {esc(c['chat_type'])}</td>"
-                f"<td>{fmt_int(c['requests'])}</td>"
-                "</tr>"
-            )
+    for c in stats.get("top_chats") or []:
+        if c.get("chat_type") == "private":
+            continue
+        chat_id = c["chat_id"]
+        title = (_groups_cache.get(int(chat_id)) or {}).get("title") or ""
+        name = esc(title) if title else f"<code>{chat_id}</code>"
+        merged.append(
+            (name, f"💬 {esc(c.get('chat_type') or 'чат')}", int(c["requests"]))
+        )
+    merged = merged[:8]
+    if merged:
+        rows = [
+            "<tr>"
+            f"<td>{name}</td>"
+            f"<td>{where}</td>"
+            f"<td>{fmt_int(requests)}</td>"
+            "</tr>"
+            for name, where, requests in merged
+        ]
         lines.append(
             "<table><thead><tr>"
-            "<th>Чат</th><th>Запросы</th>"
+            "<th>Кто</th><th>Где</th><th>Запросы</th>"
             "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
         )
     else:
@@ -4654,73 +4703,6 @@ def stats_kb(period: str) -> InlineKeyboardMarkup:
     )
 
 
-def model_text() -> str:
-    current = selected_model(OWNER_ID)
-    lines = [
-        "🧠 <b>Модель для твоей ЛС</b>",
-        "",
-        f"Сейчас: <b>{esc(model_label(current))}</b>",
-        "",
-        "Выбери модель:" if len(MODEL_FAMILIES) == 1 else "Выбери семейство:",
-    ]
-    return "\n".join(lines)
-
-
-def model_kb() -> InlineKeyboardMarkup:
-    rows = []
-    if len(MODEL_FAMILIES) == 1:
-        for key in _family_models(MODEL_FAMILIES[0][0]):
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=model_label(key), callback_data=f"adm:mset:{key}"
-                    )
-                ]
-            )
-    else:
-        for key, label, names in MODEL_FAMILIES:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"{label} · {len(names)}",
-                        callback_data=f"adm:fam:{key}",
-                    )
-                ]
-            )
-    rows.append([InlineKeyboardButton(text="🌿 Groq", callback_data="adm:mset:groq")])
-    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main")])
-    return admin_kb(rows)
-
-
-def family_text(family: str) -> str:
-    current = selected_model(OWNER_ID)
-    label = FAMILY_LABELS.get(family, family)
-    lines = [
-        f"🧠 <b>{esc(label)}</b>",
-        "",
-        f"Сейчас: <b>{esc(model_label(current))}</b>",
-        "",
-        "Выбери модель:",
-    ]
-    return "\n".join(lines)
-
-
-def family_kb(family: str) -> InlineKeyboardMarkup:
-    rows = []
-    for key in _family_models(family):
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=model_label(key), callback_data=f"adm:mset:{key}"
-                )
-            ]
-        )
-    rows.append(
-        [InlineKeyboardButton(text="◀️ К семействам", callback_data="adm:model")]
-    )
-    return admin_kb(rows)
-
-
 def paginate(items: list, page: int) -> tuple[list, int, int]:
     total = max(1, (len(items) + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE)
     page = max(0, min(page, total - 1))
@@ -4740,7 +4722,22 @@ def paginator_kb(prefix: str, page: int, total: int, back: str = "adm:main") -> 
     return row
 
 
-def groups_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+async def groups_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    groups = sorted(_groups_cache.values(), key=lambda g: (g.get("title") or "").lower())
+    page_items, page, total = paginate(groups, page)
+    # В кэше могли остаться старые названия: подтягиваем актуальные из Telegram.
+    for g in page_items:
+        chat_id = int(g["chat_id"])
+        try:
+            chat = await bot.get_chat(chat_id)
+        except Exception:
+            continue
+        title = getattr(chat, "title", None) or getattr(chat, "full_name", None) or ""
+        if title and title != (g.get("title") or ""):
+            g["title"] = title
+            _groups_cache[chat_id] = dict(g)
+            await storage.add_group(chat_id, title)
+
     groups = sorted(_groups_cache.values(), key=lambda g: (g.get("title") or "").lower())
     page_items, page, total = paginate(groups, page)
     lines = [
@@ -4904,7 +4901,6 @@ async def requests_view_async(page: int, flt: dict) -> tuple[str, InlineKeyboard
     await resolve_user_names([r.get("user_id") for r in rows if r.get("user_id")])
     if rows:
         table_rows: list[str] = []
-        details: list[str] = []
         for r in rows:
             created = r.get("created_at")
             if isinstance(created, datetime):
@@ -4926,40 +4922,68 @@ async def requests_view_async(page: int, flt: dict) -> tuple[str, InlineKeyboard
                 else "—"
             )
             model_name = (r.get("model") or "—")[:28]
+            prompt = (r.get("prompt_preview") or "").replace("\n", " ").strip()
+            if len(prompt) > 90:
+                prompt = prompt[:90] + "…"
+            meta: list[str] = []
+            if r.get("latency_ms"):
+                meta.append(f"{fmt_int(r.get('latency_ms'))} мс")
+            if r.get("tools"):
+                meta.append("🛠 " + esc(r["tools"])[:40])
+            tokens = fmt_int(r.get("tokens") or 0)
+            if meta:
+                tokens += " · " + " · ".join(meta)
+            if r.get("error"):
+                prompt = "⚠️ " + (prompt or "ошибка")
             table_rows.append(
                 "<tr>"
                 f"<td>{icon} {created}</td>"
                 f"<td>{who}</td>"
                 f"<td>{esc(model_name)}</td>"
-                f"<td>{fmt_int(r.get('tokens') or 0)}</td>"
+                f"<td>{esc(prompt) or '—'}</td>"
+                f"<td>{tokens}</td>"
                 "</tr>"
             )
-            prompt = (r.get("prompt_preview") or "").replace("\n", " ")[:120]
-            extra = []
-            if r.get("kind"):
-                extra.append(esc(r.get("kind")))
-            if r.get("latency_ms"):
-                extra.append(f"{fmt_int(r.get('latency_ms'))} мс")
-            if r.get("tools"):
-                extra.append("🛠 " + esc(r["tools"])[:60])
-            tail = (" · " + " · ".join(extra)) if extra else ""
-            detail = f"<p><b>#{r.get('id')}</b>{tail}"
-            if prompt:
-                detail += " · " + esc(prompt)
-            details.append(detail + "</p>")
-            if r.get("error"):
-                details.append(
-                    "<p>⚠️ " + esc((r.get("error") or "")[:120]) + "</p>"
-                )
         lines.append(
             "<table><thead><tr>"
-            "<th>Когда</th><th>Кто</th><th>Модель</th><th>Токены</th>"
+            "<th>Когда</th><th>Кто</th><th>Модель</th><th>Запрос</th><th>Токены</th>"
             "</tr></thead><tbody>" + "".join(table_rows) + "</tbody></table>"
         )
-        lines.append("")
-        lines.append("<b>Детали</b>")
-        lines.append("")
-        lines.extend(details)
+
+        calls = await storage.tool_calls_for_requests([r.get("id") for r in rows])
+        if calls:
+            call_rows: list[str] = []
+            for c in calls[:12]:
+                when = c.get("created_at")
+                if isinstance(when, datetime):
+                    when = when.astimezone(MSK).strftime("%d.%m %H:%M")
+                else:
+                    when = "—"
+                cstatus = c.get("status") or "?"
+                cicon = "✅" if cstatus == "ok" else "❌"
+                args = (c.get("args_preview") or "").replace("\n", " ").strip()
+                if len(args) > 60:
+                    args = args[:60] + "…"
+                latency = (
+                    f"{fmt_int(c.get('latency_ms'))} мс"
+                    if c.get("latency_ms")
+                    else "—"
+                )
+                call_rows.append(
+                    "<tr>"
+                    f"<td>{cicon} {when}</td>"
+                    f"<td><code>{esc(c.get('tool') or '?')}</code></td>"
+                    f"<td>{esc(args) or '—'}</td>"
+                    f"<td>{latency}</td>"
+                    "</tr>"
+                )
+            lines.append("")
+            lines.append("<b>🛠 Вызовы инструментов</b>")
+            lines.append(
+                "<table><thead><tr>"
+                "<th>Когда</th><th>Инструмент</th><th>Аргументы</th><th>Время</th>"
+                "</tr></thead><tbody>" + "".join(call_rows) + "</tbody></table>"
+            )
     rows_kb = [
         [
             InlineKeyboardButton(text="🔎 Фильтры", callback_data="adm:filter"),
@@ -5026,7 +5050,9 @@ def filter_view(flt: dict) -> tuple[str, InlineKeyboardMarkup]:
     return text, admin_kb(rows)
 
 
-async def settings_view() -> tuple[str, InlineKeyboardMarkup]:
+async def settings_view(refresh: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    if refresh:
+        await refresh_all_balances()
     size = await storage.db_size()
     ctx = await storage.context_summary()
     mode = "Postgres (Neon)" if storage.available else "память (DATABASE_URL не задан)"
@@ -5054,13 +5080,12 @@ async def settings_view() -> tuple[str, InlineKeyboardMarkup]:
         "Контексты и списки не трогает."
     )
     rows = [
-        [InlineKeyboardButton(text="💳 Обновить баланс", callback_data="adm:balrefresh")],
-        [InlineKeyboardButton(text="⬇️ CSV всех запросов", callback_data="adm:csvall")],
-        [InlineKeyboardButton(text="🧹 Очистить старые логи", callback_data="adm:cleanup")],
         [
             InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:set"),
             InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main"),
         ],
+        [InlineKeyboardButton(text="⬇️ CSV всех запросов", callback_data="adm:csvall")],
+        [InlineKeyboardButton(text="🧹 Очистить старые логи", callback_data="adm:cleanup")],
     ]
     return text, admin_kb(rows)
 
@@ -5073,15 +5098,8 @@ async def admin_section(
         _db_size_cache = await storage.db_size()
         _today_usage_cache = await storage.usage_for_day(msk_today(), "gateway")
         return admin_main_text(), admin_main_kb()
-    if section == "model":
-        return model_text(), model_kb()
-    if section == "fam":
-        family = provider or MODEL_FAMILIES[0][0]
-        if not _family_models(family):
-            return model_text(), model_kb()
-        return family_text(family), family_kb(family)
     if section == "groups":
-        return groups_view(page)
+        return await groups_view(page)
     if section == "bl":
         return blacklist_view(page)
     if section == "acc":
@@ -5130,7 +5148,9 @@ async def send_admin_article(
     text: str,
     kb: InlineKeyboardMarkup | None,
     old_id: int | None = None,
-) -> None:
+    *,
+    track: bool = True,
+) -> Message | None:
     sent: Message | None = None
     if RICH_SUPPORTED:
         try:
@@ -5150,13 +5170,15 @@ async def send_admin_article(
             )
         except Exception as e:
             logging.warning(f"admin text send failed: {e}")
-            return
+            return None
     if old_id and sent and old_id != sent.message_id:
         try:
             await bot.delete_message(chat_id, old_id)
         except Exception:
             pass
-    _ADMIN_SCREENS[chat_id] = sent.message_id
+    if track and sent is not None:
+        _ADMIN_SCREENS[chat_id] = sent.message_id
+    return sent
 
 
 async def edit_admin(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
@@ -5430,30 +5452,6 @@ async def on_admin_callback(callback: CallbackQuery):
             await send_daily_summary(mark=False)
             await callback.answer("Сводка отправлена.")
             return
-        if action == "model":
-            text, kb = await admin_section("model")
-            await edit_admin(callback, text, kb)
-            await callback.answer()
-            return
-        if action == "fam":
-            family = parts[2] if len(parts) > 2 else MODEL_FAMILIES[0][0]
-            text, kb = await admin_section("fam", provider=family)
-            await edit_admin(callback, text, kb)
-            await callback.answer()
-            return
-        if action == "mset":
-            model = parts[2] if len(parts) > 2 else "groq"
-            ok, msg = await set_model_for_user(OWNER_ID, model)
-            await callback.answer(plain_text(msg)[:180], show_alert=not ok)
-            if ok:
-                await storage.add_admin_action(OWNER_ID, "model_set", model)
-            info = MODEL_REGISTRY.get(normalize_model_key(model)) or {}
-            if info.get("provider") == "gateway":
-                text, kb = await admin_section("fam", provider=info.get("family"))
-            else:
-                text, kb = await admin_section("model")
-            await edit_admin(callback, text, kb)
-            return
         if action == "groups":
             page = int(parts[2]) if len(parts) > 2 else 0
             text, kb = await admin_section("groups", page)
@@ -5485,12 +5483,6 @@ async def on_admin_callback(callback: CallbackQuery):
             await edit_admin(callback, text, kb)
             await callback.answer("Балансы обновлены.")
             return
-        if action == "balrefresh":
-            await refresh_all_balances()
-            text, kb = await admin_section("set")
-            await edit_admin(callback, text, kb)
-            await callback.answer("Балансы обновлены.")
-            return
         if action == "req":
             page = int(parts[2]) if len(parts) > 2 else 0
             text, kb = await admin_section("req", page)
@@ -5498,9 +5490,9 @@ async def on_admin_callback(callback: CallbackQuery):
             await callback.answer()
             return
         if action == "set":
-            text, kb = await admin_section("set")
+            text, kb = await settings_view(refresh=True)
             await edit_admin(callback, text, kb)
-            await callback.answer()
+            await callback.answer("Баланс обновлён.")
             return
         if action == "filter":
             text, kb = filter_view(admin_filters(OWNER_ID))
@@ -5710,35 +5702,80 @@ async def on_admin_callback(callback: CallbackQuery):
         await callback.answer(plain_text(f"Ошибка: {e}")[:180], show_alert=True)
 
 
+SUMMARY_MESSAGE_KEY = "daily_summary_message_id"
+
+
 async def send_daily_summary(mark: bool = True) -> None:
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=24)
     data = await storage.stats(start, end)
+    errors = int(data["request_errors"]) + int(data["call_errors"])
     lines = [
         "📊 <b>Сводка за 24 часа</b>",
         "",
-        f"Запросов: <b>{fmt_int(data['requests'])}</b>",
-        f"Вызовов моделей: <b>{fmt_int(data['calls'])}</b>",
-        f"Ошибок: <b>{fmt_int(data['request_errors'] + data['call_errors'])}</b>",
+        "<table><thead><tr>"
+        "<th>Запросы</th><th>Вызовы</th><th>Ошибки</th>"
+        "</tr></thead><tbody><tr>"
+        f"<td>{fmt_int(data['requests'])}</td>"
+        f"<td>{fmt_int(data['calls'])}</td>"
+        f"<td>{fmt_int(errors)}</td>"
+        "</tr></tbody></table>",
     ]
-    for m in merge_stats_models(data.get("models"), limit=6):
-        lines.append(
-            f"• <code>{esc(m['model'])}</code>: {fmt_int(m['total_tokens'])} ток."
+
+    models = merge_stats_models(data.get("models"), limit=6)
+    if models:
+        rows = "".join(
+            "<tr>"
+            f"<td>{esc(m['model'])}</td>"
+            f"<td>{fmt_int(m['calls'])}</td>"
+            f"<td>{fmt_int(m['total_tokens'])}</td>"
+            "</tr>"
+            for m in models
         )
+        lines.append("")
+        lines.append("<b>Модели</b>")
+        lines.append(
+            "<table><thead><tr>"
+            "<th>Модель</th><th>Вызовы</th><th>Токены</th>"
+            "</tr></thead><tbody>" + rows + "</tbody></table>"
+        )
+
     if data.get("top_users"):
-        lines.append("\nТоп пользователей:")
         top_users = data["top_users"][:5]
         await resolve_user_names([u.get("user_id") for u in top_users])
-        for u in top_users:
-            lines.append(
-                f"• {user_tag(u['user_id'], u.get('username', ''))} — "
-                f"{fmt_int(u['requests'])}"
-            )
-    lines.append(f"\nКредиты: <b>{data['credits']:.4f}</b>")
+        rows = "".join(
+            "<tr>"
+            f"<td>{user_tag(u['user_id'], u.get('username', ''))}</td>"
+            f"<td>{fmt_int(u.get('chats') or 0)}</td>"
+            f"<td>{fmt_int(u['requests'])}</td>"
+            "</tr>"
+            for u in top_users
+        )
+        lines.append("")
+        lines.append("<b>Люди</b>")
+        lines.append(
+            "<table><thead><tr>"
+            "<th>Кто</th><th>Чаты</th><th>Запросы</th>"
+            "</tr></thead><tbody>" + rows + "</tbody></table>"
+        )
+
+    old_raw = await storage.get_setting(SUMMARY_MESSAGE_KEY)
     try:
-        await bot.send_message(OWNER_ID, "\n".join(lines))
-    except Exception as e:
-        logging.warning(f"Daily summary send failed: {e}")
+        old_id = int(old_raw) if old_raw else None
+    except (TypeError, ValueError):
+        old_id = None
+
+    kb = admin_kb(
+        [
+            [
+                InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:summary"),
+                InlineKeyboardButton(text="🏠 Меню", callback_data="adm:main"),
+            ]
+        ]
+    )
+    sent = await send_admin_article(OWNER_ID, "\n".join(lines), kb, old_id=old_id)
+    if sent is not None:
+        await storage.set_setting(SUMMARY_MESSAGE_KEY, str(sent.message_id))
     if mark:
         await storage.set_setting("last_daily_summary", msk_now().isoformat())
 

@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     deepthink TEXT NOT NULL DEFAULT 'off',
     search TEXT NOT NULL DEFAULT 'auto',
     length TEXT NOT NULL DEFAULT 'normal',
+    agent BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -170,6 +171,7 @@ CREATE TABLE IF NOT EXISTS admin_actions (
 # старые строки удаляются, чтобы отозванные гранты не возвращались при рестарте.
 MIGRATIONS = """
 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS length TEXT NOT NULL DEFAULT 'normal';
+ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS agent BOOLEAN NOT NULL DEFAULT FALSE;
 
 INSERT INTO provider_grants (user_id, provider, username, full_name, granted_by, granted_at)
 SELECT user_id, 'deepseek', username, full_name, granted_by, granted_at
@@ -585,7 +587,7 @@ class Storage:
         try:
             if self.available:
                 rows = await self.pool.fetch(
-                    "SELECT user_id, model, rich, deepthink, search, length "
+                    "SELECT user_id, model, rich, deepthink, search, length, agent "
                     "FROM user_settings"
                 )
                 self._user_settings = {
@@ -595,6 +597,7 @@ class Storage:
                         "deepthink": r["deepthink"] or "off",
                         "search": r["search"] or "on",
                         "length": r["length"] or "normal",
+                        "agent": bool(r["agent"]),
                     }
                     for r in rows
                 }
@@ -604,7 +607,7 @@ class Storage:
             return dict(self._user_settings)
 
     async def save_user_settings(self, user_id: int, **fields) -> None:
-        allowed = {"model", "rich", "deepthink", "search", "length"}
+        allowed = {"model", "rich", "deepthink", "search", "length", "agent"}
         values = {k: v for k, v in fields.items() if k in allowed}
         if not values:
             return
@@ -616,6 +619,7 @@ class Storage:
                 "deepthink": "off",
                 "search": "on",
                 "length": "normal",
+                "agent": False,
             },
         )
         current.update(values)
@@ -956,6 +960,7 @@ class Storage:
             "models": [],
             "top_users": [],
             "top_chats": [],
+            "chats_total": 0,
             "tools": [],
             "credits": 0.0,
             "contexts": contexts,
@@ -1011,6 +1016,7 @@ class Storage:
 
             users: dict[int, dict] = {}
             chats: dict[int, dict] = {}
+            user_chats: dict[int, set[int]] = {}
             for r in reqs:
                 if not r.get("is_request"):
                     continue
@@ -1021,6 +1027,8 @@ class Storage:
                         {"user_id": int(uid), "username": r.get("username") or "", "requests": 0},
                     )
                     item["requests"] += 1
+                    if r.get("chat_id") is not None:
+                        user_chats.setdefault(int(uid), set()).add(int(r["chat_id"]))
                 cid = r.get("chat_id")
                 if cid is not None:
                     item = chats.setdefault(
@@ -1028,12 +1036,15 @@ class Storage:
                         {"chat_id": int(cid), "chat_type": r.get("chat_type") or "", "requests": 0},
                     )
                     item["requests"] += 1
+            for uid, item in users.items():
+                item["chats"] = len(user_chats.get(uid, ()))
             result["top_users"] = sorted(
                 users.values(), key=lambda x: x["requests"], reverse=True
             )[:7]
             result["top_chats"] = sorted(
                 chats.values(), key=lambda x: x["requests"], reverse=True
             )[:7]
+            result["chats_total"] = len(chats)
 
             tool_counts: dict[str, int] = {}
             for t in tools:
@@ -1052,6 +1063,8 @@ class Storage:
                 "count(*) FILTER (WHERE kind = 'group_message') AS group_messages, "
                 "count(*) FILTER (WHERE is_request AND status = 'error') AS request_errors, "
                 "count(*) FILTER (WHERE status = 'running') AS running, "
+                "count(DISTINCT chat_id) FILTER "
+                "(WHERE is_request AND chat_id IS NOT NULL) AS chats_total, "
                 "avg(latency_ms) FILTER (WHERE is_request) AS avg_latency "
                 "FROM requests WHERE ($1::timestamptz IS NULL OR created_at >= $1) "
                 "AND ($2::timestamptz IS NULL OR created_at < $2)",
@@ -1064,6 +1077,7 @@ class Storage:
                 result["request_errors"] = int(req_row["request_errors"] or 0)
                 result["running"] = int(req_row["running"] or 0)
                 result["avg_latency"] = int(req_row["avg_latency"] or 0)
+                result["chats_total"] = int(req_row["chats_total"] or 0)
 
             call_row = await self.pool.fetchrow(
                 "SELECT count(*) AS calls, "
@@ -1109,7 +1123,8 @@ class Storage:
             ]
 
             user_rows = await self.pool.fetch(
-                "SELECT user_id, max(username) AS username, count(*) AS requests "
+                "SELECT user_id, max(username) AS username, count(*) AS requests, "
+                "count(DISTINCT chat_id) AS chats "
                 "FROM requests WHERE is_request AND user_id IS NOT NULL "
                 "AND ($1::timestamptz IS NULL OR created_at >= $1) "
                 "AND ($2::timestamptz IS NULL OR created_at < $2) "
@@ -1122,6 +1137,7 @@ class Storage:
                     "user_id": int(r["user_id"]),
                     "username": r["username"] or "",
                     "requests": int(r["requests"] or 0),
+                    "chats": int(r["chats"] or 0),
                 }
                 for r in user_rows
             ]
@@ -1195,6 +1211,29 @@ class Storage:
         except Exception as e:
             logging.warning(f"db_size failed: {e}")
             return 0
+
+    async def tool_calls_for_requests(self, request_ids) -> list[dict]:
+        """Вызовы инструментов для показанных запросов."""
+        ids = [int(i) for i in request_ids if i is not None]
+        if not ids:
+            return []
+        if not self.available:
+            return [
+                dict(t)
+                for t in self._tools
+                if t.get("request_id") in ids
+            ]
+        try:
+            rows = await self.pool.fetch(
+                "SELECT created_at, request_id, tool, args_preview, status, "
+                "latency_ms, error FROM tool_calls "
+                "WHERE request_id = ANY($1::bigint[]) ORDER BY id",
+                ids,
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logging.warning(f"tool_calls_for_requests failed: {e}")
+            return []
 
     async def list_requests(
         self,
