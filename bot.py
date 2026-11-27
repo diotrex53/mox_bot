@@ -11,7 +11,6 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from urllib.parse import quote
 
 import httpx
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -50,6 +49,7 @@ from prompts import (
     SYSTEM_PROMPT_BASE,
 )
 from storage import DB_LIMIT_BYTES, MSK, storage
+import studio
 
 # widgets.py — новый файл. Если его забыли загрузить, бот продолжит работать,
 # а виджеты просто будут отдавать текстовый фолбэк вместо падения на старте.
@@ -104,62 +104,84 @@ GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
 TAVILY_API_KEY = os.environ.get("TAVIL_API", "")
 
 # ---- Универсальный шлюз ------------------------------------------------
-# Ключ aikeysforyou открывает не весь каталог: в /v1/models у провайдера 37
-# моделей, но ключ разрешает только DeepSeek-flash (остальные отдают
-# 403 model_not_allowed). В меню держим только то, что реально работает,
-# чтобы не показывать заведомо нерабочие кнопки. Ключ живёт в env Render.
-GATEWAY_API_KEY = os.environ.get("GATEWAY_API", "")
-GATEWAY_BASE_URL = os.environ.get(
-    "GATEWAY_BASE_URL", "https://api.aikeysforyou.com/v1"
-).rstrip("/")
-# JSON-эндпоинт баланса: {"object":"balance","token_balance":123456}
+# Ключи и клиенты студии живут в studio.py; здесь остаются алиасы для
+# совместимости со старым кодом статистики и баланса.
+GATEWAY_API_KEY = studio.GATEWAY_API_KEY
+GATEWAY_BASE_URL = studio.GATEWAY_BASE_URL
 GATEWAY_BALANCE_URL = os.environ.get(
     "GATEWAY_BALANCE_URL", "https://api.aikeysforyou.com/v1/balance"
 )
-DEFAULT_GATEWAY_MODEL = "deepseek-v4.1-flash-1017"
+DEFAULT_GATEWAY_MODEL = studio.DEFAULT_GATEWAY_MODEL
 
-# Только модели, которые этот ключ реально принимает и которые отвечают
-# прямо сейчас (проверено живыми запросами 26.11.2026).
-# deepseek-v4-flash-0731 временно отдаёт 503 capacity_unavailable — вернём,
-# когда шлюз его оживит. Новые рабочие модели добавляй сюда же.
-MODEL_FAMILIES: list[tuple[str, str, list[str]]] = [
-    (
-        "deepseek",
-        "DeepSeek",
-        [
-            "deepseek-v4.1-flash-1017",
-            "deepseek-v4.1-flash",
-        ],
-    ),
-]
+# Дневные пулы токенов: free 250к и paid 100к. Владелец — безлимит.
+DAILY_TOKEN_LIMIT = studio.POOL_LIMITS[studio.FREE]
+PAID_TOKEN_LIMIT = studio.POOL_LIMITS[studio.PAID]
 
+# Каталог заполняется при первом импорте fallback-списком, затем
+# refresh_catalog() подтягивает живые списки провайдеров.
 MODEL_REGISTRY: dict[str, dict] = {}
-for _family_key, _family_label, _family_models in MODEL_FAMILIES:
-    for _name in _family_models:
-        MODEL_REGISTRY[_name] = {
-            "label": _name,
-            "provider": "gateway",
-            "model": _name,
-            "family": _family_key,
-        }
+MODEL_SHORT: dict[str, str] = {}
+MODEL_SHORT_BY_KEY: dict[str, str] = {}
+MODEL_ALIASES: dict[str, str] = {}
 
-# Groq остаётся для групп и как бесплатная запасная модель в личке.
-MODEL_REGISTRY["groq"] = {
-    "label": "Groq",
-    "provider": "groq",
-    "model": CHAT_MODEL,
-    "family": "groq",
-}
 
-# Короткие имена из старых настроек. Остальные устаревшие id вылечивает
-# user_settings(): неизвестная модель заменяется на рабочую по умолчанию.
-MODEL_ALIASES = {"deepseek": DEFAULT_GATEWAY_MODEL}
-GATEWAY_MODELS = [
-    name for _key, _label, names in MODEL_FAMILIES for name in names
-]
+def rebuild_model_registry(catalog: dict[str, list[dict]] | None = None) -> None:
+    """Пересобирает реестр моделей и короткие callback-коды."""
+    global MODEL_REGISTRY, MODEL_SHORT, MODEL_SHORT_BY_KEY, MODEL_ALIASES
+    global GATEWAY_MODELS, GROQ_MODELS, ALL_MODELS
+
+    data = catalog if catalog is not None else studio.get_catalog()
+    registry: dict[str, dict] = {}
+    for family in studio.FAMILY_ORDER[studio.PAID] + studio.FAMILY_ORDER[studio.FREE]:
+        for spec in data.get(family) or []:
+            registry[spec["key"]] = dict(spec)
+
+    MODEL_REGISTRY = registry
+    MODEL_SHORT = {}
+    MODEL_SHORT_BY_KEY = {}
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    for index, key in enumerate(registry.keys()):
+        code = ""
+        value = index
+        while True:
+            code = alphabet[value % len(alphabet)] + code
+            value //= len(alphabet)
+            if value <= 0:
+                break
+        code = f"m{code}"
+        MODEL_SHORT[code] = key
+        MODEL_SHORT_BY_KEY[key] = code
+
+    aliases: dict[str, str] = {}
+    for key, spec in registry.items():
+        model = spec.get("model") or ""
+        aliases.setdefault(key, key)
+        aliases.setdefault(model, key)
+        aliases.setdefault(spec.get("label") or model, key)
+    aliases.setdefault("deepseek", studio.DEFAULT_PAID_MODEL)
+    aliases.setdefault("groq", studio.DEFAULT_FREE_MODEL)
+    aliases.setdefault("gemini", "gemini@gemini-3.5-flash-lite")
+    aliases.setdefault("openai/gpt-oss-120b", "groq@openai/gpt-oss-120b")
+    MODEL_ALIASES = aliases
+    GATEWAY_MODELS = [
+        spec["model"] for spec in registry.values() if spec["family"] == "deepseek"
+    ]
+    GROQ_MODELS = [
+        spec["model"] for spec in registry.values() if spec["family"] == "groq"
+    ]
+    ALL_MODELS = [spec["model"] for spec in registry.values()]
+
+
+rebuild_model_registry()
+
 PREMIUM_MODELS = list(GATEWAY_MODELS)
-PROVIDER_LIMITS = {"gateway": 25}
-PROVIDER_NAMES = {"gateway": "Премиум", "groq": "Groq"}
+PROVIDER_NAMES = {
+    "gateway": "DeepSeek",
+    "pollinations_free": "Pollinations Free",
+    "pollinations_vip": "Pollinations VIP",
+    "groq": "Groq",
+    "gemini": "Gemini",
+}
 
 # Думают, но не показывают мысли текстом — честно предупреждаем.
 # Среди двух рабочих моделей таких нет, механизм оставлен на будущее.
@@ -197,6 +219,8 @@ def plural_ru(count: int, one: str, few: str, many: str) -> str:
 OWNER_ID = 6101597477
 OWNER_USERNAME = "Diotrex"
 ALLOWED_GROUPS: set[int] = {-1002495961136}
+# Белый список ЛС. Пустое множество = только владелец.
+ALLOWED_USERS: set[int] = set()
 
 HISTORY_LIMIT = 50
 HISTORY_STORE_CHARS_LIMIT = 60000
@@ -261,7 +285,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
-APP_BUILD = "2026-11-26 aikeys-3-agent-mode-admin-cleanup"
+APP_BUILD = "2026-11-27 studio-free-paid-models"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -290,17 +314,17 @@ ai_client = AsyncOpenAI(
     timeout=AI_TIMEOUT,
 )
 
-gateway_client = DeepSeekClient(
-    api_key=GATEWAY_API_KEY,
-    base_url=GATEWAY_BASE_URL,
-    model=DEFAULT_GATEWAY_MODEL,
-    http_client=http_client,
-    timeout=PREMIUM_TIMEOUT,
-    label="Шлюз",
+studio.configure(
+    http_client,
+    ai_timeout=AI_TIMEOUT,
+    premium_timeout=PREMIUM_TIMEOUT,
 )
+gateway_client = studio.gateway_client
 
 PROVIDER_CLIENTS: dict[str, DeepSeekClient] = {
     "gateway": gateway_client,
+    "pollinations_free": studio.pollinations_free_client,
+    "pollinations_vip": studio.pollinations_vip_client,
 }
 
 BOT_ID: int | None = None
@@ -314,7 +338,6 @@ _fallback_last: dict[int, float] = {}
 _media_cache: dict[tuple[int, int], str] = {}
 _locks: dict[int, asyncio.Lock] = {}
 _search_cache: dict[str, tuple[float, list[dict]]] = {}
-_image_lock = asyncio.Lock()
 
 # Фото-сессии: все подряд идущие фото одного пользователя склеиваются в одну пачку.
 _photo_sessions: dict[tuple[int, int], list[Message]] = {}
@@ -325,6 +348,7 @@ _photo_generation: dict[tuple[int, int], int] = {}
 _user_settings: dict[int, dict] = {}
 _grants: dict[tuple[int, str], dict] = {}
 _dm_blacklist: dict[int, dict] = {}
+_allowed_users_cache: dict[int, dict] = {}
 _groups_cache: dict[int, dict] = {}
 _limit_notified: set[tuple[int, str, str]] = set()
 _block_reply_last: dict[int, float] = {}
@@ -739,19 +763,42 @@ def can_send_fallback(chat_id: int) -> bool:
 
 
 DEFAULT_SETTINGS = {
-    "model": DEFAULT_GATEWAY_MODEL,
+    "model": "groq",
     "rich": True,
     "deepthink": "off",
     "search": "on",
     "length": "normal",
     "agent": False,
+    "model_free": "",
+    "model_paid": "",
+    "model_section": studio.FREE,
 }
 
 
 def normalize_model_key(key: str | None) -> str:
-    """Приводит старые ключи (deepseek, qwen) к реальным id шлюза."""
+    """Приводит старые ключи (deepseek, groq, qwen) к ключам каталога."""
     raw = str(key or "").strip()
     return MODEL_ALIASES.get(raw, raw)
+
+
+def is_owner(user_id: int | None) -> bool:
+    return user_id is not None and int(user_id) == OWNER_ID
+
+
+def default_model_for_section(section: str) -> str:
+    """Рабочая модель по умолчанию для раздела free/paid."""
+    preferred = (
+        studio.DEFAULT_PAID_MODEL if section == studio.PAID else studio.DEFAULT_FREE_MODEL
+    )
+    if preferred and preferred in MODEL_REGISTRY:
+        return preferred
+    for spec in studio.all_specs(section):
+        if spec.get("key") in MODEL_REGISTRY:
+            return spec["key"]
+    for key, info in MODEL_REGISTRY.items():
+        if info.get("section") == section:
+            return key
+    return next(iter(MODEL_REGISTRY), preferred)
 
 
 def user_settings(user_id: int | None) -> dict:
@@ -759,19 +806,20 @@ def user_settings(user_id: int | None) -> dict:
         return dict(DEFAULT_SETTINGS)
     settings = _user_settings.setdefault(int(user_id), dict(DEFAULT_SETTINGS))
     # Мягко переносим настройки из старых версий.
-    model = normalize_model_key(settings.get("model"))
-    if model not in MODEL_REGISTRY:
-        # Модель исчезла из каталога шлюза — не роняем человека на Groq,
-        # а возвращаем рабочую модель по умолчанию.
-        model = DEFAULT_GATEWAY_MODEL
-    if model and settings.get("model") != model:
-        settings["model"] = model
     if settings.get("deepthink") == "low":
         settings["deepthink"] = "medium"
     if settings.get("search") in ("auto", "always"):
         settings["search"] = "on"
     if settings.get("length") not in LENGTH_ORDER:
         settings["length"] = "normal"
+    if settings.get("model_section") not in (studio.FREE, studio.PAID):
+        settings["model_section"] = studio.FREE
+    # Проверяем сохранённые ключи моделей по живому каталогу.
+    for section, field_name in ((studio.FREE, "model_free"), (studio.PAID, "model_paid")):
+        key = normalize_model_key(settings.get(field_name) or "")
+        if key not in MODEL_REGISTRY:
+            key = default_model_for_section(section)
+        settings[field_name] = key
     return settings
 
 
@@ -781,48 +829,73 @@ def provider_of(model_key: str) -> str:
 
 
 def provider_eligible(user_id: int | None, provider: str) -> bool:
-    # Шлюз открыт всем: 25 запросов в день суммарно, владельцу — безлимит.
-    if provider == "gateway":
-        return True
-    if provider == "groq":
-        return True
-    if user_id is None:
-        return False
-    if int(user_id) == OWNER_ID:
-        return True
-    return (int(user_id), provider) in _grants
+    # Все разделы открыты белому списку; в группах доступен только free.
+    return True
 
 
 def model_available(user_id: int | None, model_key: str) -> bool:
-    """Доступна ли модель пользователю (без учёта дневного лимита)."""
+    """Доступна ли модель (без учёта дневного пула токенов)."""
     key = normalize_model_key(model_key)
-    info = MODEL_REGISTRY.get(key)
-    if not info:
-        return False
-    provider = info["provider"]
-    if provider == "groq":
-        return True
-    if not provider_eligible(user_id, provider):
+    if key not in MODEL_REGISTRY:
         return False
     if key in _model_blocked:
         return False
-    client = PROVIDER_CLIENTS.get(provider)
-    return bool(client and client.configured)
+    return True
+
+
+def user_section(user_id: int | None) -> str:
+    if user_id is None:
+        return studio.FREE
+    section = user_settings(user_id).get("model_section", studio.FREE)
+    return section if section in (studio.FREE, studio.PAID) else studio.FREE
+
+
+def section_model(user_id: int | None, section: str) -> str:
+    if user_id is None:
+        return default_model_for_section(section)
+    settings = user_settings(user_id)
+    field = "model_paid" if section == studio.PAID else "model_free"
+    key = normalize_model_key(settings.get(field) or "")
+    if key not in MODEL_REGISTRY:
+        key = default_model_for_section(section)
+    return key
 
 
 def selected_model(user_id: int | None) -> str:
-    """Выбранная модель. Если доступ пропал — Groq."""
-    if user_id is None:
-        return "groq"
-    key = normalize_model_key(user_settings(user_id).get("model"))
-    if not key or not model_available(user_id, key):
-        return "groq"
-    return key
+    """Выбранная модель текущего раздела пользователя."""
+    return section_model(user_id, user_section(user_id))
 
 
 def model_label(model_key: str) -> str:
     info = MODEL_REGISTRY.get(normalize_model_key(model_key))
     return info["label"] if info else str(model_key)
+
+
+# ------------------------------------------------------------------
+# Дневные пулы токенов: free 250к, paid 100к. Владелец — безлимит.
+# ------------------------------------------------------------------
+
+
+async def pool_used(user_id: int | None, section: str) -> int:
+    if user_id is None:
+        return 0
+    return await storage.get_usage(int(user_id), f"pool_{section}", msk_today())
+
+
+async def pool_remaining(user_id: int | None, section: str) -> int:
+    limit = studio.pool_limit(section)
+    if is_owner(user_id):
+        return limit
+    used = await pool_used(user_id, section)
+    return max(0, limit - used)
+
+
+async def pool_add(user_id: int | None, section: str, tokens: int) -> None:
+    if user_id is None or tokens is None or int(tokens) <= 0:
+        return
+    if is_owner(user_id):
+        return
+    await storage.add_tokens(int(user_id), section, msk_today(), int(tokens))
 
 
 # Раньше один апстрим приходил под разными id и статистика их склеивала.
@@ -886,6 +959,15 @@ def is_blacklisted(user_id: int | None) -> bool:
     return user_id is not None and int(user_id) in _dm_blacklist
 
 
+def is_allowed_user(user_id: int | None) -> bool:
+    """Белый список ЛС: владелец и добавленные пользователи."""
+    if user_id is None:
+        return False
+    if int(user_id) == OWNER_ID:
+        return True
+    return int(user_id) in ALLOWED_USERS
+
+
 def msk_now() -> datetime:
     return datetime.now(MSK)
 
@@ -915,70 +997,85 @@ def is_complex_task(text: str) -> bool:
     return False
 
 
-async def notify_limit(user_id: int, provider: str, limit: int) -> None:
-    key = (int(user_id), provider, msk_today().isoformat())
-    if key in _limit_notified:
-        return
-    _limit_notified.add(key)
+async def notify_pool_exhausted(message: Message, section: str | None = None) -> None:
+    """Дневной пул токенов исчерпан: показываем ошибку и кнопку другого раздела."""
+    section = section or studio.FREE
+    other = studio.PAID if section == studio.FREE else studio.FREE
+    limit = studio.pool_limit(section)
+    text = (
+        f"⚠️ Дневной пул {studio.SECTION_LABELS.get(section, section)} исчерпан "
+        f"({fmt_int(limit)} токенов). Сброс в 00:00 МСК.\n\n"
+        f"Можно перейти в {studio.SECTION_LABELS.get(other, other)}."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"Перейти в {studio.SECTION_LABELS.get(other, other)}",
+                    callback_data=f"models:sec:{other}",
+                )
+            ]
+        ]
+    )
     try:
-        await bot.send_message(
-            user_id,
-            f"⚠️ Лимит {limit} запросов в день исчерпан. "
-            "Лимит сбросится в 00:00 МСК.",
-        )
+        await message.reply(text, reply_markup=kb)
     except Exception:
-        pass
+        try:
+            await message.answer(text, reply_markup=kb)
+        except Exception:
+            pass
 
 
 async def resolve_model(user_id: int | None, private: bool) -> str:
-    """Возвращает модель для запроса и списывает дневной лимит (25 в день).
+    """Возвращает модель для запроса.
 
-    Пустая строка означает «лимит исчерпан»: ответ не подменяется Groq.
+    В группах — только бесплатный раздел. Пустая строка означает, что
+    дневной пул раздела исчерпан: вызывающий код показывает ошибку.
     """
-    if not private or user_id is None:
-        return "groq"
-    key = selected_model(user_id)
-    provider = provider_of(key)
-    if provider == "groq":
-        return "groq"
-    if int(user_id) == OWNER_ID:
+    if not private:
+        key = section_model(user_id, studio.FREE)
+        if key not in MODEL_REGISTRY:
+            key = default_model_for_section(studio.FREE)
+        if not is_owner(user_id) and await pool_remaining(user_id, studio.FREE) <= 0:
+            return ""
         return key
-    limit = PROVIDER_LIMITS.get(provider, 0)
-    today = msk_today()
-    used = await storage.get_usage(int(user_id), provider, today)
-    if used >= limit:
-        await notify_limit(int(user_id), provider, limit)
+    if user_id is None:
+        return default_model_for_section(studio.FREE)
+    section = user_section(user_id)
+    key = section_model(user_id, section)
+    if not is_owner(user_id) and await pool_remaining(user_id, section) <= 0:
         return ""
-    await storage.inc_usage(int(user_id), provider, today)
     return key
 
 
 async def set_model_for_user(user_id: int, model_key: str) -> tuple[bool, str]:
-    """Переключает модель. Контекст, кэш фото и фотосессии сохраняются."""
+    """Переключает модель. Контекст и кэш фото сохраняются."""
     model_key = normalize_model_key(model_key)
     if model_key not in MODEL_REGISTRY:
         return False, "Неизвестная модель."
     if model_key in _model_blocked:
         return False, f"Модель {model_label(model_key)} сейчас недоступна."
-    if not model_available(user_id, model_key):
-        provider = provider_of(model_key)
-        name = PROVIDER_NAMES.get(provider, provider)
-        return False, f"{name} тебе не выдан. Напиши владельцу @{OWNER_USERNAME}."
     info = MODEL_REGISTRY[model_key]
-    client = PROVIDER_CLIENTS.get(info["provider"])
-    if info["provider"] != "groq" and (client is None or not client.configured):
-        return False, "Шлюз не настроен на сервере: нет API-ключа GATEWAY_API."
+    section = info.get("section", studio.FREE)
+    field = "model_paid" if section == studio.PAID else "model_free"
     settings = user_settings(user_id)
-    if settings.get("model") == model_key:
+    if settings.get(field) == model_key and settings.get("model_section") == section:
         return True, f"Уже выбрана модель {model_label(model_key)}."
+    settings[field] = model_key
+    settings["model_section"] = section
     settings["model"] = model_key
-    await storage.save_user_settings(int(user_id), model=model_key)
+    await storage.save_user_settings(
+        int(user_id),
+        **{field: model_key, "model_section": section, "model": model_key},
+    )
     note = ""
-    provider = info["provider"]
-    if provider != "groq" and int(user_id) != OWNER_ID:
-        used = await storage.get_usage(int(user_id), provider, msk_today())
-        limit = PROVIDER_LIMITS.get(provider, 0)
-        note = f"\nОсталось сегодня: {max(0, limit - used)} из {limit}."
+    if not is_owner(user_id):
+        left = await pool_remaining(user_id, section)
+        note = (
+            f"\nОсталось сегодня: {fmt_int(left)} ток."
+            if left > 0
+            else "\nПул этого раздела на сегодня исчерпан."
+        )
     return (
         True,
         f"Модель переключена на {model_label(model_key)}. Контекст сохранён.{note}",
@@ -1180,68 +1277,8 @@ def is_addressed(message: Message, text: str | None) -> bool:
 
 
 # ============================================================
-# РИСОВАНИЕ: ЯВНЫЕ ТРИГГЕРЫ
+# РАЗНОЕ
 # ============================================================
-
-DRAW_VERBS = r"(нарисуй(?:-ка)?|нарисуйте|draw|sketch)"
-IMAGE_NOUNS = (
-    r"(картинк\w*|изображени\w*|арт\w*|иллюстраци\w*|постер\w*|логотип\w*|"
-    r"аватарк\w*|обложк\w*|фотк\w*|фото|мем\w*|персонаж\w*)"
-)
-DRAW_NEGATIVE = (
-    r"(схем\w*|график\w*|таблиц\w*|код\w*|план\w*|диаграмм\w*|"
-    r"текст\w*|письм\w*|презентаци\w*|список\w*|инструкци\w*)"
-)
-DRAW_LEADING_WORDS = re.compile(
-    r"^(мне|пожалуйста|плиз|картинку|картинка|изображение|фото|фотку|"
-    r"picture|image|a|an|the)\b[\s,:—-]+",
-    re.IGNORECASE,
-)
-
-
-def clean_draw_prompt(tail: str) -> str:
-    result = (tail or "").strip(" \t\n,.:;!?—-")
-    for _ in range(4):
-        new = DRAW_LEADING_WORDS.sub("", result, count=1)
-        if new == result:
-            break
-        result = new.strip(" \t\n,.:;!?—-")
-    return result
-
-
-def detect_explicit_draw(text: str) -> str | None:
-    if not text:
-        return None
-
-    # «нарисуй кота», «draw a cat»
-    m = re.search(rf"\b{DRAW_VERBS}\b", text, flags=re.IGNORECASE)
-    if m:
-        prompt = clean_draw_prompt(text[m.end():])
-        if not prompt:
-            return None
-        # «нарисуй схему/таблицу/код» — это не картинка, пусть решает Groq.
-        if re.match(DRAW_NEGATIVE, prompt, flags=re.IGNORECASE):
-            return None
-        return prompt
-
-    # «сгенерируй картинку кота», «сделай постер с котом»
-    m = re.search(
-        r"\b(сгенерируй|сгенерируйте|сделай|сделайте|создай|создайте|generate)\b(.*)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if m:
-        tail = m.group(2)
-        noun = re.search(IMAGE_NOUNS, tail, flags=re.IGNORECASE)
-        if noun:
-            prompt = clean_draw_prompt(tail[noun.end():]) or clean_draw_prompt(tail)
-            if not prompt:
-                return None
-            if re.match(DRAW_NEGATIVE, prompt, flags=re.IGNORECASE):
-                return None
-            return prompt
-    return None
-
 
 SEARCH_VERBS = (
     "поищи", "поищи-ка", "найди", "загугли", "погугли", "search",
@@ -1252,11 +1289,6 @@ SEARCH_VERBS = (
 def has_search_verb(text: str) -> bool:
     lowered = (text or "").lower()
     return any(v in lowered for v in SEARCH_VERBS)
-
-
-# ============================================================
-# РАЗНОЕ
-# ============================================================
 
 
 def format_uptime() -> str:
@@ -1340,24 +1372,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "generate_image",
-            "description": (
-                "Сгенерировать и отправить изображение. Только для визуальных объектов: "
-                "кот, пейзаж, постер, логотип. Не для кода, текста, таблиц, схем и графиков."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt_en": {"type": "string", "description": "Промпт на английском"},
-                    "prompt_ru": {"type": "string", "description": "Тот же промпт на русском"},
-                },
-                "required": ["prompt_en", "prompt_ru"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "render_widget",
             "description": (
                 "Показать интерактивную карточку-виджет в личном чате. Используй, когда "
@@ -1421,10 +1435,16 @@ SEARCH_TOOLS = [TOOLS[0]]
 # ============================================================
 
 
-async def groq_chat(messages, tools=None, tool_choice="auto", max_tokens: int | None = None):
+async def groq_chat(
+    messages,
+    tools=None,
+    tool_choice="auto",
+    max_tokens: int | None = None,
+    model: str | None = None,
+):
     async def _do():
         kwargs = {
-            "model": CHAT_MODEL,
+            "model": model or CHAT_MODEL,
             "messages": messages,
             "temperature": 0.7,
             "max_tokens": int(max_tokens or CHAT_MAX_TOKENS),
@@ -1488,10 +1508,11 @@ async def groq_stream(
     tool_choice="auto",
     max_tokens: int | None = None,
     on_delta=None,
+    model: str | None = None,
 ) -> ChatResult:
     """Стриминг Groq с накоплением текста, мыслей и tool-call'ов."""
     base = {
-        "model": CHAT_MODEL,
+        "model": model or CHAT_MODEL,
         "messages": messages,
         "temperature": 0.7,
         "max_tokens": int(max_tokens or CHAT_MAX_TOKENS),
@@ -1595,7 +1616,7 @@ async def groq_stream(
         reasoning_tokens=reasoning_tokens,
         cached_tokens=cached_tokens,
         total_tokens=total_tokens or prompt_tokens + completion_tokens,
-        model=CHAT_MODEL,
+        model=model or CHAT_MODEL,
         finish_reason=finish or "",
     )
 
@@ -1610,6 +1631,7 @@ async def call_model(
     effort: str = "low",
     max_tokens: int | None = None,
     model: str | None = None,
+    model_key: str | None = None,
     on_delta=None,
     reset_cb=None,
 ) -> ChatResult:
@@ -1617,8 +1639,14 @@ async def call_model(
     status = "ok"
     error_text = ""
     result: ChatResult | None = None
+    spec = MODEL_REGISTRY.get(model_key) if model_key else None
+    if spec is None and model:
+        for candidate in MODEL_REGISTRY.values():
+            if candidate.get("model") == model and candidate.get("provider") == provider:
+                spec = candidate
+                break
     client = PROVIDER_CLIENTS.get(provider)
-    model_name = model or (
+    model_name = model or (spec.get("model") if spec else None) or (
         CHAT_MODEL if provider == "groq" else (client.model if client else provider)
     )
     default_max = CHAT_MAX_TOKENS if provider == "groq" else PREMIUM_MAX_TOKENS
@@ -1631,6 +1659,7 @@ async def call_model(
                     tool_choice or "auto",
                     max_tokens or default_max,
                     on_delta,
+                    model=model_name,
                 )
             else:
                 response = await groq_chat(
@@ -1638,8 +1667,28 @@ async def call_model(
                     tools,
                     tool_choice or "auto",
                     max_tokens or default_max,
+                    model=model_name,
                 )
-                result = openai_to_chat_result(response, provider, CHAT_MODEL)
+                result = openai_to_chat_result(response, provider, model_name)
+        elif provider in ("pollinations_free", "pollinations_vip"):
+            if spec is None:
+                raise RuntimeError("Модель не найдена в каталоге студии.")
+            result = await studio.pollinations_chat(
+                spec,
+                messages,
+                tools=tools,
+                tool_choice=tool_choice,
+                max_tokens=max_tokens or default_max,
+                on_delta=on_delta,
+            )
+        elif provider == "gemini":
+            if spec is None:
+                raise RuntimeError("Модель не найдена в каталоге студии.")
+            result = await studio.gemini_chat(
+                spec,
+                messages,
+                max_tokens=max_tokens or default_max,
+            )
         else:
             if client is None or not client.configured:
                 raise RuntimeError(f"{PROVIDER_NAMES.get(provider, provider)} не настроен")
@@ -1725,14 +1774,8 @@ def assistant_tool_message(msg) -> dict:
 
 
 # ============================================================
-# GEMINI — ОПИСАНИЕ ФОТО
+# РАСПОЗНАВАНИЕ ФОТО — Groq new3
 # ============================================================
-
-VISION_PROMPT = (
-    "Опиши это изображение подробно для памяти ассистента: объекты, люди, "
-    "цвета, расположение, весь видимый текст, важные детали. 80–150 слов. "
-    "Пиши только описание, без вступлений вроде «на фото»."
-)
 
 
 def image_mime(image_bytes: bytes, fallback: str | None = None) -> str:
@@ -1752,100 +1795,13 @@ async def describe_image(
     mime: str | None = None,
     *,
     track: Track | None = None,
+    section: str = studio.FREE,
 ) -> str:
+    """Распознавание фото только через Groq new3 (бесплатный ключ)."""
     mime = image_mime(image_bytes, mime)
-    b64 = base64.b64encode(image_bytes).decode()
-
-    async def gemini_describe() -> tuple[str, dict]:
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": VISION_PROMPT},
-                        {"inline_data": {"mime_type": mime, "data": b64}},
-                    ],
-                }
-            ],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 700},
-        }
-
-        response = await http_client.post(
-            f"{GEMINI_BASE_URL}/models/{VISION_MODEL}:generateContent",
-            headers={"x-goog-api-key": GEMINI_API_KEY},
-            json=payload,
-            timeout=AI_TIMEOUT,
-        )
-        response.raise_for_status()
-        data = response.json()
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise RuntimeError(f"Gemini вернул пустой ответ: {str(data)[:200]}")
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-        text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-        if not text:
-            raise RuntimeError(
-                f"Gemini не вернул описание (finishReason={candidates[0].get('finishReason')})"
-            )
-        return text, data.get("usageMetadata") or {}
-
-    async def groq_describe() -> tuple[str, dict]:
-        content = [
-            {"type": "text", "text": VISION_PROMPT},
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-        ]
-        response = await ai_client.chat.completions.create(
-            model=GROQ_VISION_MODEL,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=800,
-        )
-        text = (response.choices[0].message.content or "").strip()
-        if not text:
-            raise RuntimeError("Groq vision вернул пустой ответ")
-        return text, response
-
     started = time.perf_counter()
     try:
-        text, usage = await with_retry(gemini_describe, retries=2)
-        if track is not None:
-            prompt_tokens = int(usage.get("promptTokenCount") or 0)
-            completion_tokens = int(usage.get("candidatesTokenCount") or 0)
-            reasoning_tokens = int(usage.get("thoughtsTokenCount") or 0)
-            cached_tokens = int(usage.get("cachedContentTokenCount") or 0)
-            await storage.add_call(
-                request_id=track.request_id,
-                user_id=track.user_id,
-                chat_id=track.chat_id,
-                provider="gemini",
-                model=VISION_MODEL,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                reasoning_tokens=reasoning_tokens,
-                cached_tokens=cached_tokens,
-                total_tokens=prompt_tokens + completion_tokens + reasoning_tokens,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-            )
-        return text
-    except Exception as e:
-        logging.warning(
-            f"Gemini vision failed ({type(e).__name__}: {e}); "
-            f"пробую {GROQ_VISION_MODEL}"
-        )
-        if track is not None:
-            await storage.add_call(
-                request_id=track.request_id,
-                user_id=track.user_id,
-                chat_id=track.chat_id,
-                provider="gemini",
-                model=VISION_MODEL,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-                status="error",
-                error=str(e),
-            )
-
-    started = time.perf_counter()
-    try:
-        text, response = await with_retry(groq_describe, retries=2)
+        text, response = await studio.describe_image(image_bytes, mime, section=section)
     except Exception as e:
         if track is not None:
             await storage.add_call(
@@ -1853,26 +1809,27 @@ async def describe_image(
                 user_id=track.user_id,
                 chat_id=track.chat_id,
                 provider="groq",
-                model=GROQ_VISION_MODEL,
+                model=studio.GROQ_VISION_MODEL,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 status="error",
                 error=str(e),
             )
         raise
-
     if track is not None:
-        usage = response.usage
+        usage = getattr(response, "usage", None)
         prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        total = prompt_tokens + completion_tokens
+        track.total_tokens += total
         await storage.add_call(
             request_id=track.request_id,
             user_id=track.user_id,
             chat_id=track.chat_id,
             provider="groq",
-            model=GROQ_VISION_MODEL,
+            model=studio.GROQ_VISION_MODEL,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
+            total_tokens=total,
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
     return text
@@ -1925,39 +1882,16 @@ def audio_extension(media, file_path: str | None) -> str:
     return AUDIO_EXT_BY_MIME.get(mime, ".ogg")
 
 
-async def transcribe_voice(file_path: str, *, track: Track | None = None) -> str:
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext not in GROQ_AUDIO_EXTENSIONS:
-        ext = ".ogg"
-    content_type = AUDIO_MIME_BY_EXT[ext]
-
-    async def _do():
-        with open(file_path, "rb") as f:
-            result = await asyncio.wait_for(
-                ai_client.audio.transcriptions.create(
-                    # Явное имя обязательно: иначе SDK возьмёт имя временного
-                    # файла (например, .oga), и Groq ответит 400.
-                    file=(f"voice{ext}", f, content_type),
-                    model=WHISPER_MODEL,
-                    language="ru",
-                ),
-                timeout=AI_TIMEOUT,
-            )
-        return (result.text or "").strip()
-
+async def transcribe_voice(
+    file_path: str,
+    *,
+    track: Track | None = None,
+    section: str = studio.FREE,
+    user_id: int | None = None,
+) -> str:
     started = time.perf_counter()
     try:
-        text = await with_retry(_do, retries=2)
-        if track is not None:
-            await storage.add_call(
-                request_id=track.request_id,
-                user_id=track.user_id,
-                chat_id=track.chat_id,
-                provider="groq",
-                model=WHISPER_MODEL,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-            )
-        return text
+        text, estimate = await studio.transcribe_voice(file_path, section=section)
     except Exception as e:
         if track is not None:
             await storage.add_call(
@@ -1965,12 +1899,27 @@ async def transcribe_voice(file_path: str, *, track: Track | None = None) -> str
                 user_id=track.user_id,
                 chat_id=track.chat_id,
                 provider="groq",
-                model=WHISPER_MODEL,
+                model=studio.GROQ_FALLBACK_VOICE_MODEL,
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 status="error",
                 error=str(e),
             )
         raise
+    estimate = int(estimate or 0)
+    if track is not None:
+        track.total_tokens += estimate
+        await storage.add_call(
+            request_id=track.request_id,
+            user_id=track.user_id,
+            chat_id=track.chat_id,
+            provider="groq",
+            model=studio.GROQ_FALLBACK_VOICE_MODEL,
+            total_tokens=estimate,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+    elif user_id is not None:
+        await pool_add(user_id, section, estimate)
+    return text
 
 
 # ============================================================
@@ -1978,13 +1927,19 @@ async def transcribe_voice(file_path: str, *, track: Track | None = None) -> str
 # ============================================================
 
 
-async def tavily_search(query: str, max_results: int = 5) -> list[dict]:
+async def tavily_search(
+    query: str, max_results: int = 5, *, section: str = studio.FREE
+) -> list[dict]:
+    api_key = studio.tavily_key(section)
+    if not api_key:
+        raise RuntimeError("Tavily: ключ не задан")
+
     async def _do():
         response = await http_client.post(
             "https://api.tavily.com/search",
-            headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+            headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "api_key": TAVILY_API_KEY,
+                "api_key": api_key,
                 "query": query,
                 "max_results": max_results,
                 "search_depth": "basic",
@@ -2027,12 +1982,14 @@ def normalize_results(results: list[dict]) -> list[dict]:
     return normalized
 
 
-async def search_web(query: str, max_results: int = 5) -> list[dict]:
+async def search_web(
+    query: str, max_results: int = 5, *, section: str = studio.FREE
+) -> list[dict]:
     query = (query or "").strip()
     if not query:
         return []
 
-    key = query.lower()
+    key = f"{section}:{query.lower()}"
     now = time.time()
     cached = _search_cache.get(key)
     if cached and now - cached[0] < 600:
@@ -2040,7 +1997,9 @@ async def search_web(query: str, max_results: int = 5) -> list[dict]:
 
     results: list[dict] = []
     try:
-        results = normalize_results(await tavily_search(query, max_results))
+        results = normalize_results(
+            await tavily_search(query, max_results, section=section)
+        )
         logging.info(f"TAVILY '{query}' -> {len(results)} результатов")
     except Exception as e:
         logging.warning(f"Tavily failed: {e}")
@@ -2066,132 +2025,6 @@ def render_results(results: list[dict]) -> str:
         )
     return "\n\n".join(lines)
 
-
-# ============================================================
-# КАРТИНКИ — POLLINATIONS
-# ============================================================
-
-
-def clamp_size(width: int, height: int) -> tuple[int, int]:
-    width = max(256, min(2048, int(width)))
-    height = max(256, min(2048, int(height)))
-    max_area = 768 * 768
-    if width * height > max_area:
-        k = (max_area / (width * height)) ** 0.5
-        width = int(width * k)
-        height = int(height * k)
-    return max(256, width // 8 * 8), max(256, height // 8 * 8)
-
-
-def parse_image_params(text: str) -> tuple[int, int]:
-    width, height = 768, 768
-    lowered = (text or "").lower()
-
-    m = re.search(r"(\d{2,4})\s*[xх]\s*(\d{2,4})", lowered)
-    if m:
-        width, height = int(m.group(1)), int(m.group(2))
-    elif "16:9" in lowered or "горизонталь" in lowered or "широк" in lowered:
-        width, height = 768, 432
-    elif "9:16" in lowered or "вертикаль" in lowered:
-        width, height = 432, 768
-    elif "4:3" in lowered:
-        width, height = 768, 576
-
-    return clamp_size(width, height)
-
-
-async def generate_image_bytes(prompt_en: str, width: int, height: int) -> bytes:
-    seed = random.randint(1, 1_000_000)
-    url = (
-        f"https://image.pollinations.ai/prompt/{quote(prompt_en, safe='')}"
-        f"?width={width}&height={height}&nologo=true&seed={seed}"
-    )
-
-    async def _do():
-        response = await http_client.get(url, timeout=90.0)
-        response.raise_for_status()
-        data = response.content
-        ctype = (response.headers.get("content-type") or "").lower()
-        looks_like_image = (
-            data.startswith(b"\x89PNG")
-            or data.startswith(b"\xff\xd8")
-            or data.startswith(b"GIF8")
-            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
-        )
-        if not looks_like_image:
-            raise RuntimeError(
-                f"Генератор вернул не картинку (content-type: {ctype or 'unknown'})"
-            )
-        if len(data) < 1000:
-            raise RuntimeError("Пустой ответ от генератора картинок")
-        return data
-
-    async with _image_lock:
-        return await with_retry(_do, retries=2, base_wait=3.0)
-
-
-# ============================================================
-# ПЕРЕВОД ПРОМПТА
-# ============================================================
-
-
-async def translate_to_english(text: str, *, track: Track | None = None) -> str:
-    async def _do():
-        response = await asyncio.wait_for(
-            ai_client.chat.completions.create(
-                model=FAST_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Переведи текст на английский для генератора изображений. "
-                            "Сохрани объекты, стиль, атмосферу и детали. Убери служебные "
-                            "фразы вроде «нарисуй». Верни только перевод без кавычек."
-                        ),
-                    },
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.2,
-                max_tokens=300,
-            ),
-            timeout=30.0,
-        )
-        return response
-
-    started = time.perf_counter()
-    try:
-        response = await with_retry(_do, retries=2)
-        result = (response.choices[0].message.content or "").strip().strip('"').strip("'")
-        if track is not None:
-            usage = response.usage
-            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-            await storage.add_call(
-                request_id=track.request_id,
-                user_id=track.user_id,
-                chat_id=track.chat_id,
-                provider="groq",
-                model=FAST_MODEL,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-            )
-        return result or text
-    except Exception as e:
-        logging.warning(f"translate_to_english failed: {e}")
-        if track is not None:
-            await storage.add_call(
-                request_id=track.request_id,
-                user_id=track.user_id,
-                chat_id=track.chat_id,
-                provider="groq",
-                model=FAST_MODEL,
-                latency_ms=int((time.perf_counter() - started) * 1000),
-                status="error",
-                error=str(e),
-            )
-        return text
 
 # ============================================================
 # ОТПРАВКА И СТАТУСЫ
@@ -2232,11 +2065,8 @@ class Turn:
     chat_id: int
     is_private: bool
     user_text: str = ""
-    explicit_draw: str | None = None
-    image_sent: bool = False
-    image_prompt_ru: str = ""
-    image_error: str = ""
     model: str = "groq"
+    section: str = studio.FREE
     track: Track | None = None
     tools_used: list[str] = field(default_factory=list)
     rich_allowed: bool = True
@@ -2801,23 +2631,6 @@ class RichStreamer:
             await self._deliver(chunk)
 
 
-async def send_photo(turn: Turn, data: bytes, caption: str) -> bool:
-    ext = "png" if data.startswith(b"\x89PNG") else "jpg"
-    caption = caption[:1000]
-    file = BufferedInputFile(data, filename=f"image.{ext}")
-    try:
-        if turn.is_private:
-            sent = await turn.message.answer_photo(photo=file, caption=caption)
-        else:
-            sent = await turn.message.reply_photo(photo=file, caption=caption)
-        _media_cache[(turn.chat_id, sent.message_id)] = turn.image_prompt_ru or "сгенерированная картинка"
-        return True
-    except Exception as e:
-        logging.error(f"send_photo error: {e}")
-        await send_text(turn, f"⚠️ Не удалось отправить картинку: <code>{esc(e)}</code>")
-        return False
-
-
 # ============================================================
 # СКАЧИВАНИЕ МЕДИА
 # ============================================================
@@ -3085,34 +2898,8 @@ async def execute_tool(turn: Turn, name: str, args: dict) -> str:
                 return "Ошибка: пустой поисковый запрос."
             await turn.status.show("🔍 Ищу в интернете…")
             logging.info(f"[{turn.chat_id}] TOOL web_search: {query}")
-            results = await search_web(query)
+            results = await search_web(query, section=turn.section)
             return render_results(results)
-
-        if name == "generate_image":
-            if turn.image_sent:
-                return "Изображение уже отправлено, повторно не генерируй."
-            prompt_en = (args.get("prompt_en") or "").strip()
-            prompt_ru = (args.get("prompt_ru") or "").strip() or prompt_en
-            if not prompt_en:
-                return "Ошибка: пустой промпт изображения."
-
-            await turn.status.show("🎨 Рисую…")
-            width, height = parse_image_params(turn.user_text)
-            logging.info(f"[{turn.chat_id}] TOOL generate_image: {prompt_en[:100]} ({width}x{height})")
-            try:
-                data = await generate_image_bytes(prompt_en, width, height)
-                turn.image_prompt_ru = prompt_ru
-                ok = await send_photo(turn, data, f"🎨 Нарисовал: <i>{esc(prompt_ru[:300])}</i>")
-                if not ok:
-                    turn.image_error = "не удалось отправить изображение в Telegram"
-                    return "Ошибка: изображение сгенерировано, но не отправлено."
-                turn.image_sent = True
-                turn.image_error = ""
-                return "Изображение сгенерировано и отправлено пользователю."
-            except Exception as e:
-                turn.image_error = str(e)
-                logging.exception("Image generation error")
-                return f"Ошибка генерации изображения: {e}"
 
         if name == "render_widget":
             kind = (args.get("kind") or "").strip().lower()
@@ -3170,9 +2957,9 @@ async def execute_tool(turn: Turn, name: str, args: dict) -> str:
             )
 
 
-TEXT_TOOL_NAMES = ("make_checklist", "render_widget", "generate_image", "web_search")
+TEXT_TOOL_NAMES = ("make_checklist", "render_widget", "web_search")
 _TEXT_TOOL_BLOCK_RE = re.compile(
-    r"<(make_checklist|render_widget|generate_image|web_search)\b([^>]*?)"
+    r"<(make_checklist|render_widget|web_search)\b([^>]*?)"
     r"(?:/>|>(.*?)</\1\s*>)",
     re.IGNORECASE | re.DOTALL,
 )
@@ -3307,11 +3094,6 @@ def _text_tool_args(name: str, attrs: dict, body: str) -> dict:
                 args["spec"] = parsed_spec
         return args
 
-    if name == "generate_image":
-        args.setdefault("prompt_ru", args.get("prompt") or args.get("prompt_ru") or body)
-        args.setdefault("prompt_en", args.get("prompt") or args.get("prompt_en") or body)
-        return args
-
     # web_search
     if body and not args.get("query"):
         args["query"] = body
@@ -3351,6 +3133,7 @@ async def run_tools(
     track: Track | None = None,
     effort: str = "off",
     model: str | None = None,
+    model_key: str | None = None,
     on_delta=None,
     reset_cb=None,
     max_tokens: int | None = None,
@@ -3371,6 +3154,7 @@ async def run_tools(
                 effort=effort,
                 max_tokens=limit,
                 model=model,
+                model_key=model_key,
                 on_delta=on_delta,
                 reset_cb=reset_cb,
             )
@@ -3425,6 +3209,7 @@ async def run_tools(
             effort=effort,
             max_tokens=limit,
             model=model,
+            model_key=model_key,
             on_delta=on_delta,
             reset_cb=reset_cb,
         )
@@ -3433,28 +3218,6 @@ async def run_tools(
     content = (final.content or "").strip()
     clean, _text_calls = extract_text_tool_calls(content)
     return clean or content
-
-
-async def fallback_draw(turn: Turn) -> None:
-    prompt_ru = (turn.explicit_draw or turn.user_text or "").strip()
-    if not prompt_ru:
-        return
-    await turn.status.show("🎨 Рисую…")
-    prompt_en = await translate_to_english(prompt_ru, track=turn.track)
-    width, height = parse_image_params(turn.user_text)
-    try:
-        data = await generate_image_bytes(prompt_en, width, height)
-        turn.image_prompt_ru = prompt_ru
-        ok = await send_photo(turn, data, f"🎨 Нарисовал: <i>{esc(prompt_ru[:300])}</i>")
-        if not ok:
-            turn.image_error = "не удалось отправить изображение в Telegram"
-        else:
-            turn.image_sent = True
-            turn.image_error = ""
-    except Exception as e:
-        turn.image_error = str(e)
-        logging.exception("Fallback image generation error")
-        await send_text(turn, f"⚠️ Ошибка генерации: <code>{esc(e)}</code>")
 
 
 async def send_switch_button(turn: Turn, error_text: str) -> None:
@@ -3545,11 +3308,13 @@ async def run_ai(turn: Turn) -> None:
     started = time.perf_counter()
     model_key = normalize_model_key(turn.model)
     if model_key not in MODEL_REGISTRY:
-        model_key = "groq"
+        model_key = default_model_for_section(turn.section)
     turn.model = model_key
     info = MODEL_REGISTRY[model_key]
     provider = info["provider"]
     model_id = info["model"]
+    section = info.get("section", turn.section)
+    turn.section = section
     user = turn.message.from_user
     user_id = user.id if user else None
     settings_active = turn.is_private and user_id is not None
@@ -3588,8 +3353,6 @@ async def run_ai(turn: Turn) -> None:
         if agent:
             # В агентском режиме модель сама выбирает инструменты на каждом шаге.
             forced = None
-        elif turn.explicit_draw:
-            forced = {"type": "function", "function": {"name": "generate_image"}}
         elif search_on and has_search_verb(turn.user_text):
             forced = {"type": "function", "function": {"name": "web_search"}}
         else:
@@ -3615,6 +3378,7 @@ async def run_ai(turn: Turn) -> None:
             track=turn.track,
             effort=effort,
             model=model_id,
+            model_key=model_key,
             on_delta=streamer.on_delta if streamer else None,
             reset_cb=streamer.reset if streamer else None,
             max_tokens=max_tokens,
@@ -3655,22 +3419,6 @@ async def run_ai(turn: Turn) -> None:
                     messages, tools, executor, forced, **attempt_args
                 )
 
-        if turn.explicit_draw and not turn.image_sent and not turn.image_error:
-            await fallback_draw(turn)
-
-        if turn.image_sent:
-            await add_to_history(
-                turn.chat_id,
-                "assistant",
-                f"Отправил сгенерированную картинку: {turn.image_prompt_ru}",
-            )
-        elif turn.image_error:
-            await add_to_history(
-                turn.chat_id,
-                "assistant",
-                f"Не удалось сгенерировать изображение: {turn.image_error}",
-            )
-
         footer = usage_footer(turn, rich)
         if answer:
             answer = strip_text_tool_calls(answer)
@@ -3678,18 +3426,12 @@ async def run_ai(turn: Turn) -> None:
         if answer and note:
             footer = note + ("\n\n" + footer if footer else "")
         if answer:
-            if turn.image_sent and is_trivial(answer):
-                # Картинка уже отправлена. Вместо «ОК» показываем расход.
-                token_note = usage_footer(turn, False).strip()
-                if token_note:
-                    await send_text(turn, token_note)
+            if streamer is not None:
+                await streamer.finish(answer, footer=footer)
             else:
-                if streamer is not None:
-                    await streamer.finish(answer, footer=footer)
-                else:
-                    await send_text(turn, answer + footer)
-                await add_to_history(turn.chat_id, "assistant", answer)
-        elif turn.tools_used or turn.image_sent or turn.image_error:
+                await send_text(turn, answer + footer)
+            await add_to_history(turn.chat_id, "assistant", answer)
+        elif turn.tools_used:
             # Инструмент уже сработал — не пишем «Не понял».
             if footer and streamer is not None:
                 await streamer.finish("", footer=footer)
@@ -3703,8 +3445,8 @@ async def run_ai(turn: Turn) -> None:
 
         _stats[turn.chat_id] = _stats.get(turn.chat_id, 0) + 1
         logging.info(
-            f"[{turn.chat_id}] AI готов | model={model_key} | rich={rich} | "
-            f"draw={turn.image_sent} | поиск={search_on} | длина={length} | "
+            f"[{turn.chat_id}] AI готов | model={model_key} | section={section} | "
+            f"rich={rich} | поиск={search_on} | длина={length} | "
             f"agent={agent} | effort={effort} | "
             f"токенов={turn.track.total_tokens if turn.track else 0}"
         )
@@ -3734,6 +3476,8 @@ async def run_ai(turn: Turn) -> None:
             model=model_key,
             tools=",".join(turn.tools_used),
         )
+        if turn.track is not None:
+            await pool_add(user_id, section, turn.track.total_tokens)
         await turn.status.clear()
 
 # ============================================================
@@ -3743,7 +3487,8 @@ async def run_ai(turn: Turn) -> None:
 
 def command_allowed(message: Message) -> bool:
     if is_private(message):
-        return True
+        user = message.from_user
+        return user is not None and is_allowed_user(user.id)
     return is_whitelisted(message.chat.id)
 
 
@@ -3779,10 +3524,11 @@ async def cmd_start(message: Message):
         "• В <b>личке</b> — отвечаю на всё: текст, голосовые, фото, реплаи.\n"
         "• В <b>группах</b> — когда обращаются словом <b>мох</b>, через "
         f"<b>@{BOT_USERNAME or 'M0XAIBOT'}</b> или реплаем на моё сообщение.\n"
-        "• <b>Рисование</b>: <code>мох нарисуй кота</code>\n"
+        "• <b>Модели</b> — бесплатные и платные, в /models.\n"
         "• <b>Поиск</b> — включается сам, когда нужны свежие данные.\n"
         "• <b>Inline</b>: <code>@M0XAIBOT запрос</code>\n\n"
         "🧩 Модели и режимы: /models\n"
+        "👤 Профиль и лимиты: /profile\n"
         "🧹 Сбросить контекст: /clear\n"
         "ℹ️ Обо мне: /about",
     )
@@ -3790,34 +3536,8 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    if not command_allowed(message):
-        return
-    extra = ""
-    if is_private(message) and message.from_user:
-        extra = "/models — выбрать модель и режимы\n"
-        if message.from_user.id == OWNER_ID:
-            extra += "/admin — админ-панель\n"
-    await reply_any(
-        message,
-        "🌿 <b>Что я умею:</b>\n\n"
-        "• Отвечаю на вопросы и помню контекст\n"
-        "• Понимаю фото и голосовые\n"
-        "• Рисую: <code>нарисуй кота</code>\n"
-        "• Строю графики и таблицы: <code>построй график</code>\n"
-        "• Делаю тесты и чек-листы: <code>составь чек-лист деплоя</code>\n"
-        "• Ищу в интернете, когда нужно\n"
-        "• Режим агента: до 8 шагов — в /models → «Режимы»\n"
-        "• Отвечаю в inline-режиме\n\n"
-        "<b>Команды:</b>\n"
-        "/start — приветствие\n"
-        "/help — это меню\n"
-        "/about — инфо обо мне\n"
-        "/clear — очистить контекст\n"
-        "/context — размер памяти\n"
-        "/whoami — твой ID\n"
-        "/stats — статистика\n"
-        f"{extra}",
-    )
+    # /help теперь ведёт в /about: единая справка.
+    await cmd_about(message)
 
 
 @dp.message(Command("about"))
@@ -3825,13 +3545,17 @@ async def cmd_about(message: Message):
     if not command_allowed(message):
         return
     chat_id = message.chat.id
-    current = "groq"
+    current = default_model_for_section(studio.FREE)
     if is_private(message) and message.from_user:
         current = selected_model(message.from_user.id)
+    section = (MODEL_REGISTRY.get(normalize_model_key(current)) or {}).get(
+        "section", studio.FREE
+    )
     current_line = (
-        f"Сейчас: <b>{esc(model_label(current))}</b> (только в личке)"
+        f"Сейчас: <b>{esc(model_label(current))}</b> · "
+        f"{studio.SECTION_LABELS.get(section, section)}"
         if is_private(message)
-        else "В группах: 🌿 Groq"
+        else f"В группах: <b>{esc(model_label(current))}</b> (только free)"
     )
     agent_on = bool(
         is_private(message)
@@ -3845,46 +3569,48 @@ async def cmd_about(message: Message):
         if is_private(message)
         else ""
     )
-    model_lines = "\n".join(f"• {esc(model_label(key))}" for key in GATEWAY_MODELS)
+    free_n = len(_section_keys(studio.FREE))
+    paid_n = len(_section_keys(studio.PAID))
     await reply_any(
         message,
         "🌿 <b>Мудрый Мох — информация</b>\n\n"
-        f"<b>🧩 Модели:</b> {len(GATEWAY_MODELS)} "
-        f"{plural_ru(len(GATEWAY_MODELS), 'модель', 'модели', 'моделей')}\n"
-        f"{model_lines}\n{current_line}{agent_line}\n\n"
+        f"<b>🧩 Модели:</b> {free_n + paid_n} "
+        f"{plural_ru(free_n + paid_n, 'модель', 'модели', 'моделей')}\n"
+        f"• 🆓 Free: {free_n} — Pollinations, Groq, Gemini\n"
+        f"• 💎 Paid: {paid_n} — DeepSeek\n"
+        f"{current_line}{agent_line}\n\n"
         "<b>🤖 Агент:</b>\n"
         "• Включается в /models → «Режимы»\n"
         "• Сам планирует, ищет и вызывает инструменты — до 8 шагов\n"
         "• Всегда думает максимально глубоко\n"
         "• Работает только в личке\n\n"
         "<b>👁 Фото:</b>\n"
-        "• Модели DeepSeek видят фото сами\n"
-        "• Если модель не принимает картинку — опишем через Gemini и ответим текстом\n"
-        f"• На ветке Groq — <code>{VISION_MODEL}</code> (Gemini), "
-        f"резерв <code>{GROQ_VISION_MODEL}</code>\n\n"
+        "• 💎 Paid — DeepSeek видит фото сам\n"
+        "• 🆓 Free — нативно, если у модели есть зрение, иначе Groq new3\n\n"
         "<b>🎙 Голос:</b>\n"
-        f"• <code>{WHISPER_MODEL}</code> (Groq)\n\n"
-        "<b>🎨 Рисование:</b>\n"
-        "• Pollinations.ai\n\n"
+        "• 🆓 Free — Groq new3, 💎 Paid — Groq new2\n\n"
         "<b>🔍 Поиск:</b>\n"
-        "• Tavily (+ запасной DuckDuckGo), включается в «Режимах»\n"
-        "• В режиме агента доступен всегда\n\n"
+        "• 🆓 Free — Tavily (старый ключ) + DuckDuckGo\n"
+        "• 💎 Paid — Tavily (новый ключ) + DuckDuckGo\n"
+        "• Включается в «Режимах», в агенте доступен всегда\n\n"
         "<b>🧠 Размышления и длина:</b>\n"
         "• Не думать / Думать / Думать долго\n"
         "• Кратко / Обычно / Подробно / Максимально\n\n"
-        "<b>🔑 Доступ:</b>\n"
-        f"• Все модели, {PROVIDER_LIMITS.get('gateway', 25)} запросов в день\n"
+        "<b>🔑 Лимиты в сутки:</b>\n"
+        f"• 🆓 Free — {fmt_int(studio.POOL_LIMITS[studio.FREE])} токенов\n"
+        f"• 💎 Paid — {fmt_int(studio.POOL_LIMITS[studio.PAID])} токенов\n"
+        "• Раздельные счётчики, сброс в 00:00 МСК\n"
+        "• В группах — по автору сообщения, только free\n"
         "• Владельцу — безлимит\n\n"
         "<b>📊 Статистика чата:</b>\n"
         f"• Время работы: <b>{format_uptime()}</b>\n"
         f"• Запросов в этом чате: <b>{_stats.get(chat_id, 0)}</b>\n"
         f"• В контексте: <b>{get_history_size(chat_id)}</b> из {HISTORY_LIMIT}\n\n"
-        "<b>🛠 Служебные команды:</b>\n"
+        "<b>🛠 Команды:</b>\n"
         "/models — модели и режимы\n"
+        "/profile — профиль, лимиты и статистика\n"
         "/clear — очистить контекст\n"
-        "/context — размер памяти\n"
-        "/whoami — ID и username\n"
-        "/stats — статистика чата",
+        "/about — эта справка",
     )
 
 
@@ -3898,7 +3624,19 @@ async def cmd_clear(message: Message):
     logging.info(f"[{chat_id}] /clear")
 
 
-FAMILY_LABELS = {key: label for key, label, _names in MODEL_FAMILIES}
+MODELS_PAGE = 8
+
+
+def _section_keys(section: str) -> list[str]:
+    return [spec["key"] for spec in studio.all_specs(section) if spec["key"] in MODEL_REGISTRY]
+
+
+def _family_keys(section: str, family: str) -> list[str]:
+    return [
+        spec["key"]
+        for spec in studio.all_specs(section)
+        if spec.get("family") == family and spec["key"] in MODEL_REGISTRY
+    ]
 
 
 def _tab_row(active: str) -> list[InlineKeyboardButton]:
@@ -3916,101 +3654,168 @@ def _tab_row(active: str) -> list[InlineKeyboardButton]:
     return row
 
 
-def _family_models(family: str) -> list[str]:
-    for key, _label, names in MODEL_FAMILIES:
-        if key == family:
-            return names
-    return []
+def _section_row(active: str) -> list[InlineKeyboardButton]:
+    row = []
+    for section in (studio.FREE, studio.PAID):
+        row.append(
+            InlineKeyboardButton(
+                text=("✅ " if section == active else "") + studio.SECTION_LABELS[section],
+                callback_data=f"models:sec:{section}",
+            )
+        )
+    return row
 
 
-def _models_list_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+async def _models_sections_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    section = user_section(user_id)
     current = selected_model(user_id)
-    models_n = len(GATEWAY_MODELS)
-    families_n = len(MODEL_FAMILIES)
-    models_word = plural_ru(models_n, "модель", "модели", "моделей")
     lines = [
         "🧩 <b>Модели</b>",
         "",
         f"Сейчас: <b>{esc(model_label(current))}</b>",
+        f"Раздел: <b>{studio.SECTION_LABELS.get(section, section)}</b>",
         "",
+        "Выбери раздел:",
     ]
-    rows: list[list[InlineKeyboardButton]] = [_tab_row("models")]
-    if families_n == 1:
-        # Одно семейство — незачем открывать его отдельным шагом.
-        _key, _label, names = MODEL_FAMILIES[0]
-        lines.append(f"{models_n} {models_word} на твоём ключе. Выбери:")
-        for key in names:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=("✅ " if key == current else "") + model_label(key),
-                        callback_data=f"model:set:{key}",
-                    )
-                ]
-            )
-    else:
-        families_word = plural_ru(
-            families_n, "семействе", "семействах", "семействах"
-        )
+    for sec in (studio.FREE, studio.PAID):
+        count = len(_section_keys(sec))
+        used = await pool_used(user_id, sec)
+        limit = studio.pool_limit(sec)
         lines.append(
-            f"{models_n} {models_word} в {families_n} {families_word}. "
-            "Выбери семейство:"
+            f"• {studio.SECTION_LABELS[sec]}: <b>{count}</b> "
+            f"{plural_ru(count, 'модель', 'модели', 'моделей')} · "
+            f"{fmt_int(used)}/{fmt_int(limit)} ток."
         )
-        current_family = ""
-        for key, _label, names in MODEL_FAMILIES:
-            if current in names:
-                current_family = key
-                break
-        for key, label, names in MODEL_FAMILIES:
-            mark = "✅ " if key == current_family else ""
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"{mark}{label} · {len(names)}",
-                        callback_data=f"models:fam:{key}",
-                    )
-                ]
-            )
-    rows.append(
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="models:tab:models")]
-    )
+    rows = [
+        _tab_row("models"),
+        _section_row(section),
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="models:tab:models")],
+    ]
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _models_family_view(
-    user_id: int, family: str
+async def _models_families_view(
+    user_id: int, section: str
 ) -> tuple[str, InlineKeyboardMarkup]:
-    label = FAMILY_LABELS.get(family, family)
-    models = _family_models(family)
-    if not models:
-        # Старая клавиатура могла ссылаться на семейство, которого больше нет.
-        return _models_list_view(user_id)
-    current = selected_model(user_id)
+    current = section_model(user_id, section)
+    section = MODEL_REGISTRY.get(current, {}).get("section", section)
+    families = studio.families(section)
     lines = [
-        f"🧩 <b>{esc(label)}</b>",
+        f"🧩 <b>{esc(studio.SECTION_TITLES.get(section, section))}</b>",
         "",
         f"Сейчас: <b>{esc(model_label(current))}</b>",
         "",
-        "Выбери модель:",
+        "Выбери семейство:",
     ]
-    rows: list[list[InlineKeyboardButton]] = [_tab_row("models")]
-    for key in models:
+    rows: list[list[InlineKeyboardButton]] = [_tab_row("models"), _section_row(section)]
+    for family in families:
+        keys = _family_keys(section, family)
+        mark = "✅ " if current in keys else ""
+        label = studio.FAMILY_LABELS.get(family, family)
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=("✅ " if key == current else "") + model_label(key),
-                    callback_data=f"model:set:{key}",
+                    text=f"{mark}{label} · {len(keys)}",
+                    callback_data=f"models:fam:{section}:{family}:0",
                 )
             ]
         )
     rows.append(
+        [InlineKeyboardButton(text="◀️ К разделам", callback_data="models:tab:models")]
+    )
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _models_list_view(
+    user_id: int, section: str, family: str, page: int = 0
+) -> tuple[str, InlineKeyboardMarkup]:
+    keys = _family_keys(section, family)
+    if not keys:
+        return await _models_families_view(user_id, section)
+    current = section_model(user_id, section)
+    total = max(1, (len(keys) + MODELS_PAGE - 1) // MODELS_PAGE)
+    page = max(0, min(int(page or 0), total - 1))
+    start = page * MODELS_PAGE
+    page_keys = keys[start: start + MODELS_PAGE]
+    label = studio.FAMILY_LABELS.get(family, family)
+    lines = [
+        f"🧩 <b>{esc(label)}</b>",
+        "",
+        f"Раздел: {studio.SECTION_LABELS.get(section, section)}",
+        f"Сейчас: <b>{esc(model_label(current))}</b>",
+        "",
+        "Выбери модель, а по ℹ️ — подробности:",
+    ]
+    rows: list[list[InlineKeyboardButton]] = [_tab_row("models")]
+    for key in page_keys:
+        code = MODEL_SHORT_BY_KEY.get(key)
+        if not code:
+            continue
+        mark = "✅ " if key == current else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark}{MODEL_REGISTRY[key]['label']}",
+                    callback_data=f"m:s:{code}",
+                ),
+                InlineKeyboardButton(text="ℹ️", callback_data=f"m:i:{code}"),
+            ]
+        )
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text="◀️", callback_data=f"models:fam:{section}:{family}:{page - 1}"
+            )
+        )
+    nav.append(
+        InlineKeyboardButton(
+            text=f"{page + 1}/{total}",
+            callback_data=f"models:fam:{section}:{family}:{page}",
+        )
+    )
+    if page + 1 < total:
+        nav.append(
+            InlineKeyboardButton(
+                text="▶️", callback_data=f"models:fam:{section}:{family}:{page + 1}"
+            )
+        )
+    rows.append(nav)
+    rows.append(
         [
             InlineKeyboardButton(
-                text="◀️ К семействам", callback_data="models:tab:models"
-            )
+                text="◀️ К семействам", callback_data=f"models:sec:{section}"
+            ),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"models:fam:{section}:{family}:{page}"),
         ]
     )
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _model_info_view(
+    code: str, section: str, family: str, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    key = MODEL_SHORT.get(code) or ""
+    spec = studio.model_by_key(key) or MODEL_REGISTRY.get(key)
+    if not spec:
+        return "Модель не найдена.", InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад", callback_data="models:tab:models")]]
+        )
+    text = studio.info_text(spec)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="✅ Выбрать модель", callback_data=f"m:s:{code}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="◀️ Назад",
+                callback_data=f"models:fam:{section}:{family}:{page}",
+            )
+        ],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -4138,18 +3943,26 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
 
 async def models_panel_view(
-    user_id: int, tab: str = "models", family: str | None = None
+    user_id: int,
+    tab: str = "models",
+    family: str | None = None,
+    section: str | None = None,
+    page: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    if tab == "family":
-        return _models_family_view(user_id, family or MODEL_FAMILIES[0][0])
     if tab == "modes":
         return _models_modes_view(user_id)
-    return _models_list_view(user_id)
+    if tab == "family" and family:
+        return await _models_list_view(
+            user_id, section or user_section(user_id), family, page
+        )
+    if tab == "section" and section:
+        return await _models_families_view(user_id, section)
+    return await _models_sections_view(user_id)
 
 
 @dp.message(Command("models"))
 async def cmd_models(message: Message):
-    if not is_private(message) or not message.from_user:
+    if not command_allowed(message) or not is_private(message) or not message.from_user:
         return
     text, kb = await models_panel_view(message.from_user.id, "models")
     await message.answer(text, reply_markup=kb)
@@ -4174,6 +3987,60 @@ async def on_model_locked(callback: CallbackQuery):
     await callback.answer("Эта модель сейчас недоступна.", show_alert=True)
 
 
+@dp.callback_query(F.data.startswith("m:s:"))
+async def on_pick_model(callback: CallbackQuery):
+    if not callback.from_user or callback.message is None:
+        return
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Модели доступны только в личке.", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    code = (callback.data or "").split(":", 2)[-1]
+    key = MODEL_SHORT.get(code)
+    if not key:
+        await callback.answer("Модель не найдена, обнови список.", show_alert=True)
+        return
+    ok, text = await set_model_for_user(user_id, key)
+    await callback.answer(("✅ " if ok else "⚠️ ") + plain_text(text)[:180], show_alert=not ok)
+    if not ok:
+        return
+    info = MODEL_REGISTRY.get(normalize_model_key(key)) or {}
+    panel, kb = await models_panel_view(
+        user_id, "family", info.get("family"), info.get("section"), 0
+    )
+    try:
+        await callback.message.edit_text(panel, reply_markup=kb)
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("m:i:"))
+async def on_model_info(callback: CallbackQuery):
+    if not callback.from_user or callback.message is None:
+        return
+    if callback.message.chat.type != ChatType.PRIVATE:
+        await callback.answer("Только в личке.", show_alert=True)
+        return
+    code = (callback.data or "").split(":", 2)[-1]
+    key = MODEL_SHORT.get(code)
+    info = MODEL_REGISTRY.get(normalize_model_key(key or "")) or {}
+    if not info:
+        await callback.answer("Модель не найдена, обнови список.", show_alert=True)
+        return
+    text, kb = _model_info_view(
+        code, info.get("section", studio.FREE), info.get("family", ""), 0
+    )
+    await callback.answer()
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            try:
+                await callback.message.answer(text, reply_markup=kb)
+            except Exception:
+                pass
+
+
 @dp.callback_query(F.data.startswith("models:"))
 async def on_models_callback(callback: CallbackQuery):
     if not callback.from_user or callback.message is None:
@@ -4186,10 +4053,22 @@ async def on_models_callback(callback: CallbackQuery):
     action = parts[1] if len(parts) > 1 else ""
     tab = "models"
     family: str | None = None
+    section: str | None = None
+    page = 0
     if action == "tab":
         tab = parts[2] if len(parts) > 2 else "models"
+    elif action == "sec":
+        section = parts[2] if len(parts) > 2 else studio.FREE
+        if section not in (studio.FREE, studio.PAID):
+            section = studio.FREE
+        tab = "section"
     elif action == "fam":
-        family = parts[2] if len(parts) > 2 else MODEL_FAMILIES[0][0]
+        section = parts[2] if len(parts) > 2 else studio.FREE
+        family = parts[3] if len(parts) > 3 else None
+        try:
+            page = int(parts[4]) if len(parts) > 4 else 0
+        except (TypeError, ValueError):
+            page = 0
         tab = "family"
     elif action == "toggle":
         field = parts[2] if len(parts) > 2 else "rich"
@@ -4220,10 +4099,9 @@ async def on_models_callback(callback: CallbackQuery):
         await save_toggle(user_id, "search", "off" if state == "off" else "on")
         tab = "modes"
     elif action == "clear":
-        # В личке chat_id совпадает с user_id — чистим историю этого диалога.
-        await clear_chat_context(int(user_id))
+        await clear_chat_context(user_id)
         tab = "modes"
-    text, kb = await models_panel_view(user_id, tab, family)
+    text, kb = await models_panel_view(user_id, tab, family, section, page)
     try:
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception as e:
@@ -4234,70 +4112,59 @@ async def on_models_callback(callback: CallbackQuery):
                 pass
     if action == "clear":
         await callback.answer("🧹 Контекст очищен")
-    elif action == "toggle" and (parts[2] if len(parts) > 2 else "") == "agent":
+    elif action in ("toggle", "effort", "length", "search"):
         pass
     else:
         await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("model:set:"))
-async def on_model_callback(callback: CallbackQuery):
-    if not callback.from_user or not callback.message:
-        return
-    user_id = callback.from_user.id
-    if callback.message.chat.type != ChatType.PRIVATE:
-        await callback.answer("Модели доступны только в личке.", show_alert=True)
-        return
-    model = (callback.data or "").rsplit(":", 1)[-1]
-    ok, text = await set_model_for_user(user_id, model)
-    await callback.answer(("✅ " if ok else "⚠️ ") + plain_text(text)[:180], show_alert=not ok)
-    if not ok:
-        return
-    info = MODEL_REGISTRY.get(normalize_model_key(model)) or {}
-    if info.get("provider") == "gateway":
-        panel, kb = await models_panel_view(user_id, "family", info.get("family"))
-    else:
-        panel, kb = await models_panel_view(user_id, "models")
-    try:
-        await callback.message.edit_text(panel, reply_markup=kb)
-    except Exception:
-        pass
+@dp.message(Command("profile", "context", "whoami", "stats"))
+async def cmd_profile(message: Message):
+    """/profile — профиль, лимиты и статистика чата.
 
-
-@dp.message(Command("context"))
-async def cmd_context(message: Message):
-    if not command_allowed(message):
-        return
-    size = get_history_size(message.chat.id)
-    await reply_any(message, f"📊 В контексте: <b>{size}</b> сообщений из {HISTORY_LIMIT}.")
-
-
-@dp.message(Command("whoami"))
-async def cmd_whoami(message: Message):
-    if not command_allowed(message):
-        return
-    user = message.from_user
-    if not user:
-        return
-    await reply_any(
-        message,
-        f"👤 <b>{esc(user.full_name)}</b>\n"
-        f"ID: <code>{user.id}</code>\n"
-        f"Username: @{user.username or '—'}",
-    )
-
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
+    Старые /context, /whoami, /stats оставлены как алиасы.
+    """
     if not command_allowed(message):
         return
     chat_id = message.chat.id
-    await reply_any(
-        message,
-        f"📊 <b>Статистика чата:</b>\n"
-        f"• Обработано запросов: <b>{_stats.get(chat_id, 0)}</b>\n"
-        f"• Сейчас в контексте: <b>{get_history_size(chat_id)}</b> сообщений",
+    user = message.from_user
+    lines = []
+    if user:
+        lines.append(f"👤 <b>{esc(user.full_name)}</b>")
+        lines.append(f"ID: <code>{user.id}</code>")
+        lines.append(f"Username: @{user.username or '—'}")
+        if is_owner(user.id):
+            lines.append("Роль: <b>владелец</b> (безлимит)")
+        elif is_allowed_user(user.id):
+            lines.append("Роль: <b>гость</b> из белого списка")
+        lines.append("")
+    if is_private(message) and user:
+        section = user_section(user.id)
+        current = selected_model(user.id)
+        lines.append("<b>🧩 Модели</b>")
+        lines.append(
+            f"• Сейчас: <b>{esc(model_label(current))}</b> · "
+            f"{studio.SECTION_LABELS.get(section, section)}"
+        )
+        free_used = await pool_used(user.id, studio.FREE)
+        paid_used = await pool_used(user.id, studio.PAID)
+        lines.append(
+            f"• 🆓 Free: {fmt_int(free_used)} / "
+            f"{fmt_int(studio.POOL_LIMITS[studio.FREE])} ток."
+        )
+        lines.append(
+            f"• 💎 Paid: {fmt_int(paid_used)} / "
+            f"{fmt_int(studio.POOL_LIMITS[studio.PAID])} ток."
+        )
+        lines.append(f"• Сброс пулов: {studio.reset_text()}")
+        lines.append("")
+    lines.append("<b>📊 Статистика чата</b>")
+    lines.append(f"• Обработано запросов: <b>{_stats.get(chat_id, 0)}</b>")
+    lines.append(
+        f"• В контексте: <b>{get_history_size(chat_id)}</b> из {HISTORY_LIMIT}"
     )
+    lines.append(f"• Время работы: <b>{format_uptime()}</b>")
+    await reply_any(message, "\n".join(lines))
 
 
 # ============================================================
@@ -4524,11 +4391,11 @@ def admin_main_text() -> str:
     return (
         "🛠 <b>Админ-панель Мудрого Мха</b>\n\n"
         "<table><thead><tr>"
-        "<th>Шлюз</th><th>Модели</th><th>Лимит</th>"
+        "<th>Шлюз</th><th>Модели</th><th>Пул paid</th>"
         "</tr></thead><tbody><tr>"
         f"<td>{'настроен' if configured else 'нет ключа'}</td>"
         f"<td>{len(GATEWAY_MODELS)}</td>"
-        f"<td>{PROVIDER_LIMITS.get('gateway', 25)}/день</td>"
+        f"<td>{fmt_int(studio.POOL_LIMITS[studio.PAID])} ток./день</td>"
         "</tr></tbody></table>\n\n"
         "<table><thead><tr>"
         "<th>Сегодня</th><th>Люди</th><th>Групп</th><th>Блок</th>"
@@ -4552,7 +4419,7 @@ def admin_main_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="👥 Группы", callback_data="adm:groups:0"),
-            InlineKeyboardButton(text="🚫 ЛС", callback_data="adm:bl:0"),
+            InlineKeyboardButton(text="✅ ЛС", callback_data="adm:wl:0"),
         ],
         [
             InlineKeyboardButton(text="🔑 Доступ", callback_data="adm:acc:gateway:0"),
@@ -4570,7 +4437,6 @@ async def stats_text(stats: dict, period: str, flt: dict) -> str:
     today_usage = await storage.usage_for_day(today, "gateway")
     today_total = sum(today_usage.values())
     today_users = len({uid for (uid, _prov) in today_usage})
-    limit = PROVIDER_LIMITS.get("gateway", 25)
     models = merge_stats_models(stats.get("models"), limit=8)
     total_tokens = sum(int(m.get("total_tokens") or 0) for m in models)
     errors = int(stats["request_errors"]) + int(stats["call_errors"])
@@ -4596,11 +4462,11 @@ async def stats_text(stats: dict, period: str, flt: dict) -> str:
     )
     lines.append(
         "<table><thead><tr>"
-        "<th>Люди</th><th>Чаты</th><th>Лимит</th>"
+        "<th>Люди</th><th>Чаты</th><th>Пулы</th>"
         "</tr></thead><tbody><tr>"
         f"<td>{fmt_int(today_users)}</td>"
         f"<td>{fmt_int(stats.get('chats_total') or 0)}</td>"
-        f"<td>{limit}/день</td>"
+        "<td>250к / 100к</td>"
         "</tr></tbody></table>"
     )
     lines.append("")
@@ -4806,8 +4672,46 @@ def blacklist_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), admin_kb(rows)
 
 
+def wl_view(page: int) -> tuple[str, InlineKeyboardMarkup]:
+    items = sorted(
+        _allowed_users_cache.values(),
+        key=lambda x: (x.get("added_at") or datetime.min.replace(tzinfo=timezone.utc)),
+    )
+    page_items, page, total = paginate(items, page)
+    lines = [
+        f"✅ <b>Белый список ЛС</b> · всего {len(items)}",
+        "",
+        "Кто в списке — тому бот отвечает в личке. Остальным доступ закрыт.",
+        "",
+    ]
+    if page_items:
+        table_rows = "".join(
+            "<tr>"
+            f"<td>{esc(u.get('full_name') or u.get('username') or 'без имени')}</td>"
+            f"<td><code>{u['user_id']}</code></td>"
+            "</tr>"
+            for u in page_items
+        )
+        lines.append(
+            "<table><thead><tr><th>Кто</th><th>ID</th></tr></thead><tbody>"
+            + table_rows
+            + "</tbody></table>"
+        )
+    else:
+        lines.append("<p>Список пуст — в личку пускаем только владельца.</p>")
+    rows = [
+        [InlineKeyboardButton(text="➕ Добавить пользователя", callback_data="adm:wladd")]
+    ]
+    for u in page_items:
+        name = (u.get("full_name") or u.get("username") or str(u["user_id"]))[:25]
+        rows.append(
+            [InlineKeyboardButton(text=f"🗑 {name}", callback_data=f"adm:wldel:{u['user_id']}")]
+        )
+    rows.append(paginator_kb("adm:wl", page, total))
+    return "\n".join(lines), admin_kb(rows)
+
+
 async def access_view(provider: str = "gateway", page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
-    limit = PROVIDER_LIMITS.get("gateway", 25)
     today = msk_today()
     usage = await storage.usage_for_day(today, "gateway")
     items = sorted(
@@ -4824,15 +4728,17 @@ async def access_view(provider: str = "gateway", page: int = 0) -> tuple[str, In
     lines = [
         "🔑 <b>Доступ к шлюзу</b>",
         "",
-        "Доступные модели открыты каждому: 25 запросов в день суммарно.",
+        "Модели открыты белому списку. Пулы в сутки: "
+        f"free {fmt_int(studio.POOL_LIMITS[studio.FREE])} ток., "
+        f"paid {fmt_int(studio.POOL_LIMITS[studio.PAID])} ток.",
         f"👑 Владелец: <code>{OWNER_ID}</code> — безлимит",
         "",
         "<table><thead><tr>"
-        "<th>Сегодня</th><th>Люди</th><th>Лимит</th>"
+        "<th>Сегодня</th><th>Люди</th><th>Пулы</th>"
         "</tr></thead><tbody><tr>"
         f"<td>{fmt_int(total_today)}</td>"
         f"<td>{fmt_int(len(items))}</td>"
-        f"<td>{limit}/день</td>"
+        f"<td>250к / 100к</td>"
         "</tr></tbody></table>",
         "",
     ]
@@ -4840,7 +4746,7 @@ async def access_view(provider: str = "gateway", page: int = 0) -> tuple[str, In
         table_rows = "".join(
             "<tr>"
             f"<td>{user_tag(u['user_id'])}</td>"
-            f"<td>{u['requests']}/{limit}</td>"
+            f"<td>{u['requests']} запросов</td>"
             "</tr>"
             for u in page_items
         )
@@ -5069,7 +4975,8 @@ async def settings_view(refresh: bool = False) -> tuple[str, InlineKeyboardMarku
         f"<tr><td>Шлюз</td><td>{'настроен' if gateway_ok else 'нет GATEWAY_API'} · "
         f"{len(GATEWAY_MODELS)} "
         f"{plural_ru(len(GATEWAY_MODELS), 'модель', 'модели', 'моделей')}</td></tr>"
-        f"<tr><td>Лимит</td><td>{PROVIDER_LIMITS.get('gateway', 25)} запросов/день, "
+        f"<tr><td>Лимит</td><td>free {fmt_int(studio.POOL_LIMITS[studio.FREE])} · "
+        f"paid {fmt_int(studio.POOL_LIMITS[studio.PAID])} токенов/день, "
         "владелец — безлимит</td></tr>"
         f"<tr><td>История</td><td>{fmt_int(PREMIUM_HISTORY_CHARS_LIMIT)} символов · "
         f"ответ до {fmt_int(PREMIUM_MAX_TOKENS)} токенов</td></tr>"
@@ -5102,6 +5009,8 @@ async def admin_section(
         return await groups_view(page)
     if section == "bl":
         return blacklist_view(page)
+    if section == "wl":
+        return wl_view(page)
     if section == "acc":
         return await access_view(provider or "gateway", page)
     if section == "set":
@@ -5259,6 +5168,20 @@ def _parse_int(text: str) -> int | None:
         return None
 
 
+async def _cleanup_admin_input(message: Message, state: dict | None) -> None:
+    """Убирает подсказку и сообщение с ID, чтобы не засорять чат."""
+    prompt_id = (state or {}).get("prompt_id")
+    if prompt_id:
+        try:
+            await bot.delete_message(message.chat.id, prompt_id)
+        except Exception:
+            pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 async def maybe_admin_input(message: Message) -> bool:
     """Перехватывает ввод для админ-панели. Возвращает True, если сообщение съедено."""
     if not is_private(message) or not message.from_user:
@@ -5299,10 +5222,10 @@ async def maybe_admin_input(message: Message) -> bool:
             }
             await storage.add_admin_action(OWNER_ID, "group_add", f"{chat_id} {title}")
             _admin_input.pop(OWNER_ID, None)
-            await message.answer(
-                f"✅ Группа <b>{esc(title or chat_id)}</b> добавлена в белый список.\n"
-                "Бот начнёт отвечать, когда его позовут.",
-                reply_markup=admin_main_kb(),
+            await _cleanup_admin_input(message, state)
+            text, kb = await admin_section("groups")
+            await send_admin_article(
+                message.chat.id, text, kb, old_id=_ADMIN_SCREENS.get(OWNER_ID)
             )
             return True
 
@@ -5335,6 +5258,40 @@ async def maybe_admin_input(message: Message) -> bool:
             )
             return True
 
+        if action == "whitelist_id":
+            forwarded = _forwarded_user(message)
+            if forwarded:
+                user_id, uname, full_name = forwarded
+            else:
+                user_id = _parse_int(text)
+                uname, full_name = "", ""
+            if user_id is None or user_id <= 0:
+                await message.answer(
+                    "Нужен ID пользователя (положительное число) или пересланное сообщение от него."
+                )
+                return True
+            if int(user_id) == OWNER_ID:
+                _admin_input.pop(OWNER_ID, None)
+                await _cleanup_admin_input(message, state)
+                await message.answer("Владелец и так имеет доступ.")
+                return True
+            await storage.add_allowed_user(user_id, uname, full_name, OWNER_ID)
+            ALLOWED_USERS.add(int(user_id))
+            _allowed_users_cache[int(user_id)] = {
+                "user_id": int(user_id),
+                "username": uname,
+                "full_name": full_name,
+                "added_at": msk_now(),
+            }
+            await storage.add_admin_action(OWNER_ID, "whitelist_add", str(user_id))
+            _admin_input.pop(OWNER_ID, None)
+            await _cleanup_admin_input(message, state)
+            text, kb = await admin_section("wl")
+            await send_admin_article(
+                message.chat.id, text, kb, old_id=_ADMIN_SCREENS.get(OWNER_ID)
+            )
+            return True
+
         if action == "grant_note":
             await message.answer(
                 "Доступ к шлюзу открыт всем: 25 запросов в день, "
@@ -5364,7 +5321,7 @@ async def maybe_admin_input(message: Message) -> bool:
             flt["user_id"] = None if user_id == 0 else user_id
             _admin_input.pop(OWNER_ID, None)
             txt, kb = await requests_view_async(0, flt)
-            await message.answer(txt, reply_markup=kb)
+            await send_admin_article(message.chat.id, txt, kb)
             return True
 
         if action == "req_date":
@@ -5383,7 +5340,7 @@ async def maybe_admin_input(message: Message) -> bool:
             flt["date_from"] = day.isoformat()
             _admin_input.pop(OWNER_ID, None)
             txt, kb = await requests_view_async(0, flt)
-            await message.answer(txt, reply_markup=kb)
+            await send_admin_article(message.chat.id, txt, kb)
             return True
     except Exception as e:
         logging.exception("Admin input error")
@@ -5464,6 +5421,12 @@ async def on_admin_callback(callback: CallbackQuery):
             await edit_admin(callback, text, kb)
             await callback.answer()
             return
+        if action == "wl":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            text, kb = await admin_section("wl", page)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
         if action == "acc":
             page = int(parts[3]) if len(parts) > 3 else 0
             provider = parts[2] if len(parts) > 2 else "gateway"
@@ -5501,12 +5464,12 @@ async def on_admin_callback(callback: CallbackQuery):
             return
 
         if action == "gadd":
-            _admin_input[OWNER_ID] = {"action": "group_id"}
-            await callback.answer()
-            await callback.message.answer(
+            sent = await callback.message.answer(
                 "Отправь ID группы (например <code>-1001234567890</code>) "
                 "или перешли любое сообщение из этой группы.\n\n/cancel — отмена."
             )
+            _admin_input[OWNER_ID] = {"action": "group_id", "prompt_id": sent.message_id}
+            await callback.answer()
             return
         if action == "gdel":
             chat_id = int(parts[2])
@@ -5557,6 +5520,35 @@ async def on_admin_callback(callback: CallbackQuery):
             text, kb = await admin_section("bl")
             await edit_admin(callback, text, kb)
             await callback.answer("Разблокирован.")
+            return
+
+        if action == "wladd":
+            sent = await callback.message.answer(
+                "Отправь ID пользователя или перешли его сообщение.\n\n/cancel — отмена."
+            )
+            _admin_input[OWNER_ID] = {"action": "whitelist_id", "prompt_id": sent.message_id}
+            await callback.answer()
+            return
+        if action == "wldel":
+            user_id = int(parts[2])
+            item = _allowed_users_cache.get(user_id) or {}
+            name = item.get("full_name") or item.get("username") or str(user_id)
+            await edit_admin(
+                callback,
+                f"Убрать <b>{esc(name)}</b> из белого списка ЛС?",
+                confirm_kb(f"adm:wldelok:{user_id}", "adm:wl:0"),
+            )
+            await callback.answer()
+            return
+        if action == "wldelok":
+            user_id = int(parts[2])
+            await storage.remove_allowed_user(user_id)
+            ALLOWED_USERS.discard(user_id)
+            _allowed_users_cache.pop(user_id, None)
+            await storage.add_admin_action(OWNER_ID, "whitelist_remove", str(user_id))
+            text, kb = await admin_section("wl")
+            await edit_admin(callback, text, kb)
+            await callback.answer("Убран из белого списка.")
             return
 
         if action == "accadd":
@@ -5829,17 +5821,20 @@ class DMBlacklistMiddleware(BaseMiddleware):
             isinstance(event, Message)
             and event.chat.type == ChatType.PRIVATE
             and event.from_user
-            and is_blacklisted(event.from_user.id)
         ):
-            await record_blocked(event)
-            now = time.time()
-            if now - _block_reply_last.get(event.from_user.id, 0) >= BLOCK_REPLY_COOLDOWN:
-                _block_reply_last[event.from_user.id] = now
-                try:
-                    await event.answer("доступ закрыт")
-                except Exception:
-                    pass
-            return
+            blocked = is_blacklisted(event.from_user.id) or not is_allowed_user(
+                event.from_user.id
+            )
+            if blocked:
+                await record_blocked(event)
+                now = time.time()
+                if now - _block_reply_last.get(event.from_user.id, 0) >= BLOCK_REPLY_COOLDOWN:
+                    _block_reply_last[event.from_user.id] = now
+                    try:
+                        await event.answer("доступ закрыт")
+                    except Exception:
+                        pass
+                return
         return await handler(event, data)
 
 
@@ -6084,6 +6079,10 @@ async def process_photos(messages: list[Message]) -> None:
 
     model = await resolve_model(user.id if user else None, private)
     if not model:
+        await notify_pool_exhausted(
+            first,
+            user_section(user.id if user else None) if private else studio.FREE,
+        )
         return
     provider = provider_of(model)
 
@@ -6100,19 +6099,47 @@ async def process_photos(messages: list[Message]) -> None:
     )
     started = time.perf_counter()
 
+    info = MODEL_REGISTRY.get(normalize_model_key(model)) or {}
+    section = info.get("section", studio.FREE)
+
     if provider == "gateway" and private:
         async with chat_lock(chat_id):
-            await process_gateway_photos(messages, question, track, started, model)
+            await process_gateway_photos(
+                messages, question, track, started, model,
+                provider=provider, section=section,
+            )
         return
 
-    await process_groq_photos(messages, question, track, started)
+    if info.get("vision"):
+        async with chat_lock(chat_id):
+            await process_gateway_photos(
+                messages, question, track, started, model,
+                provider=provider, section=section,
+            )
+        return
+
+    await process_groq_photos(messages, question, track, started, model, section)
 
 
-async def process_groq_photos(messages: list[Message], question: str, track: Track, started: float) -> None:
+async def process_groq_photos(
+    messages: list[Message],
+    question: str,
+    track: Track,
+    started: float,
+    model_key: str = "groq",
+    section: str = studio.FREE,
+) -> None:
     first = messages[0]
     chat_id = first.chat.id
     private = is_private(first)
-    turn = Turn(message=first, chat_id=chat_id, is_private=private, model="groq", track=track)
+    turn = Turn(
+        message=first,
+        chat_id=chat_id,
+        is_private=private,
+        model=model_key,
+        section=section,
+        track=track,
+    )
     await turn.status.show("👁 Смотрю фото…")
 
     descriptions: list[str] = []
@@ -6120,7 +6147,7 @@ async def process_groq_photos(messages: list[Message], question: str, track: Tra
     for index, m in enumerate(messages, 1):
         try:
             data = await download_image_bytes(m)
-            desc = await describe_image(data, track=track)
+            desc = await describe_image(data, track=track, section=studio.FREE)
             if desc:
                 descriptions.append(desc)
                 _media_cache[(chat_id, m.message_id)] = desc
@@ -6141,7 +6168,7 @@ async def process_groq_photos(messages: list[Message], question: str, track: Tra
             status="error",
             error="all photos failed",
             latency_ms=int((time.perf_counter() - started) * 1000),
-            model="groq",
+            model=model_key,
         )
         return
 
@@ -6171,10 +6198,6 @@ async def process_groq_photos(messages: list[Message], question: str, track: Tra
     await add_to_history(chat_id, "user", entry)
 
     turn.user_text = question
-    draw = detect_explicit_draw(question)
-    if draw and re.search(r"(такое же|похожее|это же|это)", draw, flags=re.IGNORECASE):
-        draw = f"{draw}. Референс: {'; '.join(descriptions)}"
-    turn.explicit_draw = draw
 
     if failed:
         await send_text(
@@ -6208,13 +6231,19 @@ async def process_gateway_photos(
     track: Track,
     started: float,
     model_key: str,
+    *,
+    provider: str | None = None,
+    section: str = studio.PAID,
 ) -> None:
-    """Модели шлюза сами видят фото — без двухшагового описания.
+    """Модели со зрением сами видят фото.
 
-    Не все модели каталога принимают картинки: если шлюз ответил
-    invalid_request на изображение, ниже сработает запасной путь через
-    описание Gemini (см. процесс фото в on_photo).
+    Paid-фото распознаёт DeepSeek нативно. Free-фото идут этим путём, только
+    если у выбранной модели есть vision. Если модель не приняла картинки,
+    для free-раздела срабатывает запасной путь через Groq new3.
     """
+    info = MODEL_REGISTRY[model_key]
+    provider = provider or info["provider"]
+    section = info.get("section", section)
     first = messages[0]
     chat_id = first.chat.id
     private = is_private(first)
@@ -6227,6 +6256,7 @@ async def process_gateway_photos(
         is_private=private,
         user_text=question,
         model=model_key,
+        section=section,
         track=track,
     )
     streamer = RichStreamer(turn) if rich else None
@@ -6276,10 +6306,7 @@ async def process_gateway_photos(
                 if (t.get("function") or {}).get("name") != "web_search"
             ]
 
-        turn.explicit_draw = draw_with_reference(detect_explicit_draw(question), "")
-        if turn.explicit_draw:
-            forced = {"type": "function", "function": {"name": "generate_image"}}
-        elif search_on and has_search_verb(user_question):
+        if search_on and has_search_verb(user_question):
             forced = {"type": "function", "function": {"name": "web_search"}}
         else:
             forced = None
@@ -6296,10 +6323,11 @@ async def process_gateway_photos(
                 tools,
                 executor,
                 forced,
-                provider="gateway",
+                provider=provider,
                 track=track,
                 effort=effort,
                 model=MODEL_REGISTRY[model_key]["model"],
+                model_key=model_key,
                 on_delta=streamer.on_delta if streamer else None,
                 reset_cb=streamer.reset if streamer else None,
                 max_tokens=max_tokens,
@@ -6308,13 +6336,13 @@ async def process_gateway_photos(
         try:
             answer = await ask_with(model_messages)
         except Exception as e:
-            if not _is_image_rejected(e):
+            if section != studio.FREE or not _is_image_rejected(e):
                 raise
-            # Некоторые модели каталога не принимают картинки: описываем их
-            # через Gemini и повторяем запрос уже текстом.
+            # Free-модель не приняла картинки: описываем их через Groq new3
+            # и повторяем запрос уже текстом.
             logging.warning(
-                f"Gateway rejected photos ({type(e).__name__}: {e}); "
-                f"перехожу на описание"
+                f"Free vision rejected photos ({type(e).__name__}: {e}); "
+                f"перехожу на Groq new3"
             )
             if streamer is not None:
                 streamer.reset()
@@ -6322,7 +6350,9 @@ async def process_gateway_photos(
             descriptions: list[tuple[int, str]] = []
             for index, (mime, data) in enumerate(images, 1):
                 try:
-                    desc = await describe_image(data, mime, track=track)
+                    desc = await describe_image(
+                        data, mime, track=track, section=studio.FREE
+                    )
                 except Exception as exc:
                     logging.warning(f"Photo {index} describe failed: {exc}")
                     desc = ""
@@ -6355,22 +6385,6 @@ async def process_gateway_photos(
                 + "</b>. Остальные обработал.",
             )
 
-        if turn.explicit_draw and not turn.image_sent and not turn.image_error:
-            await fallback_draw(turn)
-
-        if turn.image_sent:
-            await add_to_history(
-                chat_id,
-                "assistant",
-                f"Отправил сгенерированную картинку: {turn.image_prompt_ru}",
-            )
-        elif turn.image_error:
-            await add_to_history(
-                chat_id,
-                "assistant",
-                f"Не удалось сгенерировать изображение: {turn.image_error}",
-            )
-
         footer = usage_footer(turn, rich)
         if answer:
             answer = strip_text_tool_calls(answer)
@@ -6378,17 +6392,12 @@ async def process_gateway_photos(
         if answer and note:
             footer = note + ("\n\n" + footer if footer else "")
         if answer:
-            if turn.image_sent and is_trivial(answer):
-                token_note = usage_footer(turn, False).strip()
-                if token_note:
-                    await send_text(turn, token_note)
+            if streamer is not None:
+                await streamer.finish(answer, footer=footer)
             else:
-                if streamer is not None:
-                    await streamer.finish(answer, footer=footer)
-                else:
-                    await send_text(turn, answer + footer)
-                await add_to_history(chat_id, "assistant", answer)
-        elif not turn.image_sent and not turn.image_error and not turn.tools_used:
+                await send_text(turn, answer + footer)
+            await add_to_history(chat_id, "assistant", answer)
+        elif not turn.tools_used:
             fallback_text = "Не смог разобрать задание. Попробуй сфотографировать чётче."
             if streamer is not None:
                 await streamer.finish(fallback_text, footer=footer)
@@ -6415,6 +6424,7 @@ async def process_gateway_photos(
             model=model_key,
             tools=",".join(turn.tools_used),
         )
+        await pool_add(user_id, section, track.total_tokens)
         await turn.status.clear()
 
 
@@ -6469,9 +6479,15 @@ async def on_voice(message: Message):
 
     await safe_typing(chat_id)
 
-    model = await resolve_model(user.id, private) if private else "groq"
+    model = await resolve_model(user.id, private)
     if not model:
+        await notify_pool_exhausted(
+            message, user_section(user.id) if private else studio.FREE
+        )
         return
+    voice_section = (MODEL_REGISTRY.get(normalize_model_key(model)) or {}).get(
+        "section", studio.FREE
+    )
     track: Track | None = None
     if private:
         # Запрос создаём до расшифровки, чтобы вызов Whisper попал в лог,
@@ -6487,7 +6503,12 @@ async def on_voice(message: Message):
     whisper_started = time.perf_counter()
     try:
         path = await download_media_to_temp(message)
-        transcript = await transcribe_voice(path, track=track)
+        transcript = await transcribe_voice(
+            path,
+            track=track,
+            section=voice_section,
+            user_id=user.id if user else None,
+        )
     except Exception as e:
         logging.warning(f"Voice transcription failed: {e}")
         if track is not None:
@@ -6586,16 +6607,13 @@ async def on_voice(message: Message):
     entry = f"{label}{quote}(голосовое, расшифровка, возможны ошибки): {cleaned}"
     await add_to_history(chat_id, "user", entry)
 
-    draw = detect_explicit_draw(cleaned)
-    if draw and media_desc and re.search(r"(такое же|похожее|это же|это)", draw, flags=re.IGNORECASE):
-        draw = f"{draw}. Референс: {media_desc}"
     turn = Turn(
         message=message,
         chat_id=chat_id,
         is_private=private,
         user_text=cleaned,
-        explicit_draw=draw,
         model=model,
+        section=voice_section,
         track=track,
         rich_allowed=False,
     )
@@ -6610,12 +6628,6 @@ async def on_voice(message: Message):
 # ============================================================
 
 
-def draw_with_reference(draw: str | None, media_desc: str) -> str | None:
-    if draw and media_desc and re.search(r"(такое же|похожее|это же|это)", draw, flags=re.IGNORECASE):
-        return f"{draw}. Референс: {media_desc}"
-    return draw
-
-
 async def handle_private_text(message: Message) -> None:
     if is_on_cooldown(message):
         return
@@ -6626,9 +6638,15 @@ async def handle_private_text(message: Message) -> None:
 
     chat_id = message.chat.id
     user = message.from_user
-    model = await resolve_model(user.id if user else None, True)
-    if not model:
+    if user is None or not is_allowed_user(user.id):
         return
+    model = await resolve_model(user.id, True)
+    if not model:
+        await notify_pool_exhausted(message, user_section(user.id))
+        return
+    section = (MODEL_REGISTRY.get(normalize_model_key(model)) or {}).get(
+        "section", studio.FREE
+    )
     track = await begin_request(message, kind="text", prompt=text, model=model)
     quote, media_desc = await build_reply_block(
         message, need_media=True, track=track, provider=provider_of(model)
@@ -6640,8 +6658,8 @@ async def handle_private_text(message: Message) -> None:
         chat_id=chat_id,
         is_private=True,
         user_text=text,
-        explicit_draw=draw_with_reference(detect_explicit_draw(text), media_desc),
         model=model,
+        section=section,
         track=track,
     )
     logging.info(f"[{chat_id}] ЛС | model={model} | {text[:100]}")
@@ -6679,11 +6697,15 @@ async def handle_group_text(message: Message) -> None:
         cleaned = "реши подробно"
     await add_to_history(chat_id, "user", f"{display_user(user)}: {quote}{entry_text}")
 
+    group_model = await resolve_model(user.id if user else None, False)
+    if not group_model:
+        await notify_pool_exhausted(message, studio.FREE)
+        return
     track = await begin_request(
         message,
         kind="group_request",
         prompt=text,
-        model="groq",
+        model=group_model,
     )
 
     logging.info(f"{display_user(user)} | {text[:100]}")
@@ -6693,8 +6715,8 @@ async def handle_group_text(message: Message) -> None:
         chat_id=chat_id,
         is_private=False,
         user_text=cleaned,
-        explicit_draw=draw_with_reference(detect_explicit_draw(cleaned), media_desc),
-        model="groq",
+        model=group_model,
+        section=studio.FREE,
         track=track,
     )
     async with chat_lock(chat_id):
@@ -6763,19 +6785,15 @@ GROUP_COMMANDS = [
     BotCommand(command="help", description="Что я умею"),
     BotCommand(command="about", description="Инфо обо мне и моделях"),
     BotCommand(command="clear", description="Очистить контекст чата"),
-    BotCommand(command="context", description="Сколько сообщений в памяти"),
-    BotCommand(command="whoami", description="Мой ID и username"),
-    BotCommand(command="stats", description="Статистика чата"),
+    BotCommand(command="profile", description="Профиль и статистика"),
 ]
 PRIVATE_COMMANDS = [
     BotCommand(command="start", description="Приветствие"),
     BotCommand(command="help", description="Что я умею"),
     BotCommand(command="about", description="Инфо обо мне и моделях"),
     BotCommand(command="models", description="Модели и режимы"),
+    BotCommand(command="profile", description="Профиль и лимиты"),
     BotCommand(command="clear", description="Очистить контекст чата"),
-    BotCommand(command="context", description="Сколько сообщений в памяти"),
-    BotCommand(command="whoami", description="Мой ID и username"),
-    BotCommand(command="stats", description="Статистика чата"),
 ]
 BASE_COMMANDS = GROUP_COMMANDS
 
@@ -6814,6 +6832,12 @@ async def load_runtime_state() -> None:
     _grants.clear()
     _grants.update(grants)
 
+    allowed_users = await storage.load_allowed_users()
+    ALLOWED_USERS.clear()
+    ALLOWED_USERS.update(int(uid) for uid in allowed_users)
+    _allowed_users_cache.clear()
+    _allowed_users_cache.update({int(uid): info for uid, info in allowed_users.items()})
+
     settings = await storage.load_user_settings()
     _user_settings.clear()
     _user_settings.update(settings)
@@ -6825,10 +6849,15 @@ async def load_runtime_state() -> None:
             _trim_history(messages)
             _history[int(chat_id)] = messages
 
+    # Живой каталог моделей: Pollinations / Groq / Gemini.
+    catalog = await studio.refresh_catalog()
+    rebuild_model_registry(catalog)
+
     logging.info(
         f"Загружено: групп={len(_groups_cache)}, ЛС в блоке={len(_dm_blacklist)}, "
-        f"доступов={len(_grants)}, настроек={len(_user_settings)}, "
-        f"контекстов={len(_history)}"
+        f"доступов={len(_grants)}, whitelist={len(ALLOWED_USERS)}, "
+        f"настроек={len(_user_settings)}, контекстов={len(_history)}, "
+        f"моделей={len(MODEL_REGISTRY)} (каталог: {studio.CATALOG_SOURCE})"
     )
 
 
@@ -6916,6 +6945,10 @@ async def main() -> None:
     try:
         await asyncio.gather(*tasks)
     finally:
+        try:
+            await http_client.aclose()
+        except Exception:
+            pass
         await storage.close()
 
 

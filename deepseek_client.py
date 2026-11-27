@@ -100,6 +100,7 @@ class DeepSeekClient:
         http_client: httpx.AsyncClient,
         timeout: float | httpx.Timeout = 120.0,
         label: str = "API",
+        anonymous: bool = False,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -107,10 +108,11 @@ class DeepSeekClient:
         self.http = http_client
         self.timeout = timeout
         self.label = label
+        self.anonymous = anonymous
 
     @property
     def configured(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.api_key) or self.anonymous
 
     def _payload(
         self,
@@ -142,10 +144,10 @@ class DeepSeekClient:
 
     @property
     def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     async def chat(
         self,

@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS dm_blacklist (
     added_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Белый список личных сообщений: бот отвечает в ЛС только этим людям.
+CREATE TABLE IF NOT EXISTS allowed_users (
+    user_id BIGINT PRIMARY KEY,
+    username TEXT,
+    full_name TEXT,
+    added_by BIGINT,
+    added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Старые таблицы DeepSeek оставлены для миграции данных.
 CREATE TABLE IF NOT EXISTS deepseek_grants (
     user_id BIGINT PRIMARY KEY,
@@ -87,6 +96,9 @@ CREATE TABLE IF NOT EXISTS user_settings (
     search TEXT NOT NULL DEFAULT 'auto',
     length TEXT NOT NULL DEFAULT 'normal',
     agent BOOLEAN NOT NULL DEFAULT FALSE,
+    model_free TEXT NOT NULL DEFAULT '',
+    model_paid TEXT NOT NULL DEFAULT '',
+    model_section TEXT NOT NULL DEFAULT 'free',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -172,6 +184,9 @@ CREATE TABLE IF NOT EXISTS admin_actions (
 MIGRATIONS = """
 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS length TEXT NOT NULL DEFAULT 'normal';
 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS agent BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS model_free TEXT NOT NULL DEFAULT '';
+ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS model_paid TEXT NOT NULL DEFAULT '';
+ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS model_section TEXT NOT NULL DEFAULT 'free';
 
 INSERT INTO provider_grants (user_id, provider, username, full_name, granted_by, granted_at)
 SELECT user_id, 'deepseek', username, full_name, granted_by, granted_at
@@ -220,6 +235,7 @@ class Storage:
             }
         }
         self._blacklist: dict[int, dict] = {}
+        self._allowed: dict[int, dict] = {}
         self._grants: dict[tuple[int, str], dict] = {}
         self._usage: dict[tuple[int, str, str], int] = {}
         self._user_settings: dict[int, dict] = {}
@@ -438,6 +454,67 @@ class Storage:
             logging.warning(f"remove_blacklist failed: {e}")
 
     # ------------------------------------------------------------------
+    # Белый список ЛС
+    # ------------------------------------------------------------------
+
+    async def load_allowed_users(self) -> dict[int, dict]:
+        try:
+            if self.available:
+                rows = await self.pool.fetch(
+                    "SELECT user_id, username, full_name, added_at FROM allowed_users"
+                )
+                self._allowed = {
+                    int(r["user_id"]): {
+                        "user_id": int(r["user_id"]),
+                        "username": r["username"] or "",
+                        "full_name": r["full_name"] or "",
+                        "added_at": r["added_at"],
+                    }
+                    for r in rows
+                }
+        except Exception as e:
+            logging.warning(f"load_allowed_users failed: {e}")
+        return dict(self._allowed)
+
+    async def add_allowed_user(
+        self,
+        user_id: int,
+        username: str = "",
+        full_name: str = "",
+        added_by: int | None = None,
+    ) -> None:
+        self._allowed[int(user_id)] = {
+            "user_id": int(user_id),
+            "username": username or "",
+            "full_name": full_name or "",
+            "added_at": _now(),
+        }
+        try:
+            if self.available:
+                await self.pool.execute(
+                    "INSERT INTO allowed_users (user_id, username, full_name, added_by) "
+                    "VALUES ($1, $2, $3, $4) "
+                    "ON CONFLICT (user_id) DO UPDATE SET "
+                    "username = EXCLUDED.username, full_name = EXCLUDED.full_name",
+                    int(user_id),
+                    username or "",
+                    full_name or "",
+                    added_by,
+                )
+        except Exception as e:
+            logging.warning(f"add_allowed_user failed: {e}")
+
+    async def remove_allowed_user(self, user_id: int) -> None:
+        self._allowed.pop(int(user_id), None)
+        try:
+            if self.available:
+                await self.pool.execute(
+                    "DELETE FROM allowed_users WHERE user_id = $1", int(user_id)
+                )
+        except Exception as e:
+            logging.warning(f"remove_allowed_user failed: {e}")
+
+    # ------------------------------------------------------------------
     # Доступ к провайдерам (DeepSeek / Qwen)
     # ------------------------------------------------------------------
 
@@ -548,6 +625,34 @@ class Storage:
             logging.warning(f"inc_usage failed: {e}")
         return current
 
+    async def add_tokens(
+        self, user_id: int, pool: str, day: date, tokens: int
+    ) -> int:
+        """Прибавляет токены к дневному пулу (free/paid)."""
+        tokens = max(0, int(tokens))
+        provider = f"pool_{pool}"
+        key = (int(user_id), provider, day.isoformat())
+        current = self._usage.get(key)
+        if current is None:
+            current = await self.get_usage(user_id, provider, day)
+        current += tokens
+        self._usage[key] = current
+        try:
+            if self.available:
+                await self.pool.execute(
+                    "INSERT INTO usage_daily (user_id, provider, day, requests) "
+                    "VALUES ($1, $2, $3, $4) "
+                    "ON CONFLICT (user_id, provider, day) DO UPDATE SET "
+                    "requests = usage_daily.requests + EXCLUDED.requests",
+                    int(user_id),
+                    provider,
+                    day,
+                    tokens,
+                )
+        except Exception as e:
+            logging.warning(f"add_tokens failed: {e}")
+        return current
+
     async def usage_for_day(
         self, day: date, provider: str | None = None
     ) -> dict[tuple[int, str], int]:
@@ -587,7 +692,8 @@ class Storage:
         try:
             if self.available:
                 rows = await self.pool.fetch(
-                    "SELECT user_id, model, rich, deepthink, search, length, agent "
+                    "SELECT user_id, model, rich, deepthink, search, length, agent, "
+                    "model_free, model_paid, model_section "
                     "FROM user_settings"
                 )
                 self._user_settings = {
@@ -598,6 +704,9 @@ class Storage:
                         "search": r["search"] or "on",
                         "length": r["length"] or "normal",
                         "agent": bool(r["agent"]),
+                        "model_free": r["model_free"] or "",
+                        "model_paid": r["model_paid"] or "",
+                        "model_section": r["model_section"] or "free",
                     }
                     for r in rows
                 }
@@ -607,7 +716,17 @@ class Storage:
             return dict(self._user_settings)
 
     async def save_user_settings(self, user_id: int, **fields) -> None:
-        allowed = {"model", "rich", "deepthink", "search", "length", "agent"}
+        allowed = {
+            "model",
+            "rich",
+            "deepthink",
+            "search",
+            "length",
+            "agent",
+            "model_free",
+            "model_paid",
+            "model_section",
+        }
         values = {k: v for k, v in fields.items() if k in allowed}
         if not values:
             return
@@ -620,6 +739,9 @@ class Storage:
                 "search": "on",
                 "length": "normal",
                 "agent": False,
+                "model_free": "",
+                "model_paid": "",
+                "model_section": "free",
             },
         )
         current.update(values)
