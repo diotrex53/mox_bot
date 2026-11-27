@@ -66,6 +66,8 @@ GROQ_FALLBACK_VOICE_MODEL = "whisper-large-v3-turbo"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 POLLINATIONS_BASE_URL = "https://text.pollinations.ai/openai"
 POLLINATIONS_MODELS_URL = "https://text.pollinations.ai/models"
+POLLINATIONS_GEN_BASE_URL = "https://gen.pollinations.ai/v1"
+POLLINATIONS_VIP_MODELS_URL = "https://gen.pollinations.ai/v1/models"
 
 GATEWAY_API_KEY = os.environ.get("GATEWAY_API", "")
 GATEWAY_BASE_URL = os.environ.get(
@@ -260,27 +262,23 @@ KNOWN_INFO: dict[str, dict] = {
     },
 }
 
-# Известные id Pollinations, которые точно отдают текст.
-POLLINATIONS_FALLBACK = [
-    "openai",
-    "openai-fast",
-    "openai-large",
-    "openai-reasoning",
-    "qwen-coder",
-    "mistral",
-    "llama",
-    "llamascout",
-    "deepseek",
-    "deepseek-reasoning",
-    "gemini",
-    "gemini-flash",
-    "gemini-thinking",
-    "nova-fast",
-    "grok",
-    "grok-large",
-    "amazon-nova",
-    "mistral-small",
-    "phi",
+# Анонимный Pollinations теперь отдаёт только одну модель.
+POLLINATIONS_FREE_FALLBACK = ["openai-fast"]
+
+# Запасной VIP-каталог на случай, если gen.pollinations.ai не ответил.
+POLLINATIONS_VIP_FALLBACK = [
+    "openai/gpt-5.4-nano",
+    "openai/gpt-6.1-terra",
+    "minimax/minimax-m3.1-flash",
+    "moonshotai/kimi-k3.1-pro",
+    "deepseek/deepseek-v4.1-flash-1017",
+    "deepseek/deepseek-v4.1-flash",
+    "meta/muse-spark-open",
+    "openai/gpt-6.1-sol",
+    "openai/gpt-6-luna",
+    "openai/gpt-6-sol",
+    "z-ai/glm-5.3-flash",
+    "nvidia/nemotron-3.5-lightning",
 ]
 
 GROQ_FALLBACK = [
@@ -354,8 +352,8 @@ def configure(
     )
     pollinations_vip_client = DeepSeekClient(
         api_key=POLLINATIONS_API_KEY,
-        base_url=POLLINATIONS_BASE_URL,
-        model="openai",
+        base_url=POLLINATIONS_GEN_BASE_URL,
+        model="openai/gpt-5.4-nano",
         http_client=client,
         timeout=ai_timeout,
         label="Pollinations VIP",
@@ -451,10 +449,12 @@ def _fallback_catalog() -> dict[str, list[dict]]:
         )
     ]
     catalog["pollinations_free"] = [
-        make_spec(FREE, "pollinations_free", model) for model in POLLINATIONS_FALLBACK
+        make_spec(FREE, "pollinations_free", model)
+        for model in POLLINATIONS_FREE_FALLBACK
     ]
     catalog["pollinations_vip"] = [
-        make_spec(FREE, "pollinations_vip", model) for model in POLLINATIONS_FALLBACK
+        make_spec(FREE, "pollinations_vip", model)
+        for model in POLLINATIONS_VIP_FALLBACK
     ]
     catalog["groq"] = [
         make_spec(FREE, "groq", model, vision=(model == GROQ_VISION_MODEL))
@@ -533,6 +533,59 @@ def _parse_pollinations(data: Any, family: str) -> list[dict]:
                 description=description,
             )
         )
+    return specs
+
+
+def _parse_pollinations_gen(data: Any, family: str) -> list[dict]:
+    """Новый каталог gen.pollinations.ai: id, title, modalities, capabilities."""
+    specs: list[dict] = []
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return specs
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get("id") or "").strip()
+        if not model:
+            continue
+        if item.get("category") not in (None, "text"):
+            continue
+        endpoints = item.get("supported_endpoints") or []
+        if endpoints and "/v1/chat/completions" not in endpoints:
+            continue
+        output = item.get("output_modalities") or []
+        if output and "text" not in [str(x).lower() for x in output]:
+            continue
+        if item.get("paid_only"):
+            continue
+        lowered = model.lower()
+        if any(
+            bad in lowered
+            for bad in ("audio", "embedding", "embed", "tts", "whisper", "sdxl", "flux")
+        ):
+            continue
+        inputs = [str(x).lower() for x in (item.get("input_modalities") or [])]
+        caps = [str(x).lower() for x in (item.get("capabilities") or [])]
+        vision = "image" in inputs
+        reasoning = bool(item.get("reasoning")) or "reasoning" in caps
+        tools = "tool_calling" in caps or "tools" in caps
+        spec = make_spec(
+            FREE,
+            family,
+            model,
+            label=str(item.get("title") or model),
+            vision=vision,
+            reasoning=reasoning,
+            tools=tools,
+            description=str(item.get("description") or ""),
+        )
+        context = item.get("context_length")
+        if context:
+            spec["context"] = int(context)
+        pricing = item.get("pricing") or {}
+        if pricing:
+            spec["price"] = "бесплатно (VIP)"
+        specs.append(spec)
     return specs
 
 
@@ -642,7 +695,7 @@ async def refresh_catalog() -> dict[str, list[dict]]:
 
     free_data, vip_data, groq_data, gemini_data = await asyncio.gather(
         _get_json(POLLINATIONS_MODELS_URL),
-        _get_json(POLLINATIONS_MODELS_URL, headers=poll_headers),
+        _get_json(POLLINATIONS_VIP_MODELS_URL, headers=poll_headers),
         _get_json(
             f"{GROQ_BASE_URL}/models",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"} if GROQ_API_KEY else {},
@@ -662,7 +715,7 @@ async def refresh_catalog() -> dict[str, list[dict]]:
             catalog["pollinations_free"] = parsed
             sources.append("pollinations-free")
     if isinstance(vip_data, (list, dict)):
-        parsed = _dedupe(_parse_pollinations(vip_data, "pollinations_vip"))
+        parsed = _dedupe(_parse_pollinations_gen(vip_data, "pollinations_vip"))
         if parsed:
             catalog["pollinations_vip"] = parsed
             sources.append("pollinations-vip")
@@ -823,6 +876,7 @@ async def gemini_chat(
     messages: list[dict],
     *,
     max_tokens: int = 2000,
+    effort: str = "off",
     **_kwargs,
 ) -> ChatResult:
     if not GEMINI_API_KEY:
@@ -859,13 +913,48 @@ async def gemini_chat(
             "parts": [{"text": "\n\n".join(system_parts)}]
         }
 
-    async def _do():
+    # Gemini 3 по умолчанию думает очень долго. В обычном режиме просим
+    # минимальное размышление, иначе ответ легко уходит за 60-80 секунд.
+    thinking_variants: list[dict] = []
+    model_name = str(spec.get("model") or "")
+    if model_name.startswith("gemini-2.5"):
+        if effort == "off":
+            thinking_variants = [{"thinkingBudget": 0}]
+        elif effort == "medium":
+            thinking_variants = [{"thinkingBudget": 1024}]
+        else:
+            thinking_variants = [{"thinkingBudget": -1}]
+    elif model_name.startswith("gemini-3"):
+        if effort in ("off", "medium"):
+            thinking_variants = [{"thinkingLevel": "low"}, {"thinkingBudget": 0}]
+        else:
+            thinking_variants = [{"thinkingLevel": "high"}]
+
+    async def _post(thinking: dict | None):
+        body = dict(payload)
+        config = dict(payload["generationConfig"])
+        if thinking:
+            config["thinkingConfig"] = thinking
+        body["generationConfig"] = config
         response = await http_client.post(
-            f"{GEMINI_BASE_URL}/models/{spec['model']}:generateContent",
+            f"{GEMINI_BASE_URL}/models/{model_name}:generateContent",
             headers={"x-goog-api-key": GEMINI_API_KEY},
-            json=payload,
+            json=body,
             timeout=AI_TIMEOUT,
         )
+        return response
+
+    async def _do():
+        variants = list(thinking_variants) + [None]
+        response = None
+        for thinking in variants:
+            response = await _post(thinking)
+            if response.status_code < 400:
+                break
+            text = (response.text or "").lower()
+            if response.status_code != 400 or "thinking" not in text:
+                break
+        assert response is not None
         if response.status_code >= 400:
             raise DeepSeekError(
                 f"Gemini HTTP {response.status_code}: {response.text[:300]}",
@@ -885,7 +974,7 @@ async def gemini_chat(
             )
         return ChatResult(
             content=text,
-            model=spec["model"],
+            model=model_name,
             finish_reason=candidates[0].get("finishReason") or "",
             **_gemini_usage(data.get("usageMetadata") or {}),
         )

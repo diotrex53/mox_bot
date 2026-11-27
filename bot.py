@@ -1688,6 +1688,7 @@ async def call_model(
                 spec,
                 messages,
                 max_tokens=max_tokens or default_max,
+                effort=effort,
             )
         else:
             if client is None or not client.configured:
@@ -3222,18 +3223,48 @@ async def run_tools(
 
 async def send_switch_button(turn: Turn, error_text: str) -> None:
     current = normalize_model_key(turn.model)
-    rows = []
-    for key in ("groq", "deepseek-v4.1-flash", "gpt-5.6-sol", "gemini-4-carbon"):
-        if key == current or key not in MODEL_REGISTRY:
-            continue
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"Переключиться на {model_label(key)}",
-                    callback_data=f"model:set:{key}",
-                )
-            ]
-        )
+    info = MODEL_REGISTRY.get(current) or {}
+    section = info.get("section", studio.FREE)
+    rows: list[list[InlineKeyboardButton]] = []
+    if turn.is_private:
+        # Сначала альтернативы из этого же раздела, затем модель из соседнего.
+        candidates: list[str] = []
+        for key, spec in MODEL_REGISTRY.items():
+            if key == current or spec.get("section") != section:
+                continue
+            candidates.append(key)
+        other = studio.PAID if section == studio.FREE else studio.FREE
+        cross: list[str] = []
+        for key, spec in MODEL_REGISTRY.items():
+            if key == current or spec.get("section") != other:
+                continue
+            if spec.get("provider") == "gateway":
+                client = PROVIDER_CLIENTS.get("gateway")
+                if client is None or not client.configured:
+                    continue
+            cross.append(key)
+        defaults = [
+            default_model_for_section(section),
+            default_model_for_section(other),
+        ]
+        for bucket in (candidates, cross):
+            for default in defaults:
+                if default in bucket:
+                    bucket.remove(default)
+                    bucket.insert(0, default)
+        chosen = (candidates[:2] + cross[:1])[:3]
+        for key in chosen:
+            code = MODEL_SHORT_BY_KEY.get(key)
+            if not code:
+                continue
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"Переключиться на {model_label(key)}",
+                        callback_data=f"m:s:{code}",
+                    )
+                ]
+            )
     keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     text = (
         f"⚠️ Модель <b>{esc(model_label(current))}</b> сейчас недоступна.\n\n"
@@ -3245,7 +3276,7 @@ async def send_switch_button(turn: Turn, error_text: str) -> None:
         if turn.is_private:
             await turn.message.answer(text, reply_markup=keyboard)
         else:
-            await turn.message.reply(text, reply_markup=keyboard)
+            await turn.message.reply(text)
     except Exception:
         await send_text(turn, text)
 
