@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -177,6 +178,25 @@ CREATE TABLE IF NOT EXISTS admin_actions (
     action TEXT NOT NULL,
     details TEXT
 );
+
+-- Журнал всех событий бота: запросы, медиа, картинки, админ-действия.
+-- Это отдельная лента для экрана «Логи», не связанная с requests/model_calls.
+CREATE TABLE IF NOT EXISTS events (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    user_id BIGINT,
+    username TEXT,
+    chat_id BIGINT,
+    kind TEXT NOT NULL,
+    model TEXT,
+    text TEXT,
+    tokens INT NOT NULL DEFAULT 0,
+    latency_ms INT,
+    status TEXT NOT NULL DEFAULT 'ok',
+    error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_created ON events (created_at DESC);
 """
 
 # Миграция старых данных DeepSeek в общие таблицы. После успешного копирования
@@ -187,6 +207,7 @@ ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS agent BOOLEAN NOT NULL DEFAUL
 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS model_free TEXT NOT NULL DEFAULT '';
 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS model_paid TEXT NOT NULL DEFAULT '';
 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS model_section TEXT NOT NULL DEFAULT 'free';
+ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS format TEXT NOT NULL DEFAULT 'on';
 
 INSERT INTO provider_grants (user_id, provider, username, full_name, granted_by, granted_at)
 SELECT user_id, 'deepseek', username, full_name, granted_by, granted_at
@@ -207,6 +228,17 @@ DELETE FROM deepseek_usage;
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_SECRET_RE = re.compile(
+    r"(?i)(sk-[a-z0-9_\-]{8,}|"
+    r"(?:api[_ -]?key|bearer|authorization|token)\s*[:=]\s*[a-z0-9_\-\.]{8,})"
+)
+
+
+def _mask_secrets(text: str) -> str:
+    """Маскирует только API-ключи. ID и токены-счётчики остаются видимы."""
+    return _SECRET_RE.sub("[ключ скрыт]", text or "")
 
 
 def _char_count(messages: list[dict]) -> int:
@@ -244,6 +276,7 @@ class Storage:
         self._calls: list[dict] = []
         self._tools: list[dict] = []
         self._actions: list[dict] = []
+        self._events: list[dict] = []
         self._settings: dict[str, str] = {}
         self._request_seq = 0
 
@@ -693,7 +726,7 @@ class Storage:
             if self.available:
                 rows = await self.pool.fetch(
                     "SELECT user_id, model, rich, deepthink, search, length, agent, "
-                    "model_free, model_paid, model_section "
+                    "model_free, model_paid, model_section, format "
                     "FROM user_settings"
                 )
                 self._user_settings = {
@@ -707,6 +740,7 @@ class Storage:
                         "model_free": r["model_free"] or "",
                         "model_paid": r["model_paid"] or "",
                         "model_section": r["model_section"] or "free",
+                        "format": r["format"] or "on",
                     }
                     for r in rows
                 }
@@ -726,6 +760,7 @@ class Storage:
             "model_free",
             "model_paid",
             "model_section",
+            "format",
         }
         values = {k: v for k, v in fields.items() if k in allowed}
         if not values:
@@ -742,6 +777,7 @@ class Storage:
                 "model_free": "",
                 "model_paid": "",
                 "model_section": "free",
+                "format": "on",
             },
         )
         current.update(values)
@@ -1043,16 +1079,169 @@ class Storage:
         }
         if not self.available:
             self._actions.append(row)
+        else:
+            try:
+                await self.pool.execute(
+                    "INSERT INTO admin_actions (admin_id, action, details) VALUES ($1,$2,$3)",
+                    admin_id,
+                    action,
+                    (details or "")[:1000],
+                )
+            except Exception as e:
+                logging.warning(f"add_admin_action failed: {e}")
+        # Действия владельца тоже попадают в общий журнал событий.
+        await self.add_event(
+            kind="admin",
+            user_id=admin_id,
+            text=f"{action}: {details or ''}".strip(),
+            status="ok",
+        )
+
+    # ------------------------------------------------------------------
+    # Журнал событий (экран «Логи» в админке)
+    # ------------------------------------------------------------------
+
+    async def add_event(
+        self,
+        *,
+        kind: str,
+        user_id: int | None = None,
+        username: str = "",
+        chat_id: int | None = None,
+        model: str = "",
+        text: str = "",
+        tokens: int = 0,
+        latency_ms: int | None = None,
+        status: str = "ok",
+        error: str = "",
+    ) -> None:
+        row = {
+            "created_at": _now(),
+            "user_id": user_id,
+            "username": username or "",
+            "chat_id": chat_id,
+            "kind": kind or "event",
+            "model": model or "",
+            "text": (text or "")[:2000],
+            "tokens": int(tokens or 0),
+            "latency_ms": latency_ms,
+            "status": status or "ok",
+            "error": (error or "")[:2000],
+        }
+        self._events.append(row)
+        if len(self._events) > 5000:
+            del self._events[: len(self._events) - 5000]
+        if not self.available:
             return
         try:
             await self.pool.execute(
-                "INSERT INTO admin_actions (admin_id, action, details) VALUES ($1,$2,$3)",
-                admin_id,
-                action,
-                (details or "")[:1000],
+                "INSERT INTO events (user_id, username, chat_id, kind, model, text, "
+                "tokens, latency_ms, status, error) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                row["user_id"],
+                row["username"],
+                row["chat_id"],
+                row["kind"],
+                row["model"],
+                row["text"],
+                row["tokens"],
+                row["latency_ms"],
+                row["status"],
+                row["error"],
             )
         except Exception as e:
-            logging.warning(f"add_admin_action failed: {e}")
+            logging.warning(f"add_event failed: {e}")
+
+    async def count_events(self) -> int:
+        try:
+            if self.available:
+                return int(await self.pool.fetchval("SELECT count(*) FROM events") or 0)
+            return len(self._events)
+        except Exception as e:
+            logging.warning(f"count_events failed: {e}")
+            return len(self._events)
+
+    async def list_events(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        try:
+            if self.available:
+                rows = await self.pool.fetch(
+                    "SELECT created_at, user_id, username, chat_id, kind, model, text, "
+                    "tokens, latency_ms, status, error FROM events "
+                    "ORDER BY id DESC LIMIT $1 OFFSET $2",
+                    max(1, int(limit)),
+                    max(0, int(offset)),
+                )
+                return [dict(r) for r in rows]
+            items = list(reversed(self._events))
+            return [dict(r) for r in items[max(0, offset): max(0, offset) + limit]]
+        except Exception as e:
+            logging.warning(f"list_events failed: {e}")
+            return []
+
+    async def clear_events(self) -> int:
+        count = len(self._events)
+        self._events.clear()
+        try:
+            if self.available:
+                result = await self.pool.execute("DELETE FROM events")
+                # asyncpg возвращает строку вида "DELETE 42".
+                try:
+                    return int(str(result).split()[-1])
+                except Exception:
+                    return count
+            return count
+        except Exception as e:
+            logging.warning(f"clear_events failed: {e}")
+            return 0
+
+    async def export_events_md(self) -> str:
+        """Все события журнала в Markdown. Маскируются только API-ключи."""
+        try:
+            if self.available:
+                rows = await self.pool.fetch(
+                    "SELECT created_at, user_id, username, chat_id, kind, model, text, "
+                    "tokens, latency_ms, status, error FROM events ORDER BY id"
+                )
+                items = [dict(r) for r in rows]
+            else:
+                items = [dict(r) for r in self._events]
+        except Exception as e:
+            logging.warning(f"export_events_md failed: {e}")
+            items = [dict(r) for r in self._events]
+
+        lines = [
+            "# Журнал событий",
+            "",
+            f"Всего событий: {len(items)}",
+            "",
+        ]
+        for row in items:
+            created = row.get("created_at")
+            if isinstance(created, datetime):
+                created = created.astimezone(MSK).strftime("%d.%m.%Y %H:%M:%S")
+            else:
+                created = str(created or "—")
+            lines.append(f"## {created} · {row.get('kind') or '—'}")
+            lines.append("")
+            lines.append(f"- Статус: {row.get('status') or '—'}")
+            if row.get("model"):
+                lines.append(f"- Модель: {row.get('model')}")
+            if row.get("user_id"):
+                who = row.get("username") or ""
+                lines.append(f"- Пользователь: {who} ({row.get('user_id')})".strip())
+            if row.get("chat_id"):
+                lines.append(f"- Чат: {row.get('chat_id')}")
+            lines.append(f"- Токены: {int(row.get('tokens') or 0)}")
+            if row.get("latency_ms") is not None:
+                lines.append(f"- Время: {int(row.get('latency_ms'))} мс")
+            if row.get("text"):
+                safe_text = _mask_secrets(str(row.get("text")))
+                lines.append(f"- Текст: {safe_text}")
+            if row.get("error"):
+                safe_error = _mask_secrets(str(row.get("error")))
+                lines.append(f"- Ошибка: {safe_error}")
+            lines.append("")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Аналитика

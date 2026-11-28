@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import base64
 import html
 import inspect
@@ -45,10 +45,11 @@ from prompts import (
     AGENT_INSTRUCTIONS,
     CLASSIC_FORMAT,
     LENGTH_INSTRUCTIONS,
+    PLAIN_FORMAT,
     RICH_FORMAT,
     SYSTEM_PROMPT_BASE,
 )
-from storage import DB_LIMIT_BYTES, MSK, storage
+from storage import DB_LIMIT_BYTES, MSK, _mask_secrets, storage
 import studio
 
 # widgets.py — новый файл. Если его забыли загрузить, бот продолжит работать,
@@ -285,7 +286,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
-APP_BUILD = "2026-11-27 studio-free-paid-models"
+APP_BUILD = "2026-11-28 studio-image-edits-logs"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -769,6 +770,7 @@ DEFAULT_SETTINGS = {
     "search": "on",
     "length": "normal",
     "agent": False,
+    "format": True,
     "model_free": "",
     "model_paid": "",
     "model_section": studio.FREE,
@@ -1092,6 +1094,10 @@ def user_rich(user_id: int | None) -> bool:
     return bool(user_settings(user_id).get("rich", True))
 
 
+def user_formatting(user_id: int | None) -> bool:
+    return bool(user_settings(user_id).get("format", True))
+
+
 def user_effort(user_id: int | None) -> str:
     level = user_settings(user_id).get("deepthink", "off")
     if level == "low":
@@ -1160,6 +1166,17 @@ class Track:
     completion_tokens: int = 0
     reasoning_tokens: int = 0
     total_tokens: int = 0
+    kind: str = ""
+    prompt: str = ""
+    model_key: str = ""
+    external: dict[str, int] = field(default_factory=dict)
+    elapsed: float = 0.0
+    search_calls: int = 0
+
+    def add_external(self, name: str, tokens: int) -> None:
+        if tokens is None or int(tokens) <= 0:
+            return
+        self.external[name] = self.external.get(name, 0) + int(tokens)
 
 
 async def begin_request(
@@ -1185,6 +1202,9 @@ async def begin_request(
         request_id=request_id,
         user_id=user.id if user else None,
         chat_id=message.chat.id,
+        kind=kind,
+        prompt=prompt or "",
+        model_key=normalize_model_key(model or ""),
     )
 
 
@@ -1207,6 +1227,19 @@ async def finish_track(
         model=model,
         tools=tools,
     )
+    username, full_name = cached_user_name(track.user_id) if track.user_id else ("", "")
+    await storage.add_event(
+        kind=track.kind or "request",
+        user_id=track.user_id,
+        username=username or full_name,
+        chat_id=track.chat_id,
+        model=model or track.model_key,
+        text=track.prompt,
+        tokens=int(track.total_tokens or 0),
+        latency_ms=latency_ms,
+        status=status,
+        error=error,
+    )
 
 
 async def log_group_event(message: Message, text: str, kind: str = "group_message") -> None:
@@ -1220,6 +1253,14 @@ async def log_group_event(message: Message, text: str, kind: str = "group_messag
         is_request=False,
         model=None,
         prompt_preview=text or media_placeholder(message),
+        status="logged",
+    )
+    await storage.add_event(
+        kind=kind,
+        user_id=user.id if user else None,
+        username=username_of(user),
+        chat_id=message.chat.id,
+        text=text or media_placeholder(message),
         status="logged",
     )
 
@@ -1338,11 +1379,32 @@ def media_placeholder(message: Message) -> str:
 
 
 def system_prompt(
-    rich: bool = False, length: str = "normal", agent: bool = False
+    spec: dict | None = None,
+    *,
+    rich: bool = False,
+    length: str = "normal",
+    agent: bool = False,
+    formatting: bool = True,
 ) -> str:
-    fmt = RICH_FORMAT if rich else CLASSIC_FORMAT
+    if rich:
+        fmt = RICH_FORMAT
+    elif formatting:
+        fmt = CLASSIC_FORMAT
+    else:
+        fmt = PLAIN_FORMAT
     length_block = LENGTH_INSTRUCTIONS.get(length) or LENGTH_INSTRUCTIONS["normal"]
     parts = [SYSTEM_PROMPT_BASE]
+    if spec:
+        label = spec.get("label") or spec.get("model") or ""
+        model_id = spec.get("model") or ""
+        company = spec.get("company") or spec.get("provider") or ""
+        parts.append(
+            "КТО ТЫ СЕЙЧАС:\n"
+            f"- Модель: {label} ({model_id}).\n"
+            f"- Компания/провайдер: {company}.\n"
+            "- Если спросят, какая ты модель и от какой компании, отвечай именно "
+            "этими названиями. Не подменяй себя другой моделью."
+        )
     if agent:
         parts.append(AGENT_INSTRUCTIONS)
     parts.append(fmt)
@@ -1679,6 +1741,7 @@ async def call_model(
                 tools=tools,
                 tool_choice=tool_choice,
                 max_tokens=max_tokens or default_max,
+                effort=effort,
                 on_delta=on_delta,
             )
         elif provider == "gemini":
@@ -1822,6 +1885,7 @@ async def describe_image(
         completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         total = prompt_tokens + completion_tokens
         track.total_tokens += total
+        track.add_external("фото", total)
         await storage.add_call(
             request_id=track.request_id,
             user_id=track.user_id,
@@ -1909,6 +1973,7 @@ async def transcribe_voice(
     estimate = int(estimate or 0)
     if track is not None:
         track.total_tokens += estimate
+        track.add_external("голос", estimate)
         await storage.add_call(
             request_id=track.request_id,
             user_id=track.user_id,
@@ -2071,6 +2136,7 @@ class Turn:
     track: Track | None = None
     tools_used: list[str] = field(default_factory=list)
     rich_allowed: bool = True
+    search_allowed: bool = True
     status: Status = field(init=False)
 
     def __post_init__(self):
@@ -2137,6 +2203,106 @@ async def send_text(turn: Turn, text: str) -> None:
                 await turn.message.reply(plain, parse_mode=None)
         except Exception as e2:
             logging.error(f"send_text plain fallback error: {e2}")
+
+
+async def send_photo_result(
+    turn: Turn, data: bytes, mime: str, caption: str
+) -> bool:
+    """Отправляет готовое изображение с подписью. Без смайлов и HTML."""
+    filename = f"mokh-{int(time.time())}.{studio._image_ext(mime)}"
+    file = BufferedInputFile(data, filename=filename)
+    try:
+        if turn.is_private:
+            await turn.message.answer_photo(file, caption=caption)
+        else:
+            await turn.message.reply_photo(file, caption=caption)
+        return True
+    except Exception as e:
+        logging.warning(f"send_photo failed: {e}; пробую документом")
+    try:
+        file = BufferedInputFile(data, filename=filename)
+        if turn.is_private:
+            await turn.message.answer_document(file, caption=caption)
+        else:
+            await turn.message.reply_document(file, caption=caption)
+        return True
+    except Exception as e:
+        logging.error(f"send_document failed: {e}")
+        return False
+
+
+async def run_image_generation(
+    turn: Turn,
+    info: dict,
+    *,
+    edit_source: tuple[str, bytes] | None = None,
+) -> None:
+    """Генерация или редактирование изображения выбранной моделью.
+
+    Модель не подменяется: если она не умеет редактировать, показываем
+    ошибку. 2 500 токенов списываются только за успешный результат.
+    """
+    started = time.perf_counter()
+    track = turn.track
+    is_edit = edit_source is not None
+    if track is not None:
+        track.kind = "image_edit" if is_edit else "image"
+        track.model_key = turn.model
+        track.prompt = turn.user_text or ""
+    status = "ok"
+    error_text = ""
+    charged = False
+    try:
+        await turn.status.show("🖌 Рисую…" if not is_edit else "🖌 Редактирую фото…")
+        prompt = (turn.user_text or "").strip()
+        if not prompt:
+            prompt = (
+                "Улучши это фото, сохрани содержание и композицию."
+                if is_edit
+                else "Красивая иллюстрация по мотивам запроса."
+            )
+        if is_edit:
+            image_bytes, mime = await studio.edit_image(
+                info, edit_source[1], edit_source[0], prompt
+            )
+        else:
+            image_bytes, mime = await studio.generate_image(info, prompt)
+
+        elapsed = time.perf_counter() - started
+        label = info.get("label") or info.get("model") or turn.model
+        caption = (
+            f"{label} · {fmt_int(studio.IMAGE_CHARGE)} ток. · {elapsed:.1f} с"
+        )
+        if is_edit:
+            caption += " · редактирование фото"
+        if not await send_photo_result(turn, image_bytes, mime, caption):
+            raise RuntimeError("Telegram не принял готовое изображение")
+        charged = True
+        if track is not None:
+            track.elapsed = elapsed
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
+    except Exception as e:
+        status = "error"
+        error_text = str(e)
+        logging.exception("Image handling error")
+        await send_text(turn, "⚠️ Ошибка: <code>" + esc(friendly_ai_error(e)) + "</code>")
+    finally:
+        elapsed = time.perf_counter() - started
+        if track is not None:
+            track.elapsed = elapsed
+            track.total_tokens = studio.IMAGE_CHARGE if charged else 0
+            await finish_track(
+                track,
+                status=status,
+                error=error_text,
+                latency_ms=int(elapsed * 1000),
+                model=turn.model,
+            )
+            if charged:
+                await pool_add(track.user_id, turn.section, studio.IMAGE_CHARGE)
+        await turn.status.clear()
 
 
 RICH_ALLOWED_TAGS = (
@@ -2449,15 +2615,55 @@ def classic_from_rich(text: str) -> str:
 
 
 def usage_footer(turn: Turn, rich: bool) -> str:
-    """Мелкая подпись в конце ответа: модель и потраченные токены."""
+    """Мелкая подпись: модель · всего токенов · время · внешние вызовы."""
     track = turn.track
-    if track is None or track.total_tokens <= 0:
+    if track is None:
         return ""
     label = esc(model_label(turn.model))
-    tokens = fmt_int(track.total_tokens)
+    kind = (track.kind or "").lower()
+
+    if kind in ("image", "image_edit", "image_gen"):
+        parts = [label, f"{fmt_int(studio.IMAGE_CHARGE)} ток."]
+        if track.elapsed > 0:
+            parts.append(f"{track.elapsed:.1f} с")
+        parts.append(
+            "редактирование фото" if "edit" in kind else "генерация изображения"
+        )
+        text = " · ".join(parts)
+        if rich:
+            return f"<footer>{text}</footer>"
+        return f"\n\n<i>{text}</i>"
+
+    external = track.external or {}
+    total = int(track.total_tokens or 0)
+    if total <= 0 and not track.search_calls:
+        return ""
+    parts = [label, f"{fmt_int(total)} ток."]
+    if track.elapsed > 0:
+        parts.append(f"{track.elapsed:.1f} с")
+    if external.get("фото"):
+        parts.append(f"фото {fmt_int(external['фото'])}")
+    if external.get("голос"):
+        parts.append(f"голос {fmt_int(external['голос'])}")
+    if track.search_calls:
+        parts.append(f"поиск {fmt_int(track.search_calls)}")
+    text = " · ".join(parts)
     if rich:
-        return f"<footer>{label} · {tokens} ток.</footer>"
-    return f"\n\n<i>{label} · {tokens} ток.</i>"
+        return f"<footer>{text}</footer>"
+    return f"\n\n<i>{text}</i>"
+
+
+def effective_reasoning_effort(info: dict, effort: str) -> str:
+    """Честный уровень размышлений с учётом возможностей модели.
+
+    Не подменяем модель: если она не умеет не думать, «Не думать»
+    становится минимальным размышлением. Если не умеет думать — «off».
+    """
+    if not info.get("reasoning"):
+        return "off"
+    if not info.get("can_disable_reasoning") and effort == "off":
+        return "medium"
+    return effort
 
 
 def silent_reasoning_note(streamer: "RichStreamer | None", effort: str) -> str:
@@ -2544,7 +2750,7 @@ class RichStreamer:
         if not body:
             return ""
         return (
-            "<details open><summary>🧠 Размышления</summary>\n"
+            "<details><summary>🧠 Размышления</summary>\n"
             f"{body}\n</details>"
         )
 
@@ -2894,12 +3100,19 @@ async def execute_tool(turn: Turn, name: str, args: dict) -> str:
     turn.tools_used.append(name)
     try:
         if name == "web_search":
+            if not turn.search_allowed:
+                return (
+                    "Поиск в интернете выключен в настройках пользователя. "
+                    "Скажи об этом и ответь из своих знаний."
+                )
             query = (args.get("query") or "").strip()
             if not query:
                 return "Ошибка: пустой поисковый запрос."
             await turn.status.show("🔍 Ищу в интернете…")
             logging.info(f"[{turn.chat_id}] TOOL web_search: {query}")
             results = await search_web(query, section=turn.section)
+            if turn.track is not None:
+                turn.track.search_calls += 1
             return render_results(results)
 
         if name == "render_widget":
@@ -3346,6 +3559,10 @@ async def run_ai(turn: Turn) -> None:
     model_id = info["model"]
     section = info.get("section", turn.section)
     turn.section = section
+    if info.get("kind") == "image":
+        # В image-семействе обычный текст — это промпт, а не чат.
+        await run_image_generation(turn, info)
+        return
     user = turn.message.from_user
     user_id = user.id if user else None
     settings_active = turn.is_private and user_id is not None
@@ -3361,32 +3578,31 @@ async def run_ai(turn: Turn) -> None:
         typing_task = asyncio.create_task(keep_typing(turn.chat_id))
         length = user_length(user_id) if settings_active else "normal"
         agent = settings_active and user_agent(user_id)
+        formatting = user_formatting(user_id) if settings_active else True
         messages = [
             {
                 "role": "system",
-                "content": system_prompt(rich, length, agent=agent),
+                "content": system_prompt(
+                    info, rich=rich, length=length, agent=agent, formatting=formatting
+                ),
             }
         ]
         messages += [dict(m) for m in history_for_model(turn.chat_id, model_key)]
 
         search_on = user_search_on(user_id) if settings_active else True
+        turn.search_allowed = search_on
         tools = TOOLS
         if agent:
             # Агент сам решает, когда искать: поиск не должен быть выключен.
             search_on = True
-        elif not search_on:
-            tools = [
-                t
-                for t in TOOLS
-                if (t.get("function") or {}).get("name") != "web_search"
-            ]
-
+            turn.search_allowed = True
+        forced = (
+            {"type": "function", "function": {"name": "web_search"}}
+            if search_on and has_search_verb(turn.user_text)
+            else None
+        )
         if agent:
             # В агентском режиме модель сама выбирает инструменты на каждом шаге.
-            forced = None
-        elif search_on and has_search_verb(turn.user_text):
-            forced = {"type": "function", "function": {"name": "web_search"}}
-        else:
             forced = None
 
         effort = (
@@ -3453,7 +3669,9 @@ async def run_ai(turn: Turn) -> None:
         footer = usage_footer(turn, rich)
         if answer:
             answer = strip_text_tool_calls(answer)
-        note = silent_reasoning_note(streamer, effort)
+        note = silent_reasoning_note(
+            streamer, effective_reasoning_effort(info, effort)
+        )
         if answer and note:
             footer = note + ("\n\n" + footer if footer else "")
         if answer:
@@ -3556,6 +3774,7 @@ async def cmd_start(message: Message):
         "• В <b>группах</b> — когда обращаются словом <b>мох</b>, через "
         f"<b>@{BOT_USERNAME or 'M0XAIBOT'}</b> или реплаем на моё сообщение.\n"
         "• <b>Модели</b> — бесплатные и платные, в /models.\n"
+        "• <b>Картинки</b> — модели Image Free/VIP рисуют и редактируют фото.\n"
         "• <b>Поиск</b> — включается сам, когда нужны свежие данные.\n"
         "• <b>Inline</b>: <code>@M0XAIBOT запрос</code>\n\n"
         "🧩 Модели и режимы: /models\n"
@@ -3607,9 +3826,13 @@ async def cmd_about(message: Message):
         "🌿 <b>Мудрый Мох — информация</b>\n\n"
         f"<b>🧩 Модели:</b> {free_n + paid_n} "
         f"{plural_ru(free_n + paid_n, 'модель', 'модели', 'моделей')}\n"
-        f"• 🆓 Free: {free_n} — Pollinations, Groq, Gemini\n"
+        f"• 🆓 Free: {free_n} — Pollinations Text/Image, Groq, Gemini\n"
         f"• 💎 Paid: {paid_n} — DeepSeek\n"
         f"{current_line}{agent_line}\n\n"
+        "<b>🖼 Картинки:</b>\n"
+        "• Text = модель отвечает, Image = любой текст становится промптом\n"
+        "• Генерация и редактирование фото — 2 500 ток. за успех\n"
+        "• Редактируют только модели с поддержкой edits\n\n"
         "<b>🤖 Агент:</b>\n"
         "• Включается в /models → «Режимы»\n"
         "• Сам планирует, ищет и вызывает инструменты — до 8 шагов\n"
@@ -3789,9 +4012,11 @@ async def _models_list_view(
                     text=f"{mark}{MODEL_REGISTRY[key]['label']}",
                     callback_data=f"m:s:{code}",
                 ),
-                InlineKeyboardButton(text="ℹ️", callback_data=f"m:i:{code}"),
             ]
         )
+    info_code = MODEL_SHORT_BY_KEY.get(current)
+    if not info_code and page_keys:
+        info_code = MODEL_SHORT_BY_KEY.get(page_keys[0])
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(
@@ -3811,6 +4036,8 @@ async def _models_list_view(
                 text="▶️", callback_data=f"models:fam:{section}:{family}:{page + 1}"
             )
         )
+    if info_code:
+        nav.append(InlineKeyboardButton(text="ℹ️", callback_data=f"m:i:{info_code}"))
     rows.append(nav)
     rows.append(
         [
@@ -3852,8 +4079,15 @@ def _model_info_view(
 def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     settings = user_settings(user_id)
     model_key = selected_model(user_id)
+    model_info = MODEL_REGISTRY.get(model_key) or {}
     rich_on = bool(settings.get("rich", True)) and RICH_SUPPORTED
+    formatting_on = bool(settings.get("format", True))
+    can_stop_thinking = bool(model_info.get("can_disable_reasoning"))
     level = user_effort(user_id)
+    display_level = level
+    if model_info.get("reasoning") and not can_stop_thinking and level == "off":
+        # Модель думает всегда: показываем реальный минимум, а не «Не думать».
+        display_level = "medium"
     length = user_length(user_id)
     search_on = user_search_on(user_id)
     agent_on = user_agent(user_id)
@@ -3864,15 +4098,19 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         "",
         "🧩 <b>Rich-статьи</b> — оформленные ответы со стримингом: "
         "заголовки, таблицы, раскрывающиеся размышления.",
+        "🖋 <b>Форматирование</b> — работает, когда Rich выключен: "
+        "жирный и ссылки как в обычном Telegram. Если оба выключены — "
+        "ответ приходит простым текстом без разметки.",
         "🧠 <b>Размышления</b> — сколько модель думает перед ответом. "
-        "Мысли показываются над ответом в раскрытом блоке.",
+        "Мысли показываются над ответом в свёрнутом блоке.",
         "📏 <b>Длина ответа</b> — от короткой выжимки до максимума.",
         "🔍 <b>Поиск</b> — разрешить модели искать в интернете.",
         "🤖 <b>Агент</b> — сам планирует, ищет и вызывает инструменты "
         "до 8 шагов. Думает долго, отвечает по факту.",
         "",
         f"Rich: <b>{'включён' if rich_on else 'выключен'}</b>",
-        f"Размышления: <b>{EFFORT_LABELS.get(level, 'Не думать')}</b>",
+        f"Форматирование: <b>{'включено' if formatting_on else 'выключено'}</b>",
+        f"Размышления: <b>{EFFORT_LABELS.get(display_level, 'Не думать')}</b>",
         f"Длина: <b>{LENGTH_LABELS.get(length, 'Обычно')}</b>",
         f"Поиск: <b>{'включён' if search_on else 'выключен'}</b>",
         f"Агент: <b>{'включён' if agent_on else 'выключен'}</b>",
@@ -3880,15 +4118,14 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     ]
     if not RICH_SUPPORTED:
         lines.append("\n⚠️ Rich-статьи недоступны на этой версии aiogram.")
-    if model_key in ALWAYS_REASONING_MODELS:
+    if model_info.get("reasoning") and not can_stop_thinking:
         lines.append(
-            f"\n🧠 <b>{esc(model_label(model_key))}</b> думает всегда — "
-            "переключатель размышлений скрыт."
+            f"\n🧠 <b>{esc(model_label(model_key))}</b> не умеет не думать: "
+            "она думает всегда, и мысли показываются."
         )
-    elif model_key in SILENT_REASONING_MODELS:
+    if not model_info.get("reasoning"):
         lines.append(
-            f"\n🧠 <b>{esc(model_label(model_key))}</b> размышляет, "
-            "но не показывает мысли текстом."
+            "\n🧠 Эта модель не умеет думать: переключатель размышлений скрыт."
         )
     if agent_on:
         lines.append(
@@ -3908,23 +4145,33 @@ def _models_modes_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     rows.append(
         [
             InlineKeyboardButton(
+                text=f"{'✅' if formatting_on else '⬜️'} 🖋 Форматирование",
+                callback_data="models:toggle:format:modes",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
                 text=f"{'✅' if agent_on else '⬜️'} 🤖 Режим агента",
                 callback_data="models:toggle:agent:modes",
             )
         ]
     )
-    if model_key not in ALWAYS_REASONING_MODELS and not agent_on:
+    if model_info.get("reasoning") and not agent_on:
+        effort_options = [
+            ("medium", "Думать"),
+            ("high", "Думать долго"),
+        ]
+        if can_stop_thinking:
+            effort_options.insert(0, ("off", "Не думать"))
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=("✅ " if level == code else "") + label,
+                    text=("✅ " if display_level == code else "") + label,
                     callback_data=f"models:effort:{code}:modes",
                 )
-                for code, label in (
-                    ("off", "Не думать"),
-                    ("medium", "Думать"),
-                    ("high", "Думать долго"),
-                )
+                for code, label in effort_options
             ]
         )
     rows.append(
@@ -4105,6 +4352,8 @@ async def on_models_callback(callback: CallbackQuery):
         field = parts[2] if len(parts) > 2 else "rich"
         if field == "rich":
             await save_toggle(user_id, "rich", not user_rich(user_id))
+        elif field == "format":
+            await save_toggle(user_id, "format", not user_formatting(user_id))
         elif field == "agent":
             await save_toggle(user_id, "agent", not user_agent(user_id))
             if user_agent(user_id):
@@ -4458,6 +4707,9 @@ def admin_main_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="⚙️ Настройки", callback_data="adm:set"),
+        ],
+        [
+            InlineKeyboardButton(text="📜 Логи", callback_data="adm:logs:0"),
         ],
     ]
     return admin_kb(rows)
@@ -5028,6 +5280,74 @@ async def settings_view(refresh: bool = False) -> tuple[str, InlineKeyboardMarku
     return text, admin_kb(rows)
 
 
+LOGS_PAGE_SIZE = 50
+
+
+def _log_who(row: dict) -> str:
+    user_id = row.get("user_id")
+    if not user_id:
+        return ""
+    name = (row.get("username") or "").strip()
+    if len(name) > 22:
+        name = name[:22] + "…"
+    return f"{name} ({user_id})" if name else str(user_id)
+
+
+async def logs_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    total = await storage.count_events()
+    total_pages = max(1, (total + LOGS_PAGE_SIZE - 1) // LOGS_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    items = await storage.list_events(
+        LOGS_PAGE_SIZE, page * LOGS_PAGE_SIZE
+    )
+    lines = [
+        "📜 <b>Логи</b>",
+        "",
+        f"Всего событий: <b>{fmt_int(total)}</b> · "
+        f"страница {page + 1} из {total_pages} · "
+        f"{LOGS_PAGE_SIZE} на страницу",
+        "",
+    ]
+    if not items:
+        lines.append("<p>Журнал пуст.</p>")
+    for row in items:
+        created = row.get("created_at")
+        if isinstance(created, datetime):
+            created = created.astimezone(MSK).strftime("%d.%m %H:%M")
+        elif not created:
+            created = "—"
+        kind = str(row.get("kind") or "event")[:20]
+        status = str(row.get("status") or "ok")[:12]
+        parts = [f"{esc(created)} · {esc(kind)} · {esc(status)}"]
+        model = str(row.get("model") or "")
+        if model:
+            parts.append(esc(model[:28]))
+        tokens = int(row.get("tokens") or 0)
+        if tokens:
+            parts.append(f"{fmt_int(tokens)} ток.")
+        if row.get("latency_ms"):
+            parts.append(f"{fmt_int(row.get('latency_ms'))} мс")
+        who = _log_who(row)
+        if who:
+            parts.append(esc(who))
+        line = " · ".join(parts)
+        preview = re.sub(r"\s+", " ", _mask_secrets(str(row.get("text") or ""))).strip()
+        if preview:
+            line += " · " + esc(preview[:70])
+        error = re.sub(r"\s+", " ", _mask_secrets(str(row.get("error") or ""))).strip()
+        if error:
+            line += " · <b>ошибка:</b> " + esc(error[:60])
+        lines.append(line)
+    rows: list[list[InlineKeyboardButton]] = [
+        paginator_kb("adm:logs", page, total_pages),
+        [
+            InlineKeyboardButton(text="📥 Скачать .md", callback_data="adm:logs:md"),
+            InlineKeyboardButton(text="🧹 Очистить логи", callback_data="adm:logs:clear"),
+        ],
+    ]
+    return "\n".join(lines), admin_kb(rows)
+
+
 async def admin_section(
     section: str, page: int = 0, period: str | None = None, provider: str | None = None
 ) -> tuple[str, InlineKeyboardMarkup]:
@@ -5050,6 +5370,8 @@ async def admin_section(
         return filter_view(admin_filters(OWNER_ID))
     if section == "req":
         return await requests_view_async(page, admin_filters(OWNER_ID))
+    if section == "logs":
+        return await logs_view(page)
     if section == "stats":
         flt = admin_filters(OWNER_ID)
         if period:
@@ -5480,6 +5802,44 @@ async def on_admin_callback(callback: CallbackQuery):
         if action == "req":
             page = int(parts[2]) if len(parts) > 2 else 0
             text, kb = await admin_section("req", page)
+            await edit_admin(callback, text, kb)
+            await callback.answer()
+            return
+        if action == "logs":
+            mode = parts[2] if len(parts) > 2 else "0"
+            if mode == "md":
+                md = await storage.export_events_md()
+                filename = f"mokh-logs-{msk_now().strftime('%Y%m%d-%H%M')}.md"
+                await callback.message.answer_document(
+                    BufferedInputFile(md.encode("utf-8"), filename=filename),
+                    caption="📥 Журнал событий в Markdown.",
+                )
+                await callback.answer("Файл отправлен.")
+                return
+            if mode == "clear":
+                await edit_admin(
+                    callback,
+                    "🧹 <b>Очистить логи?</b>\n\n"
+                    "Будет удалён только журнал событий. Запросы, статистика "
+                    "и контекст останутся.",
+                    confirm_kb("adm:logs:clearok", "adm:logs:0"),
+                )
+                await callback.answer()
+                return
+            if mode == "clearok":
+                removed = await storage.clear_events()
+                await storage.add_admin_action(
+                    OWNER_ID, "logs_clear", f"removed={removed}"
+                )
+                text, kb = await logs_view(0)
+                await edit_admin(callback, text, kb)
+                await callback.answer(f"Удалено событий: {fmt_int(removed)}")
+                return
+            try:
+                page = int(mode)
+            except (TypeError, ValueError):
+                page = 0
+            text, kb = await logs_view(page)
             await edit_admin(callback, text, kb)
             await callback.answer()
             return
@@ -6133,6 +6493,55 @@ async def process_photos(messages: list[Message]) -> None:
     info = MODEL_REGISTRY.get(normalize_model_key(model)) or {}
     section = info.get("section", studio.FREE)
 
+    if info.get("kind") == "image":
+        # Image-модели не «смотрят» фото: они его редактируют.
+        edit_source: tuple[str, bytes] | None = None
+        for m in messages:
+            try:
+                data = await download_image_bytes(m)
+                mime = image_mime(
+                    data, (m.document.mime_type if m.document else None)
+                )
+                edit_source = (mime, data)
+                break
+            except Exception as e:
+                logging.warning(f"Image edit download failed: {e}")
+        edit_prompt = question or "Улучши это фото, сохрани содержание и композицию."
+        if edit_source is None:
+            await send_text(
+                Turn(
+                    message=first,
+                    chat_id=chat_id,
+                    is_private=private,
+                    user_text=edit_prompt,
+                    model=model,
+                    section=section,
+                    track=track,
+                ),
+                "⚠️ Не удалось скачать фото для редактирования. Попробуй ещё раз.",
+            )
+            await finish_track(
+                track,
+                status="error",
+                error="image source download failed",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                model=model,
+            )
+            return
+        turn = Turn(
+            message=first,
+            chat_id=chat_id,
+            is_private=private,
+            user_text=edit_prompt,
+            model=model,
+            section=section,
+            track=track,
+        )
+        logging.info(f"[{chat_id}] РЕДАКТИРОВАНИЕ ФОТО {model} | {edit_prompt[:80]}")
+        async with chat_lock(chat_id):
+            await run_image_generation(turn, info, edit_source=edit_source)
+        return
+
     if provider == "gateway" and private:
         async with chat_lock(chat_id):
             await process_gateway_photos(
@@ -6316,6 +6725,7 @@ async def process_gateway_photos(
             return
 
         length = user_length(user_id) if private else "normal"
+        formatting = user_formatting(user_id) if private else True
         user_question = question or "Что на фото? Реши подробно."
         prompt_text = f"Пользователь прислал фото. Вопрос/подпись: {user_question}"
         if failed:
@@ -6326,16 +6736,17 @@ async def process_gateway_photos(
 
         vision_messages = _photo_content_messages(images, prompt_text)
         model_messages = [
-            {"role": "system", "content": system_prompt(rich, length)}
+            {
+                "role": "system",
+                "content": system_prompt(
+                    info, rich=rich, length=length, formatting=formatting
+                ),
+            }
         ] + [dict(m) for m in history_for_model(chat_id, model_key)] + vision_messages
 
         search_on = user_search_on(user_id) if private else True
+        turn.search_allowed = search_on
         tools = TOOLS
-        if not search_on:
-            tools = [
-                t for t in TOOLS
-                if (t.get("function") or {}).get("name") != "web_search"
-            ]
 
         if search_on and has_search_verb(user_question):
             forced = {"type": "function", "function": {"name": "web_search"}}
@@ -6395,7 +6806,12 @@ async def process_gateway_photos(
             for index, desc in descriptions:
                 text_parts.append(f"Описание фото {index}:\n{desc}")
             text_messages = [
-                {"role": "system", "content": system_prompt(rich, length)}
+                {
+                    "role": "system",
+                    "content": system_prompt(
+                        info, rich=rich, length=length, formatting=formatting
+                    ),
+                }
             ] + [
                 dict(m) for m in history_for_model(chat_id, model_key)
             ] + [{"role": "user", "content": "\n\n".join(text_parts)}]
@@ -6419,7 +6835,9 @@ async def process_gateway_photos(
         footer = usage_footer(turn, rich)
         if answer:
             answer = strip_text_tool_calls(answer)
-        note = silent_reasoning_note(streamer, effort)
+        note = silent_reasoning_note(
+            streamer, effective_reasoning_effort(info, effort)
+        )
         if answer and note:
             footer = note + ("\n\n" + footer if footer else "")
         if answer:
@@ -6678,7 +7096,14 @@ async def handle_private_text(message: Message) -> None:
     section = (MODEL_REGISTRY.get(normalize_model_key(model)) or {}).get(
         "section", studio.FREE
     )
-    track = await begin_request(message, kind="text", prompt=text, model=model)
+    request_kind = (
+        "image"
+        if (MODEL_REGISTRY.get(normalize_model_key(model)) or {}).get("kind") == "image"
+        else "text"
+    )
+    track = await begin_request(
+        message, kind=request_kind, prompt=text, model=model
+    )
     quote, media_desc = await build_reply_block(
         message, need_media=True, track=track, provider=provider_of(model)
     )
@@ -6734,7 +7159,12 @@ async def handle_group_text(message: Message) -> None:
         return
     track = await begin_request(
         message,
-        kind="group_request",
+        kind=(
+            "image"
+            if (MODEL_REGISTRY.get(normalize_model_key(group_model)) or {}).get("kind")
+            == "image"
+            else "group_request"
+        ),
         prompt=text,
         model=group_model,
     )

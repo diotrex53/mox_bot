@@ -13,16 +13,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from openai import AsyncOpenAI
 
 from deepseek_client import ChatResult, DeepSeekClient, DeepSeekError
+from prompts import VISION_PROMPT
 
 MSK = timezone(timedelta(hours=3))
 
@@ -77,32 +81,58 @@ DEFAULT_GATEWAY_MODEL = "deepseek-v4.1-flash-1017"
 
 PROVIDER_LABELS = {
     "gateway": "DeepSeek · шлюз aikeysforyou",
-    "pollinations_free": "Pollinations · анонимно",
-    "pollinations_vip": "Pollinations · VIP",
+    "pollinations_free": "Pollinations · Text Free (анонимно)",
+    "pollinations_vip": "Pollinations · Text VIP",
+    "pollinations_image_free": "Pollinations · Image Free (анонимно)",
+    "pollinations_image_vip": "Pollinations · Image VIP",
     "groq": "Groq Cloud",
     "gemini": "Google Gemini",
 }
 
+COMPANY_BY_PROVIDER = {
+    "gateway": "DeepSeek",
+    "pollinations_free": "Pollinations",
+    "pollinations_vip": "Pollinations",
+    "pollinations_image_free": "Pollinations",
+    "pollinations_image_vip": "Pollinations",
+    "groq": "Groq",
+    "gemini": "Google",
+}
+
 FAMILY_LABELS = {
     "deepseek": "DeepSeek",
-    "pollinations_free": "Pollinations Free",
-    "pollinations_vip": "Pollinations VIP",
+    "pollinations_free": "Pollinations Text Free",
+    "pollinations_vip": "Pollinations Text VIP",
+    "pollinations_image_free": "Pollinations Image Free",
+    "pollinations_image_vip": "Pollinations Image VIP",
     "groq": "Groq",
     "gemini": "Gemini",
 }
 
 FAMILY_ORDER = {
     PAID: ["deepseek"],
-    FREE: ["pollinations_free", "pollinations_vip", "groq", "gemini"],
+    FREE: [
+        "pollinations_free",
+        "pollinations_vip",
+        "pollinations_image_free",
+        "pollinations_image_vip",
+        "groq",
+        "gemini",
+    ],
 }
 
 FAMILY_SECTIONS = {
     "deepseek": PAID,
     "pollinations_free": FREE,
     "pollinations_vip": FREE,
+    "pollinations_image_free": FREE,
+    "pollinations_image_vip": FREE,
     "groq": FREE,
     "gemini": FREE,
 }
+
+IMAGE_CHARGE = 2_500
+FREE_IMAGE_EDIT_MAX_SIDE = 512
 
 # ---------------------------------------------------------------------------
 # Метаданные моделей
@@ -301,6 +331,48 @@ GEMINI_FALLBACK = [
     "gemini-2.5-flash",
 ]
 
+# Анонимный image.pollinations.ai отдаёт ровно одну модель.
+POLLINATIONS_IMAGE_FREE_FALLBACK = ["sana"]
+
+# Запасной VIP-каталог изображений: (id, title, edits).
+POLLINATIONS_IMAGE_VIP_FALLBACK: list[tuple[str, str, bool]] = [
+    ("tongyi-mai/z-image-turbo", "Z-Image Turbo", False),
+    ("microsoft/mai-image-2.7", "MAI Image 2.7", True),
+    ("microsoft/mai-image-2.7-flash", "MAI Image 2.7 Flash", True),
+    ("black-forest-labs/flux.1.1-pro", "FLUX 1.1 Pro", False),
+    ("microsoft/mai-image-2.6", "MAI Image 2.6", True),
+    ("microsoft/mai-image-2.6-flash", "MAI Image 2.6 Flash", True),
+    ("black-forest-labs/flux.2-flex", "FLUX.2 Flex", True),
+    ("black-forest-labs/flux.2-klein-4b", "FLUX.2 Klein 4B", True),
+    ("black-forest-labs/flux.1-kontext-pro", "FLUX.1 Kontext Pro", True),
+    ("black-forest-labs/flux.1-schnell", "FLUX.1 Schnell", False),
+    (
+        "community/tomdacatto/grok-imagine-2-quest",
+        "Grok Imagine 2 (Quest access)",
+        False,
+    ),
+    (
+        "community/sharktide/inferenceport-ai-lightning-image-plus",
+        "InferencePort AI Lightning Image Plus",
+        True,
+    ),
+    (
+        "community/vendouple/animagine",
+        "Animagine (read description)",
+        False,
+    ),
+    (
+        "community/sharktide/inferenceport-ai-lightning-image-turbo",
+        "Lightning Image Turbo",
+        True,
+    ),
+    (
+        "community/tomdacatto/nano-banana-pro",
+        "Nano banana pro",
+        False,
+    ),
+]
+
 
 # ---------------------------------------------------------------------------
 # Клиенты
@@ -349,6 +421,7 @@ def configure(
         timeout=ai_timeout,
         label="Pollinations Free",
         anonymous=True,
+        supports_reasoning_off=False,
     )
     pollinations_vip_client = DeepSeekClient(
         api_key=POLLINATIONS_API_KEY,
@@ -410,9 +483,20 @@ def make_spec(
     reasoning: bool = False,
     tools: bool = True,
     description: str = "",
+    kind: str = "text",
+    edits: bool = False,
+    can_disable_reasoning: bool | None = None,
+    supported_endpoints: list[str] | None = None,
 ) -> dict:
     provider = provider or family
     info = _info_for(model, vision=vision, reasoning=reasoning)
+    if can_disable_reasoning is None:
+        # reasoning_effort="none" реально поддерживают шлюз DeepSeek и
+        # Pollinations VIP. У Groq и Gemini минимум — low, у Free — нет.
+        can_disable_reasoning = bool(reasoning) and provider in (
+            "gateway",
+            "pollinations_vip",
+        )
     spec = {
         "key": f"{family}@{model}",
         "section": section,
@@ -420,10 +504,14 @@ def make_spec(
         "family_label": FAMILY_LABELS.get(family, family),
         "provider": provider,
         "provider_label": PROVIDER_LABELS.get(provider, provider),
+        "company": COMPANY_BY_PROVIDER.get(provider, provider),
         "model": model,
         "label": label or model,
+        "kind": kind,
         "vision": bool(info.get("vision") or vision),
         "reasoning": bool(info.get("reasoning") or reasoning),
+        "can_disable_reasoning": bool(can_disable_reasoning),
+        "edits": bool(edits),
         "tools": tools,
         "description": description,
         "params": info.get("params"),
@@ -436,6 +524,8 @@ def make_spec(
         "release": info.get("release") or "",
         "status": "доступна",
     }
+    if supported_endpoints:
+        spec["supported_endpoints"] = list(supported_endpoints)
     return spec
 
 
@@ -455,6 +545,31 @@ def _fallback_catalog() -> dict[str, list[dict]]:
     catalog["pollinations_vip"] = [
         make_spec(FREE, "pollinations_vip", model)
         for model in POLLINATIONS_VIP_FALLBACK
+    ]
+    catalog["pollinations_image_free"] = [
+        make_spec(
+            FREE,
+            "pollinations_image_free",
+            model,
+            provider="pollinations_image_free",
+            kind="image",
+            edits=True,
+            tools=False,
+        )
+        for model in POLLINATIONS_IMAGE_FREE_FALLBACK
+    ]
+    catalog["pollinations_image_vip"] = [
+        make_spec(
+            FREE,
+            "pollinations_image_vip",
+            model,
+            label=title,
+            provider="pollinations_image_vip",
+            kind="image",
+            edits=edits,
+            tools=False,
+        )
+        for model, title, edits in POLLINATIONS_IMAGE_VIP_FALLBACK
     ]
     catalog["groq"] = [
         make_spec(FREE, "groq", model, vision=(model == GROQ_VISION_MODEL))
@@ -566,9 +681,11 @@ def _parse_pollinations_gen(data: Any, family: str) -> list[dict]:
             continue
         inputs = [str(x).lower() for x in (item.get("input_modalities") or [])]
         caps = [str(x).lower() for x in (item.get("capabilities") or [])]
+        supported = [str(x).lower() for x in (item.get("supported_parameters") or [])]
         vision = "image" in inputs
         reasoning = bool(item.get("reasoning")) or "reasoning" in caps
         tools = "tool_calling" in caps or "tools" in caps
+        can_disable = "reasoning_effort" in supported
         spec = make_spec(
             FREE,
             family,
@@ -578,6 +695,8 @@ def _parse_pollinations_gen(data: Any, family: str) -> list[dict]:
             reasoning=reasoning,
             tools=tools,
             description=str(item.get("description") or ""),
+            can_disable_reasoning=can_disable if reasoning else False,
+            supported_endpoints=[str(x) for x in endpoints],
         )
         context = item.get("context_length")
         if context:
@@ -586,6 +705,40 @@ def _parse_pollinations_gen(data: Any, family: str) -> list[dict]:
         if pricing:
             spec["price"] = "бесплатно (VIP)"
         specs.append(spec)
+    return specs
+
+
+def _parse_pollinations_image(data: Any, family: str) -> list[dict]:
+    """Каталог изображений gen.pollinations.ai: category=image и edits."""
+    specs: list[dict] = []
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return specs
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("category") != "image":
+            continue
+        if item.get("paid_only"):
+            continue
+        model = str(item.get("id") or "").strip()
+        if not model:
+            continue
+        endpoints = [str(x) for x in (item.get("supported_endpoints") or [])]
+        specs.append(
+            make_spec(
+                FREE,
+                family,
+                model,
+                label=str(item.get("title") or model),
+                provider=family,
+                kind="image",
+                edits="/v1/images/edits" in endpoints,
+                tools=False,
+                description=str(item.get("description") or ""),
+                supported_endpoints=endpoints,
+            )
+        )
     return specs
 
 
@@ -693,7 +846,7 @@ async def refresh_catalog() -> dict[str, list[dict]]:
     if POLLINATIONS_API_KEY:
         poll_headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
 
-    free_data, vip_data, groq_data, gemini_data = await asyncio.gather(
+    free_data, vip_data, groq_data, gemini_data, image_free_data = await asyncio.gather(
         _get_json(POLLINATIONS_MODELS_URL),
         _get_json(POLLINATIONS_VIP_MODELS_URL, headers=poll_headers),
         _get_json(
@@ -705,6 +858,7 @@ async def refresh_catalog() -> dict[str, list[dict]]:
             if GEMINI_API_KEY
             else f"{GEMINI_BASE_URL}/models"
         ),
+        _get_json("https://image.pollinations.ai/models"),
         return_exceptions=True,
     )
 
@@ -719,6 +873,27 @@ async def refresh_catalog() -> dict[str, list[dict]]:
         if parsed:
             catalog["pollinations_vip"] = parsed
             sources.append("pollinations-vip")
+        images = _dedupe(_parse_pollinations_image(vip_data, "pollinations_image_vip"))
+        if images:
+            catalog["pollinations_image_vip"] = images
+            sources.append("pollinations-image-vip")
+    if isinstance(image_free_data, list):
+        free_images = [
+            make_spec(
+                FREE,
+                "pollinations_image_free",
+                str(model),
+                provider="pollinations_image_free",
+                kind="image",
+                edits=True,
+                tools=False,
+            )
+            for model in image_free_data
+            if isinstance(model, str) and model.strip()
+        ]
+        if free_images:
+            catalog["pollinations_image_free"] = free_images
+            sources.append("pollinations-image-free")
     if isinstance(groq_data, (list, dict)):
         parsed = _dedupe(_parse_groq(groq_data))
         if parsed:
@@ -803,6 +978,7 @@ async def pollinations_chat(
     tools: list[dict] | None = None,
     tool_choice: str | dict | None = "auto",
     max_tokens: int = 2000,
+    effort: str = "off",
     on_delta=None,
 ) -> ChatResult:
     client = (
@@ -813,13 +989,22 @@ async def pollinations_chat(
     if client is None or not client.configured:
         raise DeepSeekError("Pollinations не настроен")
 
+    # Без автоподмены: reasoning-модель получает выбранный пользователем
+    # уровень. Если модель не умеет отключать размышления, «Не думать»
+    # превращается в минимальное размышление, а не в тишину.
+    effective = effort
+    if not spec.get("reasoning"):
+        effective = "off"
+    elif not spec.get("can_disable_reasoning") and effective == "off":
+        effective = "medium"
+
     async def _ask(with_tools: bool):
         return await client.chat(
             messages,
             tools=tools if with_tools else None,
             tool_choice=tool_choice if with_tools else None,
             max_tokens=max_tokens,
-            effort="off",
+            effort=effective,
             model=spec["model"],
             on_delta=on_delta,
         )
@@ -986,11 +1171,218 @@ async def gemini_chat(
 # Фото и голос
 # ---------------------------------------------------------------------------
 
-VISION_PROMPT = (
-    "Опиши это изображение подробно для памяти ассистента: объекты, люди, "
-    "цвета, расположение, весь видимый текст, важные детали. 80–150 слов. "
-    "Пиши только описание, без вступлений вроде «на фото»."
-)
+POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt/"
+
+
+def _image_ext(mime: str) -> str:
+    return {
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+    }.get((mime or "").lower(), "jpg")
+
+
+def _detect_mime(data: bytes) -> str:
+    if data.startswith(b"\x89PNG"):
+        return "image/png"
+    if data.startswith(b"GIF8"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def shrink_image(
+    image_bytes: bytes, *, max_side: int = FREE_IMAGE_EDIT_MAX_SIDE
+) -> tuple[bytes, str]:
+    """Сжимает исходник для Free-редактирования, чтобы он влез в URL."""
+    from PIL import Image
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+    except Exception as e:
+        raise DeepSeekError(f"Не удалось открыть изображение: {e}") from e
+    image = image.convert("RGB")
+    image.thumbnail((max_side, max_side), Image.LANCZOS)
+    for side, quality in (
+        (max_side, 70),
+        (max_side, 55),
+        (max(256, max_side * 3 // 4), 55),
+        (max(192, max_side // 2), 50),
+    ):
+        copy = image.copy()
+        copy.thumbnail((side, side), Image.LANCZOS)
+        buffer = io.BytesIO()
+        copy.save(buffer, format="JPEG", quality=quality, optimize=True)
+        data = buffer.getvalue()
+        if len(data) <= 24_000:
+            return data, "image/jpeg"
+    return data, "image/jpeg"
+
+
+async def _download_image_url(url: str) -> tuple[bytes, str]:
+    if http_client is None:
+        raise DeepSeekError("HTTP-клиент не настроен")
+    response = await http_client.get(url, timeout=AI_TIMEOUT)
+    if response.status_code >= 400:
+        raise DeepSeekError(
+            f"Картинка HTTP {response.status_code}: {response.text[:200]}",
+            status_code=response.status_code,
+        )
+    mime = (response.headers.get("content-type") or "").split(";")[0].strip()
+    data = response.content
+    if not data:
+        raise DeepSeekError("Пустой ответ с изображением")
+    return data, mime or _detect_mime(data)
+
+
+def _vip_image_payload(spec: dict) -> tuple[str, dict[str, str]]:
+    return (
+        f"{POLLINATIONS_GEN_BASE_URL}/images/generations",
+        {
+            "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+
+
+def _image_from_vip_json(data: dict) -> tuple[str, str]:
+    item = ((data or {}).get("data") or [{}])[0]
+    b64 = item.get("b64_json") or ""
+    if b64:
+        raw = base64.b64decode(b64)
+        mime = item.get("media_type") or _detect_mime(raw)
+        return raw, mime
+    url = item.get("url") or ""
+    if url:
+        return url, ""
+    raise DeepSeekError("VIP-картинка: пустой ответ")
+
+
+async def generate_image(spec: dict, prompt: str) -> tuple[bytes, str]:
+    """Генерация изображения выбранной моделью. Без автоподмены."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise DeepSeekError("Пустой промпт")
+    provider = spec.get("provider")
+    model = spec.get("model") or ""
+
+    if provider == "pollinations_image_free":
+        if http_client is None:
+            raise DeepSeekError("HTTP-клиент не настроен")
+        params = {
+            "model": model,
+            "width": 1024,
+            "height": 1024,
+            "nologo": "true",
+            "seed": str(int(time.time()) % 1_000_000),
+        }
+        response = await http_client.get(
+            POLLINATIONS_IMAGE_URL + quote(prompt, safe=""),
+            params=params,
+            timeout=AI_TIMEOUT,
+        )
+        if response.status_code >= 400:
+            raise DeepSeekError(
+                f"Free-картинка HTTP {response.status_code}: {response.text[:200]}",
+                status_code=response.status_code,
+            )
+        data = response.content
+        if not data:
+            raise DeepSeekError("Free-картинка: пустой ответ")
+        return data, (response.headers.get("content-type") or "").split(";")[0].strip() or _detect_mime(data)
+
+    if provider != "pollinations_image_vip":
+        raise DeepSeekError("Эта модель не умеет генерировать изображения")
+    if not POLLINATIONS_API_KEY:
+        raise DeepSeekError("Pollinations VIP: ключ POLLINATIONS_API не задан")
+    if http_client is None:
+        raise DeepSeekError("HTTP-клиент не настроен")
+
+    url, headers = _vip_image_payload(spec)
+    response = await http_client.post(
+        url,
+        headers=headers,
+        json={"model": model, "prompt": prompt, "size": "1024x1024", "n": 1},
+        timeout=AI_TIMEOUT,
+    )
+    if response.status_code >= 400:
+        raise DeepSeekError(
+            f"VIP-картинка HTTP {response.status_code}: {response.text[:300]}",
+            status_code=response.status_code,
+        )
+    raw_or_url, mime = _image_from_vip_json(response.json())
+    if mime:
+        return raw_or_url, mime
+    return await _download_image_url(raw_or_url)
+
+
+async def edit_image(
+    spec: dict, image_bytes: bytes, mime: str, prompt: str
+) -> tuple[bytes, str]:
+    """Редактирование фото выбранной моделью. Без автоподмены."""
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise DeepSeekError("Пустой промпт для редактирования")
+    provider = spec.get("provider")
+    model = spec.get("model") or ""
+    if not spec.get("edits"):
+        raise DeepSeekError(
+            f"Модель {spec.get('label') or model} не умеет редактировать фото"
+        )
+    if http_client is None:
+        raise DeepSeekError("HTTP-клиент не настроен")
+
+    if provider == "pollinations_image_free":
+        small, small_mime = shrink_image(image_bytes)
+        b64 = base64.b64encode(small).decode()
+        params = {
+            "model": model,
+            "image": f"data:{small_mime};base64,{b64}",
+            "nologo": "true",
+            "seed": str(int(time.time()) % 1_000_000),
+        }
+        encoded_prompt = quote(prompt, safe="")
+        response = await http_client.get(
+            POLLINATIONS_IMAGE_URL + encoded_prompt,
+            params=params,
+            timeout=AI_TIMEOUT,
+        )
+        if response.status_code >= 400:
+            raise DeepSeekError(
+                f"Free-редактирование HTTP {response.status_code}: "
+                f"{response.text[:200]}",
+                status_code=response.status_code,
+            )
+        data = response.content
+        if not data:
+            raise DeepSeekError("Free-редактирование: пустой ответ")
+        return data, (response.headers.get("content-type") or "").split(";")[0].strip() or _detect_mime(data)
+
+    if not POLLINATIONS_API_KEY:
+        raise DeepSeekError("Pollinations VIP: ключ POLLINATIONS_API не задан")
+    ext = _image_ext(mime)
+    response = await http_client.post(
+        f"{POLLINATIONS_GEN_BASE_URL}/images/edits",
+        headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"},
+        data={"model": model, "prompt": prompt},
+        files={"image": (f"photo.{ext}", image_bytes, mime or "image/jpeg")},
+        timeout=AI_TIMEOUT,
+    )
+    if response.status_code >= 400:
+        raise DeepSeekError(
+            f"VIP-редактирование HTTP {response.status_code}: {response.text[:300]}",
+            status_code=response.status_code,
+        )
+    raw_or_url, out_mime = _image_from_vip_json(response.json())
+    if out_mime:
+        return raw_or_url, out_mime
+    return await _download_image_url(raw_or_url)
+
+
+VISION_DEFAULT_PROMPT = VISION_PROMPT
 
 
 async def describe_image(
@@ -1103,6 +1495,11 @@ def _fmt(value: Any, *, tokens: bool = False) -> str:
 
 
 def _modalities(spec: dict) -> str:
+    if spec.get("kind") == "image":
+        parts = ["изображения"]
+        if spec.get("edits"):
+            parts.append("редактирование фото")
+        return ", ".join(parts)
     parts = ["текст"]
     if spec.get("vision"):
         parts.append("фото")
@@ -1110,55 +1507,75 @@ def _modalities(spec: dict) -> str:
     return ", ".join(parts)
 
 
+def _yes_no(value: Any) -> str:
+    return "да" if value else "нет"
+
+
 def info_text(spec: dict) -> str:
+    is_image = spec.get("kind") == "image"
     family = spec.get("family_label") or spec.get("family") or ""
     section = "Платные" if spec.get("section") == PAID else "Бесплатные"
-    rows = [
-        ("Название", spec.get("label") or spec.get("model")),
-        ("ID", spec.get("model")),
-        ("Провайдер", spec.get("provider_label") or spec.get("provider")),
-        ("Семейство", family),
+    title = _escape(spec.get("label") or spec.get("model"))
+
+    main_rows = [
+        ("ID", f"<code>{_escape(spec.get('model'))}</code>"),
+        ("Провайдер", _escape(spec.get("provider_label") or spec.get("provider"))),
+        ("Компания", _escape(spec.get("company") or "н/д")),
+        ("Семейство", _escape(family)),
         ("Раздел", section),
-        ("Параметры", _fmt(spec.get("params"))),
-        ("Контекст", _fmt(spec.get("context"), tokens=True)),
-        ("Модальности", _modalities(spec)),
+    ]
+    capability_rows = [
+        ("Модальности", _escape(_modalities(spec))),
         (
             "Инструменты",
-            "нативные tool-calls" if spec.get("tools") else "текстовая эмуляция",
+            "нативные tool-calls" if spec.get("tools") else "нет",
         ),
-        ("Reasoning", "да" if spec.get("reasoning") else "нет"),
-        ("Макс. вывод", _fmt(spec.get("max_output"), tokens=True)),
+        ("Reasoning", _yes_no(spec.get("reasoning") and not is_image)),
         (
-            "Цена",
-            spec.get("price")
-            or ("бесплатно" if spec.get("section") == FREE else "н/д"),
+            "Может не думать",
+            _yes_no(spec.get("can_disable_reasoning") and not is_image),
         ),
-        ("Скорость", _fmt(spec.get("speed"))),
-        ("Лицензия", _fmt(spec.get("license"))),
-        ("Статус", _fmt(spec.get("status"))),
-        ("Дата релиза", _fmt(spec.get("release"))),
-        ("Ссылка", spec.get("link") or "н/д"),
         (
-            "Доступ",
-            "выдаётся всем из белого списка"
-            if spec.get("section") == PAID
-            else "бесплатно, в пределах пула 250к/день",
+            "Редактирование фото",
+            _yes_no(spec.get("edits")),
         ),
     ]
-    width = max(len(name) for name, _ in rows)
-    lines = [f"{name.ljust(width)} │ {value}" for name, value in rows]
-    table = "\n".join(lines)
+    if is_image:
+        capability_rows.append(("Генерация изображений", "да"))
+
+    parameter_rows = [
+        ("Параметры", _escape(_fmt(spec.get("params")))),
+        ("Контекст", _escape(_fmt(spec.get("context"), tokens=True))),
+        ("Макс. вывод", _escape(_fmt(spec.get("max_output"), tokens=True))),
+        (
+            "Цена",
+            _escape(
+                spec.get("price")
+                or ("бесплатно" if spec.get("section") == FREE else "н/д")
+            ),
+        ),
+        ("Лицензия", _escape(_fmt(spec.get("license")))),
+        ("Скорость", _escape(_fmt(spec.get("speed")))),
+        ("Статус", _escape(_fmt(spec.get("status")))),
+        ("Дата релиза", _escape(_fmt(spec.get("release")))),
+        ("Ссылка", _escape(spec.get("link") or "н/д")),
+    ]
+
+    def block(title: str, rows: list[tuple[str, str]]) -> str:
+        body = "\n".join(f"• {name}: {value}" for name, value in rows)
+        return f"<b>{title}</b>\n{body}"
+
+    parts = [
+        f"ℹ️ <b>{title}</b>",
+        block("Основное", main_rows),
+        block("Возможности", capability_rows),
+        block("Параметры", parameter_rows),
+    ]
     description = (spec.get("description") or "").strip()
-    text = (
-        f"ℹ️ <b>{_escape(spec.get('label') or spec.get('model'))}</b>\n\n"
-        f"<pre>{_escape(table)}</pre>"
-    )
     if description:
-        text += f"\n\n<i>{_escape(description[:600])}</i>"
-    text += (
-        "\n\n💡 Совет: выбери модель кнопкой ниже — контекст чата сохранится."
-    )
-    return text
+        parts.append(f"<i>{_escape(description[:600])}</i>")
+    parts.append("Выбери модель кнопкой ниже — контекст чата сохранится.")
+    return "\n\n".join(parts)
 
 
 def _escape(text: Any) -> str:

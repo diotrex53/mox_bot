@@ -101,6 +101,7 @@ class DeepSeekClient:
         timeout: float | httpx.Timeout = 120.0,
         label: str = "API",
         anonymous: bool = False,
+        supports_reasoning_off: bool = True,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -109,6 +110,7 @@ class DeepSeekClient:
         self.timeout = timeout
         self.label = label
         self.anonymous = anonymous
+        self.supports_reasoning_off = supports_reasoning_off
 
     @property
     def configured(self) -> bool:
@@ -131,9 +133,12 @@ class DeepSeekClient:
             "max_tokens": int(max_tokens),
         }
         if effort in ("medium", "high"):
-            # Уровень «off» вообще не отправляем: шлюз отвечает 500 на
-            # reasoning_effort = "off". Без параметра модель думает по умолчанию.
             payload["reasoning_effort"] = effort
+        elif effort == "off" and self.supports_reasoning_off:
+            # "none" — единственное значение, которое реально отключает
+            # размышления на шлюзе DeepSeek и Pollinations VIP. Старое "off"
+            # шлюз отвергает с HTTP 500, поэтому отправляем именно "none".
+            payload["reasoning_effort"] = "none"
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice or "auto"
