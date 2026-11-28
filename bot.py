@@ -182,6 +182,9 @@ PROVIDER_NAMES = {
     "pollinations_vip": "Pollinations VIP",
     "groq": "Groq",
     "gemini": "Gemini",
+    "cloudflare": "Cloudflare Workers AI",
+    "cloudflare_image": "Cloudflare Workers AI",
+    "openrouter": "OpenRouter",
 }
 
 # Думают, но не показывают мысли текстом — честно предупреждаем.
@@ -286,7 +289,7 @@ bot = Bot(
 dp = Dispatcher()
 
 # Видно в логах Render: по этой строке понятно, что задеплоена свежая версия.
-APP_BUILD = "2026-11-28 studio-image-edits-logs"
+APP_BUILD = "2026-11-28 studio-cloudflare-openrouter"
 
 # Rich Message API появился в свежих aiogram. Если на сервере старая версия,
 # честно отключаем «статьи» вместо тихих ошибок на каждом ответе.
@@ -326,6 +329,8 @@ PROVIDER_CLIENTS: dict[str, DeepSeekClient] = {
     "gateway": gateway_client,
     "pollinations_free": studio.pollinations_free_client,
     "pollinations_vip": studio.pollinations_vip_client,
+    "cloudflare": studio.cloudflare_client,
+    "openrouter": studio.openrouter_client,
 }
 
 BOT_ID: int | None = None
@@ -1707,6 +1712,14 @@ async def call_model(
             if candidate.get("model") == model and candidate.get("provider") == provider:
                 spec = candidate
                 break
+    # Честный уровень размышлений: не-reasoning модель не получает
+    # reasoning_effort, а модель без поддержки "none" — минимум (medium).
+    effective_effort = effort
+    if spec is not None:
+        if not spec.get("reasoning"):
+            effective_effort = "off"
+        elif not spec.get("can_disable_reasoning") and effective_effort == "off":
+            effective_effort = "medium"
     client = PROVIDER_CLIENTS.get(provider)
     model_name = model or (spec.get("model") if spec else None) or (
         CHAT_MODEL if provider == "groq" else (client.model if client else provider)
@@ -1741,7 +1754,7 @@ async def call_model(
                 tools=tools,
                 tool_choice=tool_choice,
                 max_tokens=max_tokens or default_max,
-                effort=effort,
+                effort=effective_effort,
                 on_delta=on_delta,
             )
         elif provider == "gemini":
@@ -1751,7 +1764,7 @@ async def call_model(
                 spec,
                 messages,
                 max_tokens=max_tokens or default_max,
-                effort=effort,
+                effort=effective_effort,
             )
         else:
             if client is None or not client.configured:
@@ -1764,7 +1777,7 @@ async def call_model(
                     tools=tools,
                     tool_choice=tool_choice,
                     max_tokens=max_tokens or default_max,
-                    effort=effort,
+                    effort=effective_effort,
                     on_delta=on_delta if stream else None,
                 )
 
@@ -3394,7 +3407,11 @@ async def run_tools(
 
         if reset_cb is not None:
             reset_cb()
-        messages.append(result.assistant_message(include_reasoning=provider != "groq"))
+        messages.append(
+            result.assistant_message(
+                include_reasoning=provider in ("gateway", "pollinations_vip")
+            )
+        )
         for tc in result.tool_calls:
             function = tc.get("function") or {}
             try:
@@ -3577,7 +3594,8 @@ async def run_ai(turn: Turn) -> None:
         await safe_typing(turn.chat_id)
         typing_task = asyncio.create_task(keep_typing(turn.chat_id))
         length = user_length(user_id) if settings_active else "normal"
-        agent = settings_active and user_agent(user_id)
+        has_tools = bool(info.get("tools", True))
+        agent = settings_active and user_agent(user_id) and has_tools
         formatting = user_formatting(user_id) if settings_active else True
         messages = [
             {
@@ -3591,14 +3609,14 @@ async def run_ai(turn: Turn) -> None:
 
         search_on = user_search_on(user_id) if settings_active else True
         turn.search_allowed = search_on
-        tools = TOOLS
+        tools = TOOLS if has_tools else None
         if agent:
             # Агент сам решает, когда искать: поиск не должен быть выключен.
             search_on = True
             turn.search_allowed = True
         forced = (
             {"type": "function", "function": {"name": "web_search"}}
-            if search_on and has_search_verb(turn.user_text)
+            if tools and search_on and has_search_verb(turn.user_text)
             else None
         )
         if agent:
@@ -3821,12 +3839,18 @@ async def cmd_about(message: Message):
     )
     free_n = len(_section_keys(studio.FREE))
     paid_n = len(_section_keys(studio.PAID))
+    free_providers = ["Pollinations", "Groq", "Gemini"]
+    free_families = studio.families(studio.FREE)
+    if "cloudflare" in free_families:
+        free_providers.append("Cloudflare")
+    if "openrouter" in free_families:
+        free_providers.append("OpenRouter")
     await reply_any(
         message,
         "🌿 <b>Мудрый Мох — информация</b>\n\n"
         f"<b>🧩 Модели:</b> {free_n + paid_n} "
         f"{plural_ru(free_n + paid_n, 'модель', 'модели', 'моделей')}\n"
-        f"• 🆓 Free: {free_n} — Pollinations Text/Image, Groq, Gemini\n"
+        f"• 🆓 Free: {free_n} — {', '.join(free_providers)}\n"
         f"• 💎 Paid: {paid_n} — DeepSeek\n"
         f"{current_line}{agent_line}\n\n"
         "<b>🖼 Картинки:</b>\n"
@@ -6746,9 +6770,9 @@ async def process_gateway_photos(
 
         search_on = user_search_on(user_id) if private else True
         turn.search_allowed = search_on
-        tools = TOOLS
+        tools = TOOLS if info.get("tools", True) else None
 
-        if search_on and has_search_verb(user_question):
+        if tools and search_on and has_search_verb(user_question):
             forced = {"type": "function", "function": {"name": "web_search"}}
         else:
             forced = None
@@ -7310,7 +7334,8 @@ async def load_runtime_state() -> None:
             _trim_history(messages)
             _history[int(chat_id)] = messages
 
-    # Живой каталог моделей: Pollinations / Groq / Gemini.
+    # Живой каталог моделей: Pollinations / Groq / Gemini / OpenRouter.
+    # Cloudflare Workers AI — проверенный фиксированный список Free-плана.
     catalog = await studio.refresh_catalog()
     rebuild_model_registry(catalog)
 

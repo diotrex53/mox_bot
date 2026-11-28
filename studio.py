@@ -1,8 +1,8 @@
 """Студия нейросетей «Мудрого Мха».
 
 Здесь живут:
-• каталоги бесплатных (Pollinations anonymous/VIP, Groq, Gemini) и платных
-  (DeepSeek через шлюз) моделей;
+• каталоги бесплатных (Pollinations anonymous/VIP, Groq, Gemini,
+  Cloudflare Workers AI, OpenRouter) и платных (DeepSeek через шлюз) моделей;
 • клиенты провайдеров;
 • карточки-справки о моделях;
 • дневные пулы токенов free/paid.
@@ -52,6 +52,15 @@ GROQ_API_FREE = os.environ.get("GROQ_API_FREE", "") or os.environ.get(
     "GROQ_API_NEW3", ""
 )
 GEMINI_API_KEY = os.environ.get("GEMINI_API", "")
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "") or os.environ.get(
+    "CLOUDFLARE_ACCOUNT_ID", ""
+)
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "") or os.environ.get(
+    "CLOUDFLARE_API_TOKEN", ""
+)
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API", "") or os.environ.get(
+    "OPENROUTER_API_KEY", ""
+)
 POLLINATIONS_API_KEY = (
     os.environ.get("POLLINATIONS_API", "")
     or os.environ.get("POLLINATIONS_VIP_API", "")
@@ -72,6 +81,13 @@ POLLINATIONS_BASE_URL = "https://text.pollinations.ai/openai"
 POLLINATIONS_MODELS_URL = "https://text.pollinations.ai/models"
 POLLINATIONS_GEN_BASE_URL = "https://gen.pollinations.ai/v1"
 POLLINATIONS_VIP_MODELS_URL = "https://gen.pollinations.ai/v1/models"
+CF_BASE_URL = (
+    f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
+    if CF_ACCOUNT_ID
+    else "https://api.cloudflare.com/client/v4/accounts"
+)
+CF_CHAT_BASE_URL = f"{CF_BASE_URL}/ai/v1"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 GATEWAY_API_KEY = os.environ.get("GATEWAY_API", "")
 GATEWAY_BASE_URL = os.environ.get(
@@ -87,6 +103,9 @@ PROVIDER_LABELS = {
     "pollinations_image_vip": "Pollinations · Image VIP",
     "groq": "Groq Cloud",
     "gemini": "Google Gemini",
+    "cloudflare": "Cloudflare Workers AI",
+    "cloudflare_image": "Cloudflare Workers AI",
+    "openrouter": "OpenRouter",
 }
 
 COMPANY_BY_PROVIDER = {
@@ -97,6 +116,9 @@ COMPANY_BY_PROVIDER = {
     "pollinations_image_vip": "Pollinations",
     "groq": "Groq",
     "gemini": "Google",
+    "cloudflare": "Cloudflare",
+    "cloudflare_image": "Cloudflare",
+    "openrouter": "OpenRouter",
 }
 
 FAMILY_LABELS = {
@@ -107,6 +129,9 @@ FAMILY_LABELS = {
     "pollinations_image_vip": "Pollinations Image VIP",
     "groq": "Groq",
     "gemini": "Gemini",
+    "cloudflare": "Cloudflare Text",
+    "cloudflare_image": "Cloudflare Images",
+    "openrouter": "OpenRouter Free",
 }
 
 FAMILY_ORDER = {
@@ -118,6 +143,9 @@ FAMILY_ORDER = {
         "pollinations_image_vip",
         "groq",
         "gemini",
+        "cloudflare",
+        "cloudflare_image",
+        "openrouter",
     ],
 }
 
@@ -129,6 +157,9 @@ FAMILY_SECTIONS = {
     "pollinations_image_vip": FREE,
     "groq": FREE,
     "gemini": FREE,
+    "cloudflare": FREE,
+    "cloudflare_image": FREE,
+    "openrouter": FREE,
 }
 
 IMAGE_CHARGE = 2_500
@@ -290,6 +321,133 @@ KNOWN_INFO: dict[str, dict] = {
         "vision": True,
         "link": "https://ai.google.dev/gemini-api/docs/models",
     },
+    # Cloudflare Workers AI — текстовые модели Free-плана
+    "@cf/openai/gpt-oss-120b": {
+        "params": "120B (MoE, ~5B активных)",
+        "context": 128_000,
+        "max_output": 32_768,
+        "license": "Apache 2.0",
+        "reasoning": True,
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/openai/gpt-oss-20b": {
+        "params": "20B (MoE, ~3.6B активных)",
+        "context": 128_000,
+        "max_output": 32_768,
+        "license": "Apache 2.0",
+        "reasoning": True,
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast": {
+        "params": "70B (FP8)",
+        "context": 131_072,
+        "max_output": 8_192,
+        "license": "Llama 3.3 Community",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/meta/llama-4-scout-17b-16e-instruct": {
+        "params": "17B (16 экспертов)",
+        "context": 131_072,
+        "max_output": 8_192,
+        "license": "Llama 4 Community",
+        "vision": True,
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/qwen/qwen3.8-27b": {
+        "params": "27B",
+        "context": 131_072,
+        "max_output": 16_384,
+        "license": "Apache 2.0",
+        "reasoning": True,
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/qwen/qwen2.5-coder-32b-instruct": {
+        "params": "32B",
+        "context": 32_768,
+        "max_output": 8_192,
+        "license": "Apache 2.0",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/google/gemma-4-26b-a4b-it": {
+        "params": "26B (MoE, ~4B активных)",
+        "context": 128_000,
+        "max_output": 16_384,
+        "license": "Gemma Terms of Use",
+        "reasoning": True,
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/mistralai/mistral-small-3.1-24b-instruct": {
+        "params": "24B",
+        "context": 128_000,
+        "max_output": 8_192,
+        "license": "Apache 2.0",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/ibm-granite/granite-4.0-h-micro": {
+        "params": "micro",
+        "context": 128_000,
+        "max_output": 8_192,
+        "license": "Apache 2.0",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/aisingapore/gemma-sea-lion-v4-27b-it": {
+        "params": "27B",
+        "context": 128_000,
+        "max_output": 8_192,
+        "license": "Gemma Terms of Use",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/mistral/mistral-7b-instruct-v0.2-lora": {
+        "params": "7B (LoRA)",
+        "context": 32_768,
+        "max_output": 8_192,
+        "license": "Apache 2.0",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    "@cf/daily-co/phonellm-mini-alpha-2": {
+        "params": "mini",
+        "context": 8_192,
+        "max_output": 4_096,
+        "license": "см. условия провайдера",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/",
+    },
+    # Cloudflare Workers AI — изображения
+    "@cf/black-forest-labs/flux-1-schnell": {
+        "params": "12B",
+        "license": "Apache 2.0",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/flux-1-schnell/",
+    },
+    "@cf/black-forest-labs/flux-2-klein-4b": {
+        "params": "4B",
+        "license": "FLUX.2 [klein] (BFL)",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-4b/",
+    },
+    "@cf/black-forest-labs/flux-2-klein-9b": {
+        "params": "9B",
+        "license": "FLUX.2 [klein] (BFL)",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/flux-2-klein-9b/",
+    },
+    "@cf/black-forest-labs/flux-2-dev": {
+        "params": "FLUX.2 [dev]",
+        "license": "FLUX.2 [dev] Non-Commercial",
+        "price": "бесплатно (квота Workers AI)",
+        "link": "https://developers.cloudflare.com/workers-ai/models/flux-2-dev/",
+    },
 }
 
 # Анонимный Pollinations теперь отдаёт только одну модель.
@@ -330,6 +488,84 @@ GEMINI_FALLBACK = [
     "gemini-3.5-pro",
     "gemini-2.5-flash",
 ]
+
+# Cloudflare Workers AI: только модели, проверенные на Free-плане.
+# (id, label, vision, reasoning, tools)
+CLOUDFLARE_TEXT_FALLBACK: list[tuple[str, str, bool, bool, bool]] = [
+    ("@cf/openai/gpt-oss-120b", "GPT-OSS 120B", False, True, True),
+    ("@cf/openai/gpt-oss-20b", "GPT-OSS 20B", False, True, True),
+    (
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "Llama 3.3 70B",
+        False,
+        False,
+        True,
+    ),
+    (
+        "@cf/meta/llama-4-scout-17b-16e-instruct",
+        "Llama 4 Scout 17B",
+        True,
+        False,
+        True,
+    ),
+    ("@cf/qwen/qwen3.8-27b", "Qwen3.8 27B", False, True, True),
+    (
+        "@cf/qwen/qwen2.5-coder-32b-instruct",
+        "Qwen2.5 Coder 32B",
+        False,
+        False,
+        True,
+    ),
+    ("@cf/google/gemma-4-26b-a4b-it", "Gemma 4 26B A4B", False, True, True),
+    (
+        "@cf/mistralai/mistral-small-3.1-24b-instruct",
+        "Mistral Small 3.1 24B",
+        False,
+        False,
+        True,
+    ),
+    (
+        "@cf/ibm-granite/granite-4.0-h-micro",
+        "Granite 4.0 H Micro",
+        False,
+        False,
+        False,
+    ),
+    (
+        "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
+        "Gemma Sea Lion v4 27B",
+        False,
+        False,
+        False,
+    ),
+    (
+        "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+        "Mistral 7B v0.2 LoRA",
+        False,
+        False,
+        False,
+    ),
+    (
+        "@cf/daily-co/phonellm-mini-alpha-2",
+        "PhoneLLM Mini Alpha 2",
+        False,
+        False,
+        False,
+    ),
+]
+
+# Cloudflare Workers AI: изображения. (id, label, edits)
+CLOUDFLARE_IMAGE_FALLBACK: list[tuple[str, str, bool]] = [
+    ("@cf/black-forest-labs/flux-1-schnell", "FLUX.1 Schnell", False),
+    ("@cf/black-forest-labs/flux-2-klein-4b", "FLUX.2 Klein 4B", True),
+    ("@cf/black-forest-labs/flux-2-klein-9b", "FLUX.2 Klein 9B", True),
+    ("@cf/black-forest-labs/flux-2-dev", "FLUX.2 Dev", True),
+]
+
+# OpenRouter: живой каталог подтягивается с фильтром :free. Запасной список
+# намеренно пуст — id бесплатных моделей часто меняются, а неверный id даёт
+# ошибку. Если каталог недоступен, семейство просто не показывается.
+OPENROUTER_FALLBACK: list[str] = []
 
 # Анонимный image.pollinations.ai отдаёт ровно одну модель.
 POLLINATIONS_IMAGE_FREE_FALLBACK = ["sana"]
@@ -385,6 +621,8 @@ pollinations_vip_client: DeepSeekClient | None = None
 groq_client: AsyncOpenAI | None = None
 groq_paid_client: AsyncOpenAI | None = None
 groq_free_client: AsyncOpenAI | None = None
+cloudflare_client: DeepSeekClient | None = None
+openrouter_client: DeepSeekClient | None = None
 
 AI_TIMEOUT = 180.0
 PREMIUM_TIMEOUT: float | httpx.Timeout = 90.0
@@ -400,6 +638,7 @@ def configure(
     global http_client, gateway_client, pollinations_free_client
     global pollinations_vip_client, groq_client, groq_paid_client
     global groq_free_client, AI_TIMEOUT, PREMIUM_TIMEOUT
+    global cloudflare_client, openrouter_client
 
     http_client = client
     AI_TIMEOUT = ai_timeout
@@ -446,6 +685,29 @@ def configure(
     groq_client = _oai(GROQ_API_KEY)
     groq_paid_client = _oai(GROQ_API_PAID or GROQ_API_KEY)
     groq_free_client = _oai(GROQ_API_FREE or GROQ_API_KEY)
+
+    # Cloudflare Workers AI: OpenAI-совместимый эндпоинт /ai/v1.
+    # reasoning_effort: none не поддерживается (400), поэтому off не отправляем.
+    cloudflare_client = DeepSeekClient(
+        api_key=CF_API_TOKEN,
+        base_url=CF_CHAT_BASE_URL,
+        model="@cf/openai/gpt-oss-120b",
+        http_client=client,
+        timeout=ai_timeout,
+        label="Cloudflare",
+        supports_reasoning_off=False,
+    )
+    # OpenRouter: бесплатные :free-модели. Схема размышлений — объект reasoning.
+    openrouter_client = DeepSeekClient(
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        model="openai/gpt-oss-20b:free",
+        http_client=client,
+        timeout=ai_timeout,
+        label="OpenRouter",
+        supports_reasoning_off=False,
+        reasoning_style="openrouter",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +760,7 @@ def make_spec(
             "pollinations_vip",
         )
     spec = {
-        "key": f"{family}@{model}",
+        "key": f"{family}@{str(model).lstrip('@')}",
         "section": section,
         "family": family,
         "family_label": FAMILY_LABELS.get(family, family),
@@ -578,6 +840,45 @@ def _fallback_catalog() -> dict[str, list[dict]]:
     catalog["gemini"] = [
         make_spec(FREE, "gemini", model, vision=True) for model in GEMINI_FALLBACK
     ]
+    if CF_ACCOUNT_ID and CF_API_TOKEN:
+        catalog["cloudflare"] = [
+            make_spec(
+                FREE,
+                "cloudflare",
+                model,
+                label=label,
+                vision=vision,
+                reasoning=reasoning,
+                tools=tools,
+                can_disable_reasoning=False,
+            )
+            for model, label, vision, reasoning, tools in CLOUDFLARE_TEXT_FALLBACK
+        ]
+        catalog["cloudflare_image"] = [
+            make_spec(
+                FREE,
+                "cloudflare_image",
+                model,
+                label=label,
+                provider="cloudflare_image",
+                kind="image",
+                edits=edits,
+                tools=False,
+                can_disable_reasoning=False,
+            )
+            for model, label, edits in CLOUDFLARE_IMAGE_FALLBACK
+        ]
+    if OPENROUTER_API_KEY and OPENROUTER_FALLBACK:
+        catalog["openrouter"] = [
+            make_spec(
+                FREE,
+                "openrouter",
+                model,
+                tools=False,
+                can_disable_reasoning=False,
+            )
+            for model in OPENROUTER_FALLBACK
+        ]
     return catalog
 
 
@@ -821,6 +1122,76 @@ def _parse_gemini(data: Any) -> list[dict]:
     return specs
 
 
+def _price_is_zero(value: Any) -> bool:
+    try:
+        return float(str(value or 0)) == 0.0
+    except Exception:
+        return False
+
+
+def _parse_openrouter(data: Any) -> list[dict]:
+    """Каталог OpenRouter: только бесплатные (:free / нулевые цены) модели."""
+    specs: list[dict] = []
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return specs
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        model = str(item.get("id") or "").strip()
+        if not model:
+            continue
+        pricing = item.get("pricing") or {}
+        free_id = model.lower().endswith(":free")
+        free_price = _price_is_zero(pricing.get("prompt")) and _price_is_zero(
+            pricing.get("completion")
+        )
+        if not (free_id or free_price):
+            continue
+        if free_id and pricing and not free_price:
+            # Бывает, что :free помечен, но цены уже не нулевые. Верим ценам.
+            continue
+        architecture = item.get("architecture") or {}
+        inputs = [str(x).lower() for x in (architecture.get("input_modalities") or [])]
+        outputs = [str(x).lower() for x in (architecture.get("output_modalities") or [])]
+        if outputs and "text" not in outputs:
+            continue
+        if "image" in outputs:
+            continue
+        params = [
+            str(x).lower() for x in (item.get("supported_parameters") or [])
+        ]
+        vision = "image" in inputs
+        reasoning = bool(
+            {"reasoning", "include_reasoning", "reasoning_effort"} & set(params)
+        )
+        tools = bool({"tools", "tool_choice"} & set(params))
+        spec = make_spec(
+            FREE,
+            "openrouter",
+            model,
+            label=str(item.get("name") or model),
+            vision=vision,
+            reasoning=reasoning,
+            tools=tools,
+            description=str(item.get("description") or "").strip(),
+            can_disable_reasoning=False,
+        )
+        context = item.get("context_length") or (item.get("top_provider") or {}).get(
+            "context_length"
+        )
+        if context:
+            spec["context"] = context
+        max_out = (item.get("top_provider") or {}).get("max_completion_tokens")
+        if max_out:
+            spec["max_output"] = max_out
+        spec["price"] = "бесплатно (:free)"
+        spec["license"] = "см. условия модели"
+        spec["link"] = f"https://openrouter.ai/{model}"
+        specs.append(spec)
+    return specs
+
+
 async def _get_json(url: str, *, headers: dict | None = None) -> Any:
     if http_client is None:
         return None
@@ -845,8 +1216,19 @@ async def refresh_catalog() -> dict[str, list[dict]]:
     poll_headers = {}
     if POLLINATIONS_API_KEY:
         poll_headers["Authorization"] = f"Bearer {POLLINATIONS_API_KEY}"
+    or_headers = {}
+    if OPENROUTER_API_KEY:
+        or_headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
+        or_headers["X-Title"] = "Mox Studio"
 
-    free_data, vip_data, groq_data, gemini_data, image_free_data = await asyncio.gather(
+    (
+        free_data,
+        vip_data,
+        groq_data,
+        gemini_data,
+        image_free_data,
+        openrouter_data,
+    ) = await asyncio.gather(
         _get_json(POLLINATIONS_MODELS_URL),
         _get_json(POLLINATIONS_VIP_MODELS_URL, headers=poll_headers),
         _get_json(
@@ -859,6 +1241,7 @@ async def refresh_catalog() -> dict[str, list[dict]]:
             else f"{GEMINI_BASE_URL}/models"
         ),
         _get_json("https://image.pollinations.ai/models"),
+        _get_json(f"{OPENROUTER_BASE_URL}/models", headers=or_headers),
         return_exceptions=True,
     )
 
@@ -904,6 +1287,11 @@ async def refresh_catalog() -> dict[str, list[dict]]:
         if parsed:
             catalog["gemini"] = parsed
             sources.append("gemini")
+    if OPENROUTER_API_KEY and isinstance(openrouter_data, (list, dict)):
+        parsed = _dedupe(_parse_openrouter(openrouter_data))
+        if parsed:
+            catalog["openrouter"] = parsed
+            sources.append("openrouter")
 
     CATALOG = catalog
     CATALOG_LOADED_AT = time.time()
@@ -1261,6 +1649,46 @@ def _image_from_vip_json(data: dict) -> tuple[str, str]:
     raise DeepSeekError("VIP-картинка: пустой ответ")
 
 
+def _ensure_cloudflare() -> None:
+    if not CF_ACCOUNT_ID:
+        raise DeepSeekError("Cloudflare Workers AI: не задан CF_ACCOUNT_ID")
+    if not CF_API_TOKEN:
+        raise DeepSeekError("Cloudflare Workers AI: не задан CF_API_TOKEN")
+
+
+def _cloudflare_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {CF_API_TOKEN}"}
+
+
+def _image_from_cloudflare(response, model: str) -> tuple[bytes, str]:
+    if response.status_code >= 400:
+        raise DeepSeekError(
+            f"Cloudflare-картинка HTTP {response.status_code}: "
+            f"{response.text[:300]}",
+            status_code=response.status_code,
+        )
+    try:
+        data = response.json()
+    except Exception as e:
+        raise DeepSeekError(f"Cloudflare-картинка: ответ не JSON: {e}") from e
+    result = data.get("result") if isinstance(data, dict) else None
+    b64 = ""
+    if isinstance(result, dict):
+        b64 = result.get("image") or ""
+    if not b64 and isinstance(data, dict):
+        b64 = data.get("image") or ""
+    if not b64:
+        raise DeepSeekError(f"Cloudflare-картинка: пустой ответ ({str(data)[:200]})")
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        raise DeepSeekError(f"Cloudflare-картинка: битый base64: {e}") from e
+    if not raw:
+        raise DeepSeekError("Cloudflare-картинка: пустое изображение")
+    logging.info(f"Cloudflare image {model}: {len(raw)} байт")
+    return raw, _detect_mime(raw)
+
+
 async def generate_image(spec: dict, prompt: str) -> tuple[bytes, str]:
     """Генерация изображения выбранной моделью. Без автоподмены."""
     prompt = (prompt or "").strip()
@@ -1293,6 +1721,27 @@ async def generate_image(spec: dict, prompt: str) -> tuple[bytes, str]:
         if not data:
             raise DeepSeekError("Free-картинка: пустой ответ")
         return data, (response.headers.get("content-type") or "").split(";")[0].strip() or _detect_mime(data)
+
+    if provider == "cloudflare_image":
+        _ensure_cloudflare()
+        if http_client is None:
+            raise DeepSeekError("HTTP-клиент не настроен")
+        url = f"{CF_BASE_URL}/ai/run/{model}"
+        if model == "@cf/black-forest-labs/flux-1-schnell":
+            response = await http_client.post(
+                url,
+                headers=_cloudflare_headers(),
+                json={"prompt": prompt, "steps": 4},
+                timeout=AI_TIMEOUT,
+            )
+        else:
+            response = await http_client.post(
+                url,
+                headers=_cloudflare_headers(),
+                data={"prompt": prompt, "steps": "4"},
+                timeout=AI_TIMEOUT,
+            )
+        return _image_from_cloudflare(response, model)
 
     if provider != "pollinations_image_vip":
         raise DeepSeekError("Эта модель не умеет генерировать изображения")
@@ -1360,6 +1809,31 @@ async def edit_image(
         if not data:
             raise DeepSeekError("Free-редактирование: пустой ответ")
         return data, (response.headers.get("content-type") or "").split(";")[0].strip() or _detect_mime(data)
+
+    if provider == "cloudflare_image":
+        _ensure_cloudflare()
+        # Free-редактирование: исходник ужимаем до 512 px. Если Pillow
+        # недоступен или картинка не открылась, отправляем оригинал.
+        small, small_mime = image_bytes, mime
+        try:
+            small, small_mime = shrink_image(image_bytes)
+        except Exception as e:
+            logging.warning(f"Cloudflare edit: shrink skipped ({e})")
+        ext = _image_ext(small_mime)
+        response = await http_client.post(
+            f"{CF_BASE_URL}/ai/run/{model}",
+            headers=_cloudflare_headers(),
+            data={"prompt": prompt, "steps": "4"},
+            files={
+                "input_image_0": (
+                    f"photo.{ext}",
+                    small,
+                    small_mime or "image/jpeg",
+                )
+            },
+            timeout=AI_TIMEOUT,
+        )
+        return _image_from_cloudflare(response, model)
 
     if not POLLINATIONS_API_KEY:
         raise DeepSeekError("Pollinations VIP: ключ POLLINATIONS_API не задан")

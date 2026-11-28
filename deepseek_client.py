@@ -102,6 +102,7 @@ class DeepSeekClient:
         label: str = "API",
         anonymous: bool = False,
         supports_reasoning_off: bool = True,
+        reasoning_style: str = "effort",
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -111,6 +112,9 @@ class DeepSeekClient:
         self.label = label
         self.anonymous = anonymous
         self.supports_reasoning_off = supports_reasoning_off
+        # "effort" — верхнеуровневый reasoning_effort (шлюз, Cloudflare).
+        # "openrouter" — объект reasoning: {effort: ...} (схема OpenRouter).
+        self.reasoning_style = reasoning_style
 
     @property
     def configured(self) -> bool:
@@ -133,7 +137,10 @@ class DeepSeekClient:
             "max_tokens": int(max_tokens),
         }
         if effort in ("medium", "high"):
-            payload["reasoning_effort"] = effort
+            if self.reasoning_style == "openrouter":
+                payload["reasoning"] = {"effort": effort}
+            else:
+                payload["reasoning_effort"] = effort
         elif effort == "off" and self.supports_reasoning_off:
             # "none" — единственное значение, которое реально отключает
             # размышления на шлюзе DeepSeek и Pollinations VIP. Старое "off"
